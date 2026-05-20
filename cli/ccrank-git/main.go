@@ -265,31 +265,68 @@ func runCcusage() (string, error) {
 	if err != nil {
 		return "", errors.New("no combined usage data found (is Node installed?)")
 	}
-	normalized, err := normalizeCcusageReport(out)
+	normalized, err := normalizeAndFilterCcusageReport(out)
 	if err != nil {
 		return "", err
 	}
 	return normalized, nil
 }
 
-func normalizeCcusageReport(out []byte) (string, error) {
-	var report map[string]any
-	if err := json.Unmarshal(out, &report); err != nil {
-		return "", errors.New("ccusage returned invalid JSON")
+func normalizeAndFilterCcusageReport(out []byte) (string, error) {
+	report, entries, err := parseCcusageReport(out)
+	if err != nil {
+		return "", err
 	}
 
-	if daily, ok := report["daily"].([]any); ok {
-		for _, item := range daily {
-			entry, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if _, hasDate := entry["date"]; !hasDate {
-				if period, hasPeriod := entry["period"]; hasPeriod {
-					entry["date"] = period
-				}
-			}
+	maxima, err := loadUsageMaxima()
+	if err != nil {
+		return "", err
+	}
+
+	changed := []map[string]any{}
+	for _, entry := range entries {
+		date := usageDate(entry)
+		if date == "" {
+			continue
 		}
+		entry["date"] = date
+
+		currentTokens := numberValue(entry["totalTokens"])
+		cached, found := maxima[date]
+		if !found || currentTokens > numberValue(cached["totalTokens"]) {
+			snapshot := cloneUsageEntry(entry)
+			maxima[date] = snapshot
+			changed = append(changed, snapshot)
+		}
+	}
+
+	if err := writeUsageMaxima(maxima); err != nil {
+		return "", err
+	}
+
+	if len(changed) == 0 {
+		return "", errors.New("no higher combined usage rows found")
+	}
+
+	filtered := map[string]any{
+		"daily":  changed,
+		"totals": usageTotals(changed),
+	}
+	if reportType, ok := report["type"].(string); ok && reportType != "" {
+		filtered["type"] = reportType
+	}
+
+	normalized, err := json.Marshal(filtered)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
+}
+
+func normalizeCcusageReport(out []byte) (string, error) {
+	report, _, err := parseCcusageReport(out)
+	if err != nil {
+		return "", err
 	}
 
 	normalized, err := json.Marshal(report)
@@ -297,6 +334,206 @@ func normalizeCcusageReport(out []byte) (string, error) {
 		return "", err
 	}
 	return string(normalized), nil
+}
+
+func parseCcusageReport(out []byte) (map[string]any, []map[string]any, error) {
+	var report map[string]any
+	if err := json.Unmarshal(out, &report); err != nil {
+		return nil, nil, errors.New("ccusage returned invalid JSON")
+	}
+
+	rawEntries, ok := report["daily"].([]any)
+	if !ok {
+		rawEntries, ok = report["data"].([]any)
+	}
+	if !ok {
+		return nil, nil, errors.New("ccusage report has no daily data")
+	}
+
+	entries := []map[string]any{}
+	for _, item := range rawEntries {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if date := usageDate(entry); date != "" {
+			entry["date"] = date
+		}
+		entries = append(entries, entry)
+	}
+
+	if _, ok := report["daily"].([]any); ok {
+		report["daily"] = entries
+	} else {
+		report["data"] = entries
+	}
+	return report, entries, nil
+}
+
+func usageDate(entry map[string]any) string {
+	for _, key := range []string{"date", "period", "week", "month"} {
+		if raw, ok := entry[key]; ok {
+			value := strings.TrimSpace(fmt.Sprint(raw))
+			if value != "" && value != "<nil>" {
+				if len(value) >= 10 {
+					return value[:10]
+				}
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func numberValue(raw any) float64 {
+	switch value := raw.(type) {
+	case float64:
+		return value
+	case float32:
+		return float64(value)
+	case int:
+		return float64(value)
+	case int64:
+		return float64(value)
+	case json.Number:
+		parsed, _ := value.Float64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func cloneUsageEntry(entry map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range entry {
+		out[key] = value
+	}
+	return out
+}
+
+func usageTotals(entries []map[string]any) map[string]any {
+	totals := map[string]any{
+		"inputTokens":              0.0,
+		"outputTokens":             0.0,
+		"cacheCreationTokens":      0.0,
+		"cacheReadTokens":          0.0,
+		"totalInputTokens":         0.0,
+		"totalOutputTokens":        0.0,
+		"totalCacheCreationTokens": 0.0,
+		"totalCacheReadTokens":     0.0,
+		"totalTokens":              0.0,
+		"totalCost":                0.0,
+		"totalCostUSD":             0.0,
+	}
+
+	for _, entry := range entries {
+		input := numberValue(entry["inputTokens"])
+		output := numberValue(entry["outputTokens"])
+		cacheCreation := numberValue(entry["cacheCreationTokens"])
+		cacheRead := numberValue(entry["cacheReadTokens"])
+		if cacheRead == 0 {
+			cacheRead = numberValue(entry["cachedInputTokens"])
+		}
+		tokens := numberValue(entry["totalTokens"])
+		cost := numberValue(entry["totalCost"])
+		if cost == 0 {
+			cost = numberValue(entry["totalCostUSD"])
+		}
+		if cost == 0 {
+			cost = numberValue(entry["costUSD"])
+		}
+
+		totals["inputTokens"] = numberValue(totals["inputTokens"]) + input
+		totals["outputTokens"] = numberValue(totals["outputTokens"]) + output
+		totals["cacheCreationTokens"] = numberValue(totals["cacheCreationTokens"]) + cacheCreation
+		totals["cacheReadTokens"] = numberValue(totals["cacheReadTokens"]) + cacheRead
+		totals["totalInputTokens"] = numberValue(totals["totalInputTokens"]) + input
+		totals["totalOutputTokens"] = numberValue(totals["totalOutputTokens"]) + output
+		totals["totalCacheCreationTokens"] = numberValue(totals["totalCacheCreationTokens"]) + cacheCreation
+		totals["totalCacheReadTokens"] = numberValue(totals["totalCacheReadTokens"]) + cacheRead
+		totals["totalTokens"] = numberValue(totals["totalTokens"]) + tokens
+		totals["totalCost"] = numberValue(totals["totalCost"]) + cost
+		totals["totalCostUSD"] = numberValue(totals["totalCostUSD"]) + cost
+	}
+
+	return totals
+}
+
+func loadUsageMaxima() (map[string]map[string]any, error) {
+	path, err := usageMaximaPath()
+	if err != nil {
+		return nil, err
+	}
+
+	maxima := map[string]map[string]any{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return maxima, nil
+		}
+		return nil, err
+	}
+
+	var report map[string]any
+	if err := json.Unmarshal(data, &report); err != nil {
+		return nil, errors.New("invalid ~/.ccrank/usage-maxima-combined.json")
+	}
+
+	rawEntries, _ := report["daily"].([]any)
+	for _, item := range rawEntries {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+		entry["date"] = date
+		maxima[date] = entry
+	}
+	return maxima, nil
+}
+
+func writeUsageMaxima(maxima map[string]map[string]any) error {
+	path, err := usageMaximaPath()
+	if err != nil {
+		return err
+	}
+
+	dates := make([]string, 0, len(maxima))
+	for date := range maxima {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+
+	entries := make([]map[string]any, 0, len(dates))
+	for _, date := range dates {
+		entries = append(entries, maxima[date])
+	}
+
+	report := map[string]any{
+		"daily":  entries,
+		"totals": usageTotals(entries),
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	out, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	return os.WriteFile(path, out, 0o600)
+}
+
+func usageMaximaPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".ccrank", "usage-maxima-combined.json"), nil
 }
 
 func printCcusageHelp() {
