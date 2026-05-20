@@ -59,7 +59,19 @@ function extractModels(obj: Record<string, unknown>): string[] {
   if (Array.isArray(obj.models)) {
     return obj.models.map(String);
   }
+  if (obj.models && typeof obj.models === 'object') {
+    return Object.keys(obj.models);
+  }
   // Try to extract from modelBreakdowns
+  if (Array.isArray(obj.modelBreakdowns)) {
+    return obj.modelBreakdowns
+      .map((model) => {
+        if (!model || typeof model !== 'object') return '';
+        const raw = model as Record<string, unknown>;
+        return String(raw.modelName ?? raw.model ?? raw.name ?? '');
+      })
+      .filter(Boolean);
+  }
   if (obj.modelBreakdowns && typeof obj.modelBreakdowns === 'object') {
     return Object.keys(obj.modelBreakdowns);
   }
@@ -95,14 +107,14 @@ function normalizeDate(dateStr: string, type: string, index: number): string {
 }
 
 function parseDataEntry(entry: Record<string, unknown>, type: string, index: number): DailyEntry {
-  const dateField = entry.date || entry.week || entry.month || entry.sessionId || `${type}-${index}`;
+  const dateField = entry.date || entry.period || entry.week || entry.month || entry.sessionId || `${type}-${index}`;
   const models = extractModels(entry);
   return {
     date: normalizeDate(String(dateField), type, index),
     inputTokens: num(entry.inputTokens),
     outputTokens: num(entry.outputTokens),
     cacheCreationTokens: num(entry.cacheCreationTokens),
-    cacheReadTokens: num(entry.cacheReadTokens),
+    cacheReadTokens: num(entry.cacheReadTokens ?? entry.cachedInputTokens),
     totalTokens: num(entry.totalTokens),
     costUsd: extractCost(entry),
     modelsUsed: models,
@@ -115,7 +127,7 @@ function parseSummary(summary: Record<string, unknown>) {
     totalInputTokens: num(summary.totalInputTokens ?? summary.inputTokens),
     totalOutputTokens: num(summary.totalOutputTokens ?? summary.outputTokens),
     totalCacheCreationTokens: num(summary.totalCacheCreationTokens ?? summary.cacheCreationTokens),
-    totalCacheReadTokens: num(summary.totalCacheReadTokens ?? summary.cacheReadTokens),
+    totalCacheReadTokens: num(summary.totalCacheReadTokens ?? summary.cacheReadTokens ?? summary.cachedInputTokens),
     totalTokens: num(summary.totalTokens),
     totalCostUsd: extractCost(summary),
   };

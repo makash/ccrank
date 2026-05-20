@@ -50,6 +50,9 @@ func main() {
 	allFlag := flag.Bool("all", false, "Deprecated: ccusage runs automatically")
 	jsonSummary := flag.Bool("json", false, "Print summary as JSON")
 	dryRun := flag.Bool("dry-run", false, "Print payload JSON without uploading")
+	uploadUsage := flag.Bool("upload-usage", false, "Upload ccusage data in addition to git metadata")
+	skipUsage := flag.Bool("skip-usage", false, "Skip automatic ccusage upload")
+	noUsage := flag.Bool("no-usage", false, "Alias for --skip-usage")
 	addThisRepo := flag.Bool("add-repo", false, "Add current repo (or scan directory) to ~/.ccrank/repos.json and exit")
 	flag.Parse()
 
@@ -111,35 +114,31 @@ func main() {
 
 	fmt.Println("Upload complete")
 
-	// Upload Claude Code usage (ccusage)
-	fmt.Println("Checking Claude Code usage...")
+	if *skipUsage || *noUsage || !*uploadUsage {
+		fmt.Println("Usage upload skipped (use --upload-usage to enable)")
+		printSummary(summary, *jsonSummary)
+		return
+	}
+
+	// Upload combined coding-agent usage (Claude Code + Codex + other ccusage agents).
+	// ccrank production currently treats this as the legacy Claude bucket, so keep
+	// the payload combined to avoid replacing old all-agent rows with narrower data.
+	fmt.Println("Checking combined Claude Code + Codex usage...")
 	report, err := runCcusage()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "  Claude Code: skipped -", err.Error())
+		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
 		err = uploadCcusage(*urlFlag, *tokenFlag, report, machine, "claude")
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "  Claude Code: upload failed -", err.Error())
+			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 		} else {
-			fmt.Println("  Claude Code: upload complete")
+			fmt.Println("  Combined usage: upload complete")
 		}
 	}
 
-	// Upload Codex CLI usage (@ccusage/codex)
-	fmt.Println("Checking Codex CLI usage...")
-	codexReport, codexErr := runCcusageCodex()
-	if codexErr != nil {
-		fmt.Fprintln(os.Stderr, "  Codex CLI: skipped -", codexErr.Error())
-	} else {
-		codexErr = uploadCcusage(*urlFlag, *tokenFlag, codexReport, machine, "codex")
-		if codexErr != nil {
-			fmt.Fprintln(os.Stderr, "  Codex CLI: upload failed -", codexErr.Error())
-		} else {
-			fmt.Println("  Codex CLI: upload complete")
-		}
-	}
+	fmt.Println("  Codex CLI: included in combined usage upload")
 
-	if err != nil && codexErr != nil {
+	if err != nil {
 		printCcusageHelp()
 	}
 
@@ -264,26 +263,47 @@ func runCcusage() (string, error) {
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", errors.New("no Claude Code usage data found (is Node installed?)")
+		return "", errors.New("no combined usage data found (is Node installed?)")
 	}
-	return string(out), nil
+	normalized, err := normalizeCcusageReport(out)
+	if err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
-func runCcusageCodex() (string, error) {
-	cmd := exec.Command("npx", "@ccusage/codex@latest", "daily", "--json")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", errors.New("no Codex CLI usage data found")
+func normalizeCcusageReport(out []byte) (string, error) {
+	var report map[string]any
+	if err := json.Unmarshal(out, &report); err != nil {
+		return "", errors.New("ccusage returned invalid JSON")
 	}
-	return string(out), nil
+
+	if daily, ok := report["daily"].([]any); ok {
+		for _, item := range daily {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, hasDate := entry["date"]; !hasDate {
+				if period, hasPeriod := entry["period"]; hasPeriod {
+					entry["date"] = period
+				}
+			}
+		}
+	}
+
+	normalized, err := json.Marshal(report)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
 }
 
 func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "To enable usage uploads:")
 	fmt.Fprintln(os.Stderr, "  1) Install mise: https://mise.jdx.dev")
 	fmt.Fprintln(os.Stderr, "  2) From a repo folder, run:")
-	fmt.Fprintln(os.Stderr, "     Claude Code: npx ccusage@latest daily --json")
-	fmt.Fprintln(os.Stderr, "     Codex CLI:   npx @ccusage/codex@latest daily --json")
+	fmt.Fprintln(os.Stderr, "     Combined: npx ccusage@latest daily --json")
 }
 
 func uploadCcusage(baseURL, token, report, machine, platform string) error {
@@ -682,5 +702,5 @@ func printOnboardingMessage() {
 	fmt.Println("  ccrank-git --add-repo")
 	fmt.Println("It will scan recursively and add the 30 most recently active repos.")
 	fmt.Println("")
-	fmt.Println("Usage data from both Claude Code and Codex CLI is uploaded automatically.")
+	fmt.Println("Git metadata uploads by default. Use --upload-usage to include Claude Code and Codex CLI usage data.")
 }
