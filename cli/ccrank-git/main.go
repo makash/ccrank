@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -123,7 +125,7 @@ func main() {
 	// Upload combined coding-agent usage (Claude Code + Codex + other ccusage agents).
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
-	fmt.Println("Checking combined Claude Code + Codex usage...")
+	fmt.Println("Checking combined Claude Code + Codex + Antigravity usage...")
 	report, err := runCcusage()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
@@ -137,6 +139,7 @@ func main() {
 	}
 
 	fmt.Println("  Codex CLI: included in combined usage upload")
+	fmt.Println("  Gemini Antigravity: included from local transcripts when present")
 
 	if err != nil {
 		printCcusageHelp()
@@ -277,6 +280,13 @@ func normalizeAndFilterCcusageReport(out []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	antigravityEntries, err := loadAntigravityUsageEntries()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "  Gemini Antigravity: skipped -", err.Error())
+	} else if len(antigravityEntries) > 0 {
+		entries = mergeUsageEntries(entries, antigravityEntries)
+		setReportEntries(report, entries)
+	}
 
 	maxima, err := loadUsageMaxima()
 	if err != nil {
@@ -370,6 +380,178 @@ func parseCcusageReport(out []byte) (map[string]any, []map[string]any, error) {
 	return report, entries, nil
 }
 
+func setReportEntries(report map[string]any, entries []map[string]any) {
+	if _, ok := report["daily"]; ok {
+		report["daily"] = entries
+		return
+	}
+	if _, ok := report["data"]; ok {
+		report["data"] = entries
+		return
+	}
+	report["daily"] = entries
+}
+
+func mergeUsageEntries(entries []map[string]any, extras []map[string]any) []map[string]any {
+	byDate := map[string]map[string]any{}
+	order := []string{}
+
+	for _, entry := range entries {
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+		entry["date"] = date
+		if existing, ok := byDate[date]; ok {
+			mergeUsageEntry(existing, entry)
+			continue
+		}
+		byDate[date] = entry
+		order = append(order, date)
+	}
+
+	for _, entry := range extras {
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+		entry["date"] = date
+		if existing, ok := byDate[date]; ok {
+			mergeUsageEntry(existing, entry)
+			continue
+		}
+		byDate[date] = entry
+		order = append(order, date)
+	}
+
+	sort.Strings(order)
+	merged := make([]map[string]any, 0, len(order))
+	for _, date := range order {
+		merged = append(merged, byDate[date])
+	}
+	return merged
+}
+
+func mergeUsageEntry(dst map[string]any, src map[string]any) {
+	for _, key := range []string{
+		"inputTokens",
+		"outputTokens",
+		"cacheCreationTokens",
+		"cacheReadTokens",
+		"cachedInputTokens",
+		"totalInputTokens",
+		"totalOutputTokens",
+		"totalCacheCreationTokens",
+		"totalCacheReadTokens",
+		"totalTokens",
+		"totalCost",
+		"totalCostUSD",
+		"costUSD",
+	} {
+		dst[key] = numberValue(dst[key]) + numberValue(src[key])
+	}
+	dst["modelsUsed"] = mergeStringArrays(dst["modelsUsed"], src["modelsUsed"])
+	dst["modelBreakdowns"] = mergeModelBreakdowns(dst["modelBreakdowns"], src["modelBreakdowns"])
+}
+
+func mergeStringArrays(a any, b any) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(raw any) {
+		switch values := raw.(type) {
+		case []string:
+			for _, value := range values {
+				value = strings.TrimSpace(value)
+				if value != "" && !seen[value] {
+					seen[value] = true
+					out = append(out, value)
+				}
+			}
+		case []any:
+			for _, value := range values {
+				text := strings.TrimSpace(fmt.Sprint(value))
+				if text != "" && text != "<nil>" && !seen[text] {
+					seen[text] = true
+					out = append(out, text)
+				}
+			}
+		}
+	}
+	add(a)
+	add(b)
+	return out
+}
+
+func mergeModelBreakdowns(a any, b any) []map[string]any {
+	byModel := map[string]map[string]any{}
+	order := []string{}
+	add := func(raw any) {
+		for _, item := range modelBreakdownList(raw) {
+			model := modelBreakdownName(item)
+			if model == "" {
+				continue
+			}
+			existing, ok := byModel[model]
+			if !ok {
+				copied := cloneUsageEntry(item)
+				byModel[model] = copied
+				order = append(order, model)
+				continue
+			}
+			for _, key := range []string{
+				"inputTokens",
+				"outputTokens",
+				"cacheCreationTokens",
+				"cacheReadTokens",
+				"cachedInputTokens",
+				"totalTokens",
+				"cost",
+				"costUSD",
+				"totalCost",
+				"totalCostUSD",
+			} {
+				existing[key] = numberValue(existing[key]) + numberValue(item[key])
+			}
+		}
+	}
+	add(a)
+	add(b)
+
+	sort.Strings(order)
+	out := make([]map[string]any, 0, len(order))
+	for _, model := range order {
+		out = append(out, byModel[model])
+	}
+	return out
+}
+
+func modelBreakdownList(raw any) []map[string]any {
+	switch values := raw.(type) {
+	case []map[string]any:
+		return values
+	case []any:
+		out := []map[string]any{}
+		for _, item := range values {
+			if entry, ok := item.(map[string]any); ok {
+				out = append(out, entry)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func modelBreakdownName(entry map[string]any) string {
+	for _, key := range []string{"modelName", "model", "name"} {
+		value := strings.TrimSpace(fmt.Sprint(entry[key]))
+		if value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
 func usageDate(entry map[string]any) string {
 	for _, key := range []string{"date", "period", "week", "month"} {
 		if raw, ok := entry[key]; ok {
@@ -401,6 +583,212 @@ func numberValue(raw any) float64 {
 	default:
 		return 0
 	}
+}
+
+type antigravityTranscriptLine struct {
+	Source    string `json:"source"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+	Content   string `json:"content"`
+	Thinking  string `json:"thinking"`
+}
+
+type antigravityDailyUsage struct {
+	InputChars      int
+	OutputChars     int
+	TranscriptFiles int
+	Steps           int
+}
+
+func loadAntigravityUsageEntries() ([]map[string]any, error) {
+	root, err := antigravityBrainPath()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	model := antigravityModelName()
+	byDate := map[string]*antigravityDailyUsage{}
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || filepath.Base(path) != "transcript.jsonl" {
+			return nil
+		}
+		if filepath.Base(filepath.Dir(path)) != "logs" {
+			return nil
+		}
+		return readAntigravityTranscript(path, byDate)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dates := make([]string, 0, len(byDate))
+	for date := range byDate {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+
+	entries := make([]map[string]any, 0, len(dates))
+	for _, date := range dates {
+		usage := byDate[date]
+		inputTokens := estimateTokensFromChars(usage.InputChars)
+		outputTokens := estimateTokensFromChars(usage.OutputChars)
+		totalTokens := inputTokens + outputTokens
+		if totalTokens == 0 {
+			continue
+		}
+		modelBreakdown := map[string]any{
+			"modelName":               model,
+			"inputTokens":             float64(inputTokens),
+			"outputTokens":            float64(outputTokens),
+			"cacheCreationTokens":     0.0,
+			"cacheReadTokens":         0.0,
+			"totalTokens":             float64(totalTokens),
+			"cost":                    0.0,
+			"estimated":               true,
+			"estimator":               "antigravity-transcript-chars-v1",
+			"transcriptFiles":         usage.TranscriptFiles,
+			"steps":                   usage.Steps,
+			"inputTranscriptChars":    usage.InputChars,
+			"outputTranscriptChars":   usage.OutputChars,
+			"estimatedCharsPerToken":  4,
+			"estimationConservatism":  "lower-bound",
+			"estimationSource":        "local-antigravity-transcript",
+			"estimationGeneratedBy":   "ccrank",
+			"estimationGeneratedFrom": "~/.gemini/antigravity-cli/brain",
+		}
+		entries = append(entries, map[string]any{
+			"date":                     date,
+			"inputTokens":              float64(inputTokens),
+			"outputTokens":             float64(outputTokens),
+			"cacheCreationTokens":      0.0,
+			"cacheReadTokens":          0.0,
+			"totalInputTokens":         float64(inputTokens),
+			"totalOutputTokens":        float64(outputTokens),
+			"totalCacheCreationTokens": 0.0,
+			"totalCacheReadTokens":     0.0,
+			"totalTokens":              float64(totalTokens),
+			"totalCost":                0.0,
+			"totalCostUSD":             0.0,
+			"costUSD":                  0.0,
+			"modelsUsed":               []string{model},
+			"modelBreakdowns":          []map[string]any{modelBreakdown},
+			"estimated":                true,
+			"source":                   "antigravity-local-transcript",
+		})
+	}
+	return entries, nil
+}
+
+func readAntigravityTranscript(path string, byDate map[string]*antigravityDailyUsage) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	seenDates := map[string]bool{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry antigravityTranscriptLine
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		date := antigravityDate(entry.CreatedAt)
+		if date == "" || strings.EqualFold(entry.Status, "RUNNING") {
+			continue
+		}
+		usage := byDate[date]
+		if usage == nil {
+			usage = &antigravityDailyUsage{}
+			byDate[date] = usage
+		}
+		if !seenDates[date] {
+			usage.TranscriptFiles += 1
+			seenDates[date] = true
+		}
+		chars := len([]rune(entry.Content)) + len([]rune(entry.Thinking))
+		if isAntigravityModelOutput(entry) {
+			usage.OutputChars += chars
+		} else {
+			usage.InputChars += chars
+		}
+		usage.Steps += 1
+	}
+	return scanner.Err()
+}
+
+func isAntigravityModelOutput(entry antigravityTranscriptLine) bool {
+	return strings.EqualFold(entry.Source, "MODEL") && strings.EqualFold(entry.Type, "PLANNER_RESPONSE")
+}
+
+func antigravityDate(createdAt string) string {
+	createdAt = strings.TrimSpace(createdAt)
+	if createdAt == "" {
+		return ""
+	}
+	parsed, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		if len(createdAt) >= 10 {
+			return createdAt[:10]
+		}
+		return ""
+	}
+	return parsed.In(time.Local).Format("2006-01-02")
+}
+
+func estimateTokensFromChars(chars int) int {
+	if chars <= 0 {
+		return 0
+	}
+	return (chars + 3) / 4
+}
+
+func antigravityBrainPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".gemini", "antigravity-cli", "brain"), nil
+}
+
+func antigravityModelName() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "gemini-antigravity-estimate"
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"))
+	if err != nil {
+		return "gemini-antigravity-estimate"
+	}
+	var settings struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return "gemini-antigravity-estimate"
+	}
+	model := slugify(settings.Model)
+	if model == "" || model == "repo" {
+		return "gemini-antigravity-estimate"
+	}
+	if !strings.Contains(model, "gemini") {
+		model = "gemini-" + model
+	}
+	return model + "-antigravity-estimate"
 }
 
 func cloneUsageEntry(entry map[string]any) map[string]any {
