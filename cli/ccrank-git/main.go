@@ -444,11 +444,14 @@ func mergeUsageEntry(dst map[string]any, src map[string]any) {
 		"totalCacheCreationTokens",
 		"totalCacheReadTokens",
 		"totalTokens",
-		"totalCost",
-		"totalCostUSD",
-		"costUSD",
 	} {
 		dst[key] = numberValue(dst[key]) + numberValue(src[key])
+	}
+	mergedCost := usageCostValue(dst) + usageCostValue(src)
+	if mergedCost > 0 {
+		dst["totalCost"] = mergedCost
+		dst["totalCostUSD"] = mergedCost
+		dst["costUSD"] = mergedCost
 	}
 	dst["modelsUsed"] = mergeStringArrays(dst["modelsUsed"], src["modelsUsed"])
 	dst["modelBreakdowns"] = mergeModelBreakdowns(dst["modelBreakdowns"], src["modelBreakdowns"])
@@ -505,12 +508,15 @@ func mergeModelBreakdowns(a any, b any) []map[string]any {
 				"cacheReadTokens",
 				"cachedInputTokens",
 				"totalTokens",
-				"cost",
-				"costUSD",
-				"totalCost",
-				"totalCostUSD",
 			} {
 				existing[key] = numberValue(existing[key]) + numberValue(item[key])
+			}
+			mergedCost := usageCostValue(existing) + usageCostValue(item)
+			if mergedCost > 0 {
+				existing["cost"] = mergedCost
+				existing["costUSD"] = mergedCost
+				existing["totalCost"] = mergedCost
+				existing["totalCostUSD"] = mergedCost
 			}
 		}
 	}
@@ -583,6 +589,15 @@ func numberValue(raw any) float64 {
 	default:
 		return 0
 	}
+}
+
+func usageCostValue(entry map[string]any) float64 {
+	for _, key := range []string{"totalCost", "totalCostUSD", "costUSD", "cost_usd", "cost"} {
+		if value := numberValue(entry[key]); value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 type antigravityTranscriptLine struct {

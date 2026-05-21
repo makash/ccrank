@@ -105,6 +105,7 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 			"inputTokens":  40.0,
 			"outputTokens": 10.0,
 			"totalTokens":  50.0,
+			"totalCost":    5.0,
 			"modelsUsed":   []any{"claude-opus-4-6"},
 			"modelBreakdowns": []any{
 				map[string]any{
@@ -112,6 +113,7 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 					"inputTokens":  40.0,
 					"outputTokens": 10.0,
 					"totalTokens":  50.0,
+					"cost":         5.0,
 				},
 			},
 		},
@@ -122,6 +124,7 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 			"inputTokens":  7.0,
 			"outputTokens": 3.0,
 			"totalTokens":  10.0,
+			"costUSD":      0.0,
 			"modelsUsed":   []string{"gemini-antigravity-estimate"},
 			"modelBreakdowns": []map[string]any{
 				{
@@ -129,6 +132,7 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 					"inputTokens":  7.0,
 					"outputTokens": 3.0,
 					"totalTokens":  10.0,
+					"cost":         0.0,
 				},
 			},
 		},
@@ -144,6 +148,15 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 	if got := numberValue(merged[0]["inputTokens"]); got != 47 {
 		t.Fatalf("inputTokens = %v", got)
 	}
+	if got := numberValue(merged[0]["totalCost"]); got != 5 {
+		t.Fatalf("totalCost = %v", got)
+	}
+	if got := numberValue(merged[0]["totalCostUSD"]); got != 5 {
+		t.Fatalf("totalCostUSD = %v", got)
+	}
+	if got := numberValue(merged[0]["costUSD"]); got != 5 {
+		t.Fatalf("costUSD = %v", got)
+	}
 	models := merged[0]["modelsUsed"].([]string)
 	if len(models) != 2 {
 		t.Fatalf("modelsUsed = %#v", models)
@@ -151,5 +164,8 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 	breakdowns := merged[0]["modelBreakdowns"].([]map[string]any)
 	if len(breakdowns) != 2 {
 		t.Fatalf("modelBreakdowns = %#v", breakdowns)
+	}
+	if got := numberValue(breakdowns[0]["cost"]); got != 5 {
+		t.Fatalf("modelBreakdowns[0].cost = %v", got)
 	}
 }
