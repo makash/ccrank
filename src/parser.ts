@@ -2,15 +2,13 @@
  * ccusage JSON report parser
  *
  * Handles multiple report formats from ccusage and @ccusage/codex:
- * - daily: { type: "daily", data: [...], summary: {...} }
- * - weekly: { type: "weekly", data: [...], summary: {...} }
- * - session: { type: "session", data: [...], summary: {...} }
+ * - daily: { type: "daily", data: [...] | daily: [...], summary/totals: {...} }
+ * - weekly: { type: "weekly", data: [...] | weekly: [...], summary/totals: {...} }
+ * - session: { type: "session", data: [...] | sessions: [...], summary/totals: {...} }
  *
  * Also handles older formats where field names differ
- * (e.g., totalCost vs costUSD vs totalCostUSD)
- *
- * Works with both Claude Code (ccusage) and OpenAI Codex CLI (@ccusage/codex)
- * as they share the same JSON output format.
+ * (e.g., totalCost vs costUSD vs totalCostUSD) and newer ccusage
+ * versions where daily rows use `period` instead of `date`.
  */
 
 export type Platform = 'claude' | 'codex';
@@ -62,7 +60,6 @@ function extractModels(obj: Record<string, unknown>): string[] {
   if (obj.models && typeof obj.models === 'object') {
     return Object.keys(obj.models);
   }
-  // Try to extract from modelBreakdowns
   if (Array.isArray(obj.modelBreakdowns)) {
     return obj.modelBreakdowns
       .map((model) => {
@@ -87,30 +84,34 @@ export function detectPlatform(models: string[]): Platform {
   const codexContains = ['codex', 'openai'];
   for (const model of models) {
     const lower = model.toLowerCase();
-    if (codexPrefixes.some(p => lower.startsWith(p))) return 'codex';
-    if (codexContains.some(p => lower.includes(p))) return 'codex';
+    if (codexPrefixes.some((prefix) => lower.startsWith(prefix))) return 'codex';
+    if (codexContains.some((part) => lower.includes(part))) return 'codex';
   }
   return 'claude';
 }
 
-function normalizeDate(dateStr: string, type: string, index: number): string {
-  // For daily reports, the date should already be YYYY-MM-DD
+function normalizeDate(dateValue: unknown, type: string, index: number): string {
+  if (dateValue === null || dateValue === undefined || dateValue === '') {
+    throw new Error(`Missing date/period for ${type} entry at index ${index}.`);
+  }
+
+  const dateStr = String(dateValue);
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return dateStr;
   }
-  // For weekly reports, use the week start date
+  // For weekly/monthly/session reports, use the leading date.
   if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
     return dateStr.substring(0, 10);
   }
-  // Fallback: generate a synthetic date
-  return `unknown-${type}-${index}`;
+
+  throw new Error(`Invalid date/period "${dateStr}" for ${type} entry at index ${index}.`);
 }
 
 function parseDataEntry(entry: Record<string, unknown>, type: string, index: number): DailyEntry {
-  const dateField = entry.date || entry.period || entry.week || entry.month || entry.sessionId || `${type}-${index}`;
+  const dateField = entry.date || entry.period || entry.week || entry.month || entry.lastActivity || entry.sessionId;
   const models = extractModels(entry);
   return {
-    date: normalizeDate(String(dateField), type, index),
+    date: normalizeDate(dateField, type, index),
     inputTokens: num(entry.inputTokens),
     outputTokens: num(entry.outputTokens),
     cacheCreationTokens: num(entry.cacheCreationTokens),
@@ -202,9 +203,9 @@ export function parseReport(jsonStr: string): ParsedReport {
     const byDate = new Map<string, DailyEntry>();
     for (const entry of entries) {
       const raw = entry as Record<string, unknown>;
-      const lastActivity = raw.lastActivity ? String(raw.lastActivity).substring(0, 10) : 'unknown';
-      const existing = byDate.get(lastActivity);
       const parsed = parseDataEntry(raw, type, 0);
+      const lastActivity = raw.lastActivity ? normalizeDate(raw.lastActivity, type, 0) : parsed.date;
+      const existing = byDate.get(lastActivity);
       parsed.date = lastActivity;
 
       if (existing) {
@@ -216,15 +217,16 @@ export function parseReport(jsonStr: string): ParsedReport {
         existing.costUsd += parsed.costUsd;
         const modelSet = new Set([...existing.modelsUsed, ...parsed.modelsUsed]);
         existing.modelsUsed = Array.from(modelSet);
+        existing.platform = detectPlatform(existing.modelsUsed);
       } else {
         byDate.set(lastActivity, parsed);
       }
     }
     const sessionEntries = Array.from(byDate.values());
-    const reportPlatform = detectPlatform(sessionEntries.flatMap(e => e.modelsUsed));
+    const reportPlatform = detectPlatform(sessionEntries.flatMap((entry) => entry.modelsUsed));
     return { type, entries: sessionEntries, platform: reportPlatform, summary };
   }
 
-  const reportPlatform = detectPlatform(parsedEntries.flatMap(e => e.modelsUsed));
+  const reportPlatform = detectPlatform(parsedEntries.flatMap((entry) => entry.modelsUsed));
   return { type, entries: parsedEntries, platform: reportPlatform, summary };
 }
