@@ -1036,6 +1036,11 @@ app.post('/api/upload', async (c) => {
     return c.json({ ok: false, error: err.message }, 400);
   }
 
+  // Clean up legacy rows created by older parser versions when ccusage renamed date -> period.
+  await c.env.DB.prepare("DELETE FROM daily_usage WHERE user_id = ? AND source = ? AND date LIKE 'unknown-%'")
+    .bind(user.id, source)
+    .run();
+
   // Create upload record
   const uploadId = generateId();
   await c.env.DB.prepare(

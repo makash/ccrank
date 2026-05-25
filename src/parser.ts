@@ -52,7 +52,18 @@ function extractModels(obj: Record<string, unknown>): string[] {
   if (Array.isArray(obj.models)) {
     return obj.models.map(String);
   }
-  // Try to extract from modelBreakdowns
+  if (obj.models && typeof obj.models === 'object') {
+    return Object.keys(obj.models);
+  }
+  if (Array.isArray(obj.modelBreakdowns)) {
+    return obj.modelBreakdowns
+      .map((breakdown) =>
+        breakdown && typeof breakdown === 'object'
+          ? String((breakdown as Record<string, unknown>).modelName || '')
+          : ''
+      )
+      .filter(Boolean);
+  }
   if (obj.modelBreakdowns && typeof obj.modelBreakdowns === 'object') {
     return Object.keys(obj.modelBreakdowns);
   }
@@ -63,27 +74,33 @@ function num(val: unknown): number {
   return typeof val === 'number' ? val : 0;
 }
 
-function normalizeDate(dateStr: string, type: string, index: number): string {
-  // For daily reports, the date should already be YYYY-MM-DD
+function normalizeDate(dateValue: unknown, type: string, index: number): string {
+  if (dateValue === null || dateValue === undefined || dateValue === '') {
+    throw new Error(`Missing date/period for ${type} entry at index ${index}.`);
+  }
+
+  const dateStr = String(dateValue);
+  // For daily reports, the date should already be YYYY-MM-DD.
+  // Newer ccusage versions use "period" for daily rows.
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
     return dateStr;
   }
-  // For weekly reports, use the week start date
+  // For weekly/monthly/session reports, use the leading date.
   if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
     return dateStr.substring(0, 10);
   }
-  // Fallback: generate a synthetic date
-  return `unknown-${type}-${index}`;
+
+  throw new Error(`Invalid date/period "${dateStr}" for ${type} entry at index ${index}.`);
 }
 
 function parseDataEntry(entry: Record<string, unknown>, type: string, index: number): DailyEntry {
-  const dateField = entry.date || entry.week || entry.month || entry.sessionId || `${type}-${index}`;
+  const dateField = entry.date || entry.period || entry.week || entry.month || entry.lastActivity || entry.sessionId;
   return {
-    date: normalizeDate(String(dateField), type, index),
+    date: normalizeDate(dateField, type, index),
     inputTokens: num(entry.inputTokens),
     outputTokens: num(entry.outputTokens),
     cacheCreationTokens: num(entry.cacheCreationTokens),
-    cacheReadTokens: num(entry.cacheReadTokens),
+    cacheReadTokens: num(entry.cacheReadTokens ?? entry.cachedInputTokens),
     totalTokens: num(entry.totalTokens),
     costUsd: extractCost(entry),
     modelsUsed: extractModels(entry),
@@ -95,7 +112,7 @@ function parseSummary(summary: Record<string, unknown>) {
     totalInputTokens: num(summary.totalInputTokens ?? summary.inputTokens),
     totalOutputTokens: num(summary.totalOutputTokens ?? summary.outputTokens),
     totalCacheCreationTokens: num(summary.totalCacheCreationTokens ?? summary.cacheCreationTokens),
-    totalCacheReadTokens: num(summary.totalCacheReadTokens ?? summary.cacheReadTokens),
+    totalCacheReadTokens: num(summary.totalCacheReadTokens ?? summary.cacheReadTokens ?? summary.cachedInputTokens),
     totalTokens: num(summary.totalTokens),
     totalCostUsd: extractCost(summary),
   };
@@ -170,9 +187,9 @@ export function parseReport(jsonStr: string): ParsedReport {
     const byDate = new Map<string, DailyEntry>();
     for (const entry of entries) {
       const raw = entry as Record<string, unknown>;
-      const lastActivity = raw.lastActivity ? String(raw.lastActivity).substring(0, 10) : 'unknown';
-      const existing = byDate.get(lastActivity);
       const parsed = parseDataEntry(raw, type, 0);
+      const lastActivity = raw.lastActivity ? normalizeDate(raw.lastActivity, type, 0) : parsed.date;
+      const existing = byDate.get(lastActivity);
       parsed.date = lastActivity;
 
       if (existing) {
