@@ -7,9 +7,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +42,18 @@ type Payload struct {
 
 type Config struct {
 	Repos []string `json:"repos"`
+}
+
+type UsageSnapshot struct {
+	Date         string
+	DisplayName  string
+	Rank         int
+	TotalCost    float64
+	TotalTokens  float64
+	OutputTokens float64
+	CostText     string
+	TokensText   string
+	SourceURL    string
 }
 
 func main() {
@@ -86,17 +100,22 @@ func main() {
 			fmt.Fprintln(os.Stderr, err.Error())
 			os.Exit(1)
 		}
-		if created || len(cfg.Repos) == 0 {
+		if shouldShowOnboarding(created, len(cfg.Repos), *uploadUsage, *dryRun) {
 			printOnboardingMessage()
-			os.Exit(0)
+			return
 		}
 		repos = cfg.Repos
 	}
 
-	payload, summary, err := buildPayload(repos, *descFlag, machine)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+	payload := Payload{Machine: machine}
+	summary := Summary{Errors: []string{}}
+	if len(repos) > 0 {
+		var err error
+		payload, summary, err = buildPayload(repos, *descFlag, machine)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	}
 
 	if *dryRun || *urlFlag == "" || *tokenFlag == "" {
@@ -108,13 +127,16 @@ func main() {
 		return
 	}
 
-	err = uploadPayload(*urlFlag, *tokenFlag, payload)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Upload failed:", err.Error())
-		os.Exit(1)
+	if len(payload.Projects) > 0 {
+		err := uploadPayload(*urlFlag, *tokenFlag, payload)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Upload failed:", err.Error())
+			os.Exit(1)
+		}
+		fmt.Println("Upload complete")
+	} else {
+		fmt.Println("Git metadata upload skipped (no repos configured)")
 	}
-
-	fmt.Println("Upload complete")
 
 	if *skipUsage || *noUsage || !*uploadUsage {
 		fmt.Println("Usage upload skipped (use --upload-usage to enable)")
@@ -122,30 +144,42 @@ func main() {
 		return
 	}
 
-	// Upload combined coding-agent usage (Claude Code + Codex + other ccusage agents).
+	// Upload combined coding-agent usage from ccusage (Claude Code + Codex + Hermes + other agents).
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
-	fmt.Println("Checking combined Claude Code + Codex + Antigravity usage...")
-	report, err := runCcusage()
+	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
+	report, localToday, err := runCcusage()
+	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
 		err = uploadCcusage(*urlFlag, *tokenFlag, report, machine, "claude")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
+			usageErr = err
 		} else {
 			fmt.Println("  Combined usage: upload complete")
+		}
+	}
+
+	if localToday != nil {
+		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
+			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
 		}
 	}
 
 	fmt.Println("  Codex CLI: included in combined usage upload")
 	fmt.Println("  Gemini Antigravity: included from local transcripts when present")
 
-	if err != nil {
+	if usageErr != nil && shouldPrintCcusageHelp(usageErr) {
 		printCcusageHelp()
 	}
 
 	printSummary(summary, *jsonSummary)
+}
+
+func shouldShowOnboarding(created bool, repoCount int, uploadUsage bool, dryRun bool) bool {
+	return (created || repoCount == 0) && !uploadUsage && !dryRun
 }
 
 func mustWd() string {
@@ -262,23 +296,36 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 	return nil
 }
 
-func runCcusage() (string, error) {
+func runCcusage() (string, *UsageSnapshot, error) {
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", errors.New("no combined usage data found (is Node installed?)")
+		return "", nil, errors.New("no combined usage data found (is Node installed?)")
 	}
-	normalized, err := normalizeAndFilterCcusageReport(out)
+	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return normalized, nil
+	localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
+	normalized, err := normalizeAndFilterUsageReport(report, entries)
+	if err != nil {
+		return "", localToday, err
+	}
+	return normalized, localToday, nil
 }
 
 func normalizeAndFilterCcusageReport(out []byte) (string, error) {
-	report, entries, err := parseCcusageReport(out)
+	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
 		return "", err
+	}
+	return normalizeAndFilterUsageReport(report, entries)
+}
+
+func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
+	report, entries, err := parseCcusageReport(out)
+	if err != nil {
+		return nil, nil, err
 	}
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
@@ -287,7 +334,10 @@ func normalizeAndFilterCcusageReport(out []byte) (string, error) {
 		entries = mergeUsageEntries(entries, antigravityEntries)
 		setReportEntries(report, entries)
 	}
+	return report, entries, nil
+}
 
+func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]any) (string, error) {
 	maxima, err := loadUsageMaxima()
 	if err != nil {
 		return "", err
@@ -301,9 +351,8 @@ func normalizeAndFilterCcusageReport(out []byte) (string, error) {
 		}
 		entry["date"] = date
 
-		currentTokens := numberValue(entry["totalTokens"])
 		cached, found := maxima[date]
-		if !found || currentTokens > numberValue(cached["totalTokens"]) {
+		if !found || isHigherUsageSnapshot(entry, cached) {
 			snapshot := cloneUsageEntry(entry)
 			maxima[date] = snapshot
 			changed = append(changed, snapshot)
@@ -331,6 +380,32 @@ func normalizeAndFilterCcusageReport(out []byte) (string, error) {
 		return "", err
 	}
 	return string(normalized), nil
+}
+
+func usageSnapshotForDate(entries []map[string]any, date string) *UsageSnapshot {
+	date = strings.TrimSpace(date)
+	if date == "" {
+		return nil
+	}
+
+	var snapshot *UsageSnapshot
+	for _, entry := range entries {
+		if usageDate(entry) != date {
+			continue
+		}
+		if snapshot == nil {
+			snapshot = &UsageSnapshot{Date: date}
+		}
+		snapshot.TotalCost += usageCostValue(entry)
+		snapshot.TotalTokens += numberValue(entry["totalTokens"])
+		snapshot.OutputTokens += numberValue(entry["outputTokens"])
+	}
+	return snapshot
+}
+
+func isHigherUsageSnapshot(current, cached map[string]any) bool {
+	return numberValue(current["totalTokens"]) > numberValue(cached["totalTokens"]) ||
+		usageCostValue(current) > usageCostValue(cached)
 }
 
 func normalizeCcusageReport(out []byte) (string, error) {
@@ -943,7 +1018,7 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "To enable usage uploads:")
 	fmt.Fprintln(os.Stderr, "  1) Install mise: https://mise.jdx.dev")
 	fmt.Fprintln(os.Stderr, "  2) From a repo folder, run:")
-	fmt.Fprintln(os.Stderr, "     Combined: npx ccusage@latest daily --json")
+	fmt.Fprintln(os.Stderr, "     Combined all agents: npx ccusage@latest daily --json")
 }
 
 func uploadCcusage(baseURL, token, report, machine, platform string) error {
@@ -984,6 +1059,292 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 	}
 
 	return nil
+}
+
+func printDailyUsageComparison(baseURL, token string, local UsageSnapshot) error {
+	if strings.TrimSpace(baseURL) == "" {
+		return errors.New("missing leaderboard URL")
+	}
+	if strings.TrimSpace(local.Date) == "" {
+		return errors.New("local usage snapshot has no date")
+	}
+
+	remote, err := fetchAuthenticatedDailyUsage(baseURL, token, local.Date)
+	if err != nil {
+		remote, err = fetchPublicDailyLeaderboardUsage(baseURL, local)
+		if err != nil {
+			return err
+		}
+	}
+
+	status := "different"
+	if usageSnapshotsDisplayEqual(local, *remote) {
+		status = "same"
+	}
+
+	remoteLabel := "leaderboard"
+	if remote.DisplayName != "" {
+		remoteLabel = "leaderboard " + remote.DisplayName
+	}
+	fmt.Printf("  Daily leaderboard check: %s for %s\n", status, local.Date)
+	fmt.Printf("    Local: %s / %s tokens\n", snapshotCostText(local), snapshotTokensText(local))
+	fmt.Printf("    %s: %s / %s tokens\n", remoteLabel, snapshotCostText(*remote), snapshotTokensText(*remote))
+	if status != "same" && remote.SourceURL != "" {
+		fmt.Printf("    URL: %s\n", remote.SourceURL)
+	}
+	return nil
+}
+
+func fetchAuthenticatedDailyUsage(baseURL, token, date string) (*UsageSnapshot, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, errors.New("missing API token")
+	}
+
+	endpoint := strings.TrimRight(baseURL, "/") + "/api/me/usage?view=daily&date=" + url.QueryEscape(date)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("authenticated stats unavailable: %s", strings.TrimSpace(string(body)))
+	}
+
+	var parsed struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+		User  struct {
+			DisplayName string `json:"display_name"`
+		} `json:"user"`
+		Stats struct {
+			Date              string  `json:"date"`
+			TotalCost         float64 `json:"total_cost"`
+			TotalTokens       float64 `json:"total_tokens"`
+			TotalOutputTokens float64 `json:"total_output_tokens"`
+			Rank              int     `json:"rank"`
+		} `json:"stats"`
+		LeaderboardURL string `json:"leaderboard_url"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
+	}
+	if !parsed.OK {
+		if parsed.Error == "" {
+			parsed.Error = "unknown response"
+		}
+		return nil, errors.New(parsed.Error)
+	}
+
+	if parsed.Stats.Date == "" {
+		parsed.Stats.Date = date
+	}
+	return &UsageSnapshot{
+		Date:         parsed.Stats.Date,
+		DisplayName:  strings.TrimSpace(parsed.User.DisplayName),
+		Rank:         parsed.Stats.Rank,
+		TotalCost:    parsed.Stats.TotalCost,
+		TotalTokens:  parsed.Stats.TotalTokens,
+		OutputTokens: parsed.Stats.TotalOutputTokens,
+		SourceURL:    parsed.LeaderboardURL,
+	}, nil
+}
+
+func fetchPublicDailyLeaderboardUsage(baseURL string, local UsageSnapshot) (*UsageSnapshot, error) {
+	rows, sourceURL, err := fetchPublicDailyLeaderboardRows(baseURL, local.Date)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("no rows found at %s", sourceURL)
+	}
+
+	localCost := snapshotCostText(local)
+	localTokens := snapshotTokensText(local)
+	for i := range rows {
+		if snapshotCostText(rows[i]) == localCost && snapshotTokensText(rows[i]) == localTokens {
+			return &rows[i], nil
+		}
+	}
+
+	if len(rows) == 1 {
+		return &rows[0], nil
+	}
+	return nil, fmt.Errorf("could not identify your row in %s", sourceURL)
+}
+
+func fetchPublicDailyLeaderboardRows(baseURL, date string) ([]UsageSnapshot, string, error) {
+	sourceURL := dailyLeaderboardURL(baseURL, date)
+	req, err := http.NewRequest("GET", sourceURL, nil)
+	if err != nil {
+		return nil, sourceURL, err
+	}
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, sourceURL, err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, sourceURL, fmt.Errorf("leaderboard returned HTTP %d", res.StatusCode)
+	}
+
+	return parsePublicDailyLeaderboardRows(string(body), date, sourceURL), sourceURL, nil
+}
+
+func dailyLeaderboardURL(baseURL, date string) string {
+	values := url.Values{}
+	values.Set("sort", "cost")
+	values.Set("view", "daily")
+	if strings.TrimSpace(date) != "" {
+		values.Set("date", date)
+	}
+	return strings.TrimRight(baseURL, "/") + "/leaderboard?" + values.Encode()
+}
+
+func parsePublicDailyLeaderboardRows(body, date, sourceURL string) []UsageSnapshot {
+	rowRe := regexp.MustCompile(`(?is)<tr\b[^>]*>.*?</tr>`)
+	cellRe := regexp.MustCompile(`(?is)<td\b[^>]*>(.*?)</td>`)
+	rows := []UsageSnapshot{}
+
+	for _, row := range rowRe.FindAllString(body, -1) {
+		cells := cellRe.FindAllStringSubmatch(row, -1)
+		if len(cells) < 4 {
+			continue
+		}
+
+		costText := cleanHTMLText(cells[2][1])
+		tokensText := cleanHTMLText(cells[3][1])
+		cost, costErr := parseUsageCostText(costText)
+		tokens, tokensErr := parseUsageTokensText(tokensText)
+		if costErr != nil || tokensErr != nil {
+			continue
+		}
+
+		rows = append(rows, UsageSnapshot{
+			Date:        date,
+			DisplayName: publicLeaderboardDisplayName(cells[1][1]),
+			Rank:        firstInt(cleanHTMLText(cells[0][1])),
+			TotalCost:   cost,
+			TotalTokens: tokens,
+			CostText:    costText,
+			TokensText:  tokensText,
+			SourceURL:   sourceURL,
+		})
+	}
+	return rows
+}
+
+func publicLeaderboardDisplayName(cellHTML string) string {
+	linkRe := regexp.MustCompile(`(?is)<a\b[^>]*>(.*?)</a>`)
+	if match := linkRe.FindStringSubmatch(cellHTML); len(match) == 2 {
+		return cleanHTMLText(match[1])
+	}
+	return cleanHTMLText(cellHTML)
+}
+
+func cleanHTMLText(raw string) string {
+	tagRe := regexp.MustCompile(`(?is)<[^>]+>`)
+	text := tagRe.ReplaceAllString(raw, " ")
+	text = html.UnescapeString(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func firstInt(text string) int {
+	match := regexp.MustCompile(`\d+`).FindString(text)
+	if match == "" {
+		return 0
+	}
+	value, _ := strconv.Atoi(match)
+	return value
+}
+
+func parseUsageCostText(text string) (float64, error) {
+	cleaned := strings.ReplaceAll(text, ",", "")
+	cleaned = strings.TrimSpace(strings.TrimPrefix(cleaned, "$"))
+	return strconv.ParseFloat(cleaned, 64)
+}
+
+func parseUsageTokensText(text string) (float64, error) {
+	cleaned := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(text), ",", ""))
+	if cleaned == "" {
+		return 0, errors.New("empty token value")
+	}
+
+	multiplier := 1.0
+	suffix := cleaned[len(cleaned)-1:]
+	switch suffix {
+	case "B":
+		multiplier = 1_000_000_000
+		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, "B"))
+	case "M":
+		multiplier = 1_000_000
+		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, "M"))
+	case "K":
+		multiplier = 1_000
+		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, "K"))
+	}
+
+	value, err := strconv.ParseFloat(cleaned, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value * multiplier, nil
+}
+
+func usageSnapshotsDisplayEqual(local, remote UsageSnapshot) bool {
+	return snapshotCostText(local) == snapshotCostText(remote) &&
+		snapshotTokensText(local) == snapshotTokensText(remote)
+}
+
+func snapshotCostText(snapshot UsageSnapshot) string {
+	if strings.TrimSpace(snapshot.CostText) != "" {
+		return strings.TrimSpace(snapshot.CostText)
+	}
+	return formatUsageCost(snapshot.TotalCost)
+}
+
+func snapshotTokensText(snapshot UsageSnapshot) string {
+	if strings.TrimSpace(snapshot.TokensText) != "" {
+		return strings.TrimSpace(snapshot.TokensText)
+	}
+	return formatUsageTokens(snapshot.TotalTokens)
+}
+
+func formatUsageCost(cost float64) string {
+	return fmt.Sprintf("$%.2f", cost)
+}
+
+func formatUsageTokens(tokens float64) string {
+	switch {
+	case tokens >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB", tokens/1_000_000_000)
+	case tokens >= 1_000_000:
+		return fmt.Sprintf("%.1fM", tokens/1_000_000)
+	case tokens >= 1_000:
+		return fmt.Sprintf("%.1fK", tokens/1_000)
+	default:
+		return fmt.Sprintf("%.0f", tokens)
+	}
+}
+
+func shouldPrintCcusageHelp(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !strings.Contains(err.Error(), "no higher combined usage rows found")
 }
 
 type Summary struct {
@@ -1342,5 +1703,5 @@ func printOnboardingMessage() {
 	fmt.Println("  ccrank-git --add-repo")
 	fmt.Println("It will scan recursively and add the 30 most recently active repos.")
 	fmt.Println("")
-	fmt.Println("Git metadata uploads by default. Use --upload-usage to include Claude Code and Codex CLI usage data.")
+	fmt.Println("Git metadata uploads by default. Use --upload-usage to include combined ccusage data for Claude Code, Codex, Hermes, ...")
 }

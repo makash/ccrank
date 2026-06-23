@@ -176,6 +176,7 @@ Each user gets 3 invite codes. Go to **Invites** to generate and share them. Adm
 | `POST` | `/api/settings/sharing` | Yes | Save sharing prefs |
 | `GET` | `/api/leaderboard` | No | Leaderboard JSON |
 | `GET` | `/api/me` | Yes | Current user + stats |
+| `GET` | `/api/me/usage` | Yes | Current user's daily/weekly/monthly usage stats |
 | `POST` | `/api/invites/create` | Yes | Generate invite code |
 | `POST` | `/api/admin/invites` | Admin | Bulk invite codes |
 

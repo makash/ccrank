@@ -212,6 +212,10 @@ app.get('/history', async (c) => {
     total_output_tokens: row.total_output_tokens,
     days_active: row.days_active,
     last_active: row.last_active,
+    output_per_dollar: 0,
+    cache_rate: 0,
+    output_ratio: 0,
+    meets_efficiency_threshold: false,
   }));
 
   return c.html(historyPage(view, dateRange, entries, user, historyPlatform));
@@ -255,6 +259,10 @@ app.get('/', async (c) => {
       total_output_tokens: row.total_output_tokens,
       days_active: row.days_active,
       last_active: row.last_active,
+      output_per_dollar: 0,
+      cache_rate: 0,
+      output_ratio: 0,
+      meets_efficiency_threshold: false,
     }));
 
     return c.html(landingPage(entries));
@@ -649,7 +657,7 @@ app.get('/user/:slug', async (c) => {
   }
 
   return c.html(profilePage(
-    { display_name: (profileUser as any).display_name, avatar_url: (profileUser as any).avatar_url, share_slug: effectiveSlug },
+    { id: (profileUser as any).id, display_name: (profileUser as any).display_name, avatar_url: (profileUser as any).avatar_url, share_slug: effectiveSlug },
     statsObj,
     isSharingEnabled ? favTools : [],
     (heatmapRows.results || []).map((r: any) => ({ date: r.date, cost: r.cost, tokens: r.tokens, sessions: r.sessions })),
@@ -1373,7 +1381,9 @@ app.get('/api/leaderboard', async (c) => {
 });
 
 app.get('/api/me', async (c) => {
-  const user = c.get('user');
+  const sessionUser = c.get('user');
+  const tokenUser = sessionUser ? null : await getTokenUser(c);
+  const user = sessionUser || tokenUser;
   if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
 
   const stats = await c.env.DB.prepare(
@@ -1414,6 +1424,72 @@ app.get('/api/me', async (c) => {
     },
     stats,
     platformBreakdown: mePlatformBreakdown,
+  });
+});
+
+app.get('/api/me/usage', async (c) => {
+  const sessionUser = c.get('user');
+  const tokenUser = sessionUser ? null : await getTokenUser(c);
+  const user = sessionUser || tokenUser;
+  if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const viewParam = c.req.query('view') || 'daily';
+  const view: ViewType = isValidView(viewParam) ? viewParam : 'daily';
+  const today = new Date().toISOString().slice(0, 10);
+  const dateParam = c.req.query('date') || today;
+  const dateStr = isValidDateString(dateParam) ? dateParam : today;
+  const dateRange = getDateRange(view, dateStr);
+
+  const stats = await c.env.DB.prepare(
+    `SELECT
+      COALESCE(SUM(cost_usd), 0) as total_cost,
+      COALESCE(SUM(total_tokens), 0) as total_tokens,
+      COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
+      COUNT(DISTINCT date) as days_active,
+      MAX(date) as last_active
+    FROM daily_usage
+    WHERE user_id = ? AND date >= ? AND date <= ?`
+  ).bind(user.id, dateRange.startDate, dateRange.endDate).first();
+
+  const totalCost = Number((stats as any)?.total_cost ?? 0);
+  let rank = 0;
+  if (totalCost > 0) {
+    const rankResult = await c.env.DB.prepare(
+      `SELECT COUNT(*) + 1 as rank FROM (
+        SELECT user_id, SUM(cost_usd) as total_cost
+        FROM daily_usage
+        WHERE date >= ? AND date <= ?
+        GROUP BY user_id
+        HAVING total_cost > 0
+      )
+      WHERE total_cost > ?`
+    ).bind(dateRange.startDate, dateRange.endDate, totalCost).first();
+    rank = Number((rankResult as any)?.rank ?? 0);
+  }
+
+  const leaderboardUrl = `${getBaseUrl(c)}/leaderboard?sort=cost&view=${view}&date=${dateRange.startDate}`;
+
+  return c.json({
+    ok: true,
+    user: {
+      display_name: user.display_name,
+      email: user.email,
+      avatar_url: user.avatar_url,
+    },
+    stats: {
+      date: dateStr,
+      start_date: dateRange.startDate,
+      end_date: dateRange.endDate,
+      total_cost: totalCost,
+      total_tokens: Number((stats as any)?.total_tokens ?? 0),
+      total_output_tokens: Number((stats as any)?.total_output_tokens ?? 0),
+      total_cache_read: Number((stats as any)?.total_cache_read ?? 0),
+      days_active: Number((stats as any)?.days_active ?? 0),
+      last_active: (stats as any)?.last_active ?? null,
+      rank,
+    },
+    leaderboard_url: leaderboardUrl,
   });
 });
 
