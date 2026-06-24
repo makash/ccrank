@@ -142,13 +142,19 @@ ccrank-git --add-repo
 
 If you run `--add-repo` outside a repo (e.g., `~/code`), it scans recursively and adds the 30 most recently active repos.
 
-Then upload:
+Then upload git metadata:
 
 ```bash
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-ccusage runs automatically in the Go CLI. See `docs/git-metadata.md` for OS-specific downloads and details.
+Include local coding-agent usage from ccusage, Pi, and other supported sources:
+
+```bash
+ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
+```
+
+Pi usage is imported automatically from `~/.pi/agent/sessions` when present. See `docs/git-metadata.md` for OS-specific downloads and details.
 
 Generate your token in **Settings → Git Metadata**.
 

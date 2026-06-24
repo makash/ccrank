@@ -300,7 +300,17 @@ func runCcusage() (string, *UsageSnapshot, error) {
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", nil, errors.New("no combined usage data found (is Node installed?)")
+		report := map[string]any{"daily": []map[string]any{}}
+		entries := loadLocalUsageEntries(nil, report)
+		if len(entries) == 0 {
+			return "", nil, errors.New("no combined usage data found (is Node installed?)")
+		}
+		localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
+		normalized, err := normalizeAndFilterUsageReport(report, entries)
+		if err != nil {
+			return "", localToday, err
+		}
+		return normalized, localToday, nil
 	}
 	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
@@ -325,8 +335,26 @@ func normalizeAndFilterCcusageReport(out []byte) (string, error) {
 func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
 	report, entries, err := parseCcusageReport(out)
 	if err != nil {
+		report = map[string]any{"daily": []map[string]any{}}
+		entries = nil
+	}
+
+	entries = loadLocalUsageEntries(entries, report)
+	if len(entries) == 0 && err != nil {
 		return nil, nil, err
 	}
+	return report, entries, nil
+}
+
+func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []map[string]any {
+	piEntries, err := loadPiUsageEntries()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "  Pi: skipped -", err.Error())
+	} else if len(piEntries) > 0 {
+		entries = mergeUsageEntries(entries, piEntries)
+		setReportEntries(report, entries)
+	}
+
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Gemini Antigravity: skipped -", err.Error())
@@ -334,7 +362,7 @@ func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string
 		entries = mergeUsageEntries(entries, antigravityEntries)
 		setReportEntries(report, entries)
 	}
-	return report, entries, nil
+	return entries
 }
 
 func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]any) (string, error) {
@@ -673,6 +701,268 @@ func usageCostValue(entry map[string]any) float64 {
 		}
 	}
 	return 0
+}
+
+type piSessionLine struct {
+	Type      string     `json:"type"`
+	Timestamp any        `json:"timestamp"`
+	Provider  string     `json:"provider"`
+	ModelID   string     `json:"modelId"`
+	Message   *piMessage `json:"message"`
+}
+
+type piMessage struct {
+	Timestamp any      `json:"timestamp"`
+	Usage     *piUsage `json:"usage"`
+}
+
+type piUsage struct {
+	Input       float64     `json:"input"`
+	Output      float64     `json:"output"`
+	CacheRead   float64     `json:"cacheRead"`
+	CacheWrite  float64     `json:"cacheWrite"`
+	TotalTokens float64     `json:"totalTokens"`
+	Cost        piUsageCost `json:"cost"`
+}
+
+type piUsageCost struct {
+	Total float64 `json:"total"`
+}
+
+type piDailyUsage struct {
+	Input        float64
+	Output       float64
+	CacheWrite   float64
+	CacheRead    float64
+	TotalTokens  float64
+	Cost         float64
+	Messages     int
+	SessionFiles map[string]bool
+	Models       map[string]*piModelUsage
+}
+
+type piModelUsage struct {
+	Input       float64
+	Output      float64
+	CacheWrite  float64
+	CacheRead   float64
+	TotalTokens float64
+	Cost        float64
+}
+
+func loadPiUsageEntries() ([]map[string]any, error) {
+	root, err := piSessionsPath()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	byDate := map[string]*piDailyUsage{}
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
+			return nil
+		}
+		return readPiSession(path, byDate)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dates := make([]string, 0, len(byDate))
+	for date := range byDate {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+
+	entries := make([]map[string]any, 0, len(dates))
+	for _, date := range dates {
+		usage := byDate[date]
+		if usage.TotalTokens == 0 {
+			continue
+		}
+
+		modelNames := make([]string, 0, len(usage.Models))
+		for modelName := range usage.Models {
+			modelNames = append(modelNames, modelName)
+		}
+		sort.Strings(modelNames)
+
+		modelBreakdowns := make([]map[string]any, 0, len(modelNames))
+		for _, modelName := range modelNames {
+			modelUsage := usage.Models[modelName]
+			modelBreakdowns = append(modelBreakdowns, map[string]any{
+				"modelName":           modelName,
+				"inputTokens":         modelUsage.Input,
+				"outputTokens":        modelUsage.Output,
+				"cacheCreationTokens": modelUsage.CacheWrite,
+				"cacheReadTokens":     modelUsage.CacheRead,
+				"totalTokens":         modelUsage.TotalTokens,
+				"cost":                modelUsage.Cost,
+				"source":              "pi-session-jsonl",
+			})
+		}
+
+		entries = append(entries, map[string]any{
+			"date":                     date,
+			"inputTokens":              usage.Input,
+			"outputTokens":             usage.Output,
+			"cacheCreationTokens":      usage.CacheWrite,
+			"cacheReadTokens":          usage.CacheRead,
+			"totalInputTokens":         usage.Input,
+			"totalOutputTokens":        usage.Output,
+			"totalCacheCreationTokens": usage.CacheWrite,
+			"totalCacheReadTokens":     usage.CacheRead,
+			"totalTokens":              usage.TotalTokens,
+			"totalCost":                usage.Cost,
+			"totalCostUSD":             usage.Cost,
+			"costUSD":                  usage.Cost,
+			"modelsUsed":               modelNames,
+			"modelBreakdowns":          modelBreakdowns,
+			"messages":                 usage.Messages,
+			"sessionFiles":             len(usage.SessionFiles),
+			"source":                   "pi-session-jsonl",
+		})
+	}
+	return entries, nil
+}
+
+func readPiSession(path string, byDate map[string]*piDailyUsage) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	modelName := "pi-unknown"
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry piSessionLine
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+
+		if entry.Type == "model_change" {
+			modelName = piModelName(entry.Provider, entry.ModelID)
+			continue
+		}
+		if entry.Type != "message" || entry.Message == nil || entry.Message.Usage == nil {
+			continue
+		}
+
+		date := piUsageDate(entry.Timestamp)
+		if date == "" {
+			date = piUsageDate(entry.Message.Timestamp)
+		}
+		if date == "" {
+			continue
+		}
+
+		usage := entry.Message.Usage
+		inputTokens := usage.Input
+		outputTokens := usage.Output
+		cacheWriteTokens := usage.CacheWrite
+		cacheReadTokens := usage.CacheRead
+		totalTokens := usage.TotalTokens
+		if totalTokens == 0 {
+			totalTokens = inputTokens + outputTokens + cacheWriteTokens + cacheReadTokens
+		}
+		if totalTokens == 0 {
+			continue
+		}
+
+		day := byDate[date]
+		if day == nil {
+			day = &piDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*piModelUsage{}}
+			byDate[date] = day
+		}
+		day.Input += inputTokens
+		day.Output += outputTokens
+		day.CacheWrite += cacheWriteTokens
+		day.CacheRead += cacheReadTokens
+		day.TotalTokens += totalTokens
+		day.Cost += usage.Cost.Total
+		day.Messages += 1
+		day.SessionFiles[path] = true
+
+		modelUsage := day.Models[modelName]
+		if modelUsage == nil {
+			modelUsage = &piModelUsage{}
+			day.Models[modelName] = modelUsage
+		}
+		modelUsage.Input += inputTokens
+		modelUsage.Output += outputTokens
+		modelUsage.CacheWrite += cacheWriteTokens
+		modelUsage.CacheRead += cacheReadTokens
+		modelUsage.TotalTokens += totalTokens
+		modelUsage.Cost += usage.Cost.Total
+	}
+	return scanner.Err()
+}
+
+func piSessionsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".pi", "agent", "sessions"), nil
+}
+
+func piModelName(provider, modelID string) string {
+	parts := []string{"pi"}
+	provider = slugify(provider)
+	modelID = slugify(modelID)
+	if provider != "" && provider != "repo" {
+		parts = append(parts, provider)
+	}
+	if modelID != "" && modelID != "repo" {
+		parts = append(parts, modelID)
+	}
+	if len(parts) == 1 {
+		return "pi-unknown"
+	}
+	return strings.Join(parts, "-")
+}
+
+func piUsageDate(raw any) string {
+	switch value := raw.(type) {
+	case string:
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return ""
+		}
+		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+			return parsed.In(time.Local).Format("2006-01-02")
+		}
+		if len(value) >= 10 {
+			return value[:10]
+		}
+	case float64:
+		if value > 0 {
+			return time.Unix(0, int64(value)*int64(time.Millisecond)).In(time.Local).Format("2006-01-02")
+		}
+	case int64:
+		if value > 0 {
+			return time.Unix(0, value*int64(time.Millisecond)).In(time.Local).Format("2006-01-02")
+		}
+	case int:
+		if value > 0 {
+			return time.Unix(0, int64(value)*int64(time.Millisecond)).In(time.Local).Format("2006-01-02")
+		}
+	}
+	return ""
 }
 
 type antigravityTranscriptLine struct {
@@ -1019,6 +1309,7 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "  1) Install mise: https://mise.jdx.dev")
 	fmt.Fprintln(os.Stderr, "  2) From a repo folder, run:")
 	fmt.Fprintln(os.Stderr, "     Combined all agents: npx ccusage@latest daily --json")
+	fmt.Fprintln(os.Stderr, "  Pi usage is imported automatically from ~/.pi/agent/sessions when present.")
 }
 
 func uploadCcusage(baseURL, token, report, machine, platform string) error {

@@ -9,7 +9,7 @@ This adds a personal, opt-in git activity layer to your profile.
 
 ## Upload git metadata
 
-Use the Go CLI (binary). It supports config-based repo discovery and runs ccusage automatically.
+Use the Go CLI (binary). It supports config-based repo discovery and can also upload local coding-agent usage.
 
 Download the latest release:
 
@@ -23,7 +23,13 @@ Run:
 ./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-ccusage upload runs automatically (requires Node.js). If Node is missing, install `mise` and run:
+Usage upload is opt-in and requires Node.js for `ccusage`:
+
+```bash
+./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
+```
+
+The usage upload combines `ccusage` output with supported local agent logs, including Pi sessions from `~/.pi/agent/sessions` when present. If Node is missing, install `mise` and verify:
 
 ```bash
 npx ccusage@latest daily --json
@@ -97,7 +103,15 @@ Optional:
 
 ## What gets uploaded
 
+Git metadata:
+
 - Repo name and description
 - Last 28 days of commit counts (daily)
 
-No raw commit messages or diffs are uploaded.
+Usage data with `--upload-usage`:
+
+- Daily token and cost totals from `ccusage`
+- Daily token and cost totals from Pi session usage in `~/.pi/agent/sessions`
+- Model breakdowns where available
+
+No raw commit messages, diffs, prompts, responses, or Pi transcript content are uploaded.
