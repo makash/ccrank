@@ -52,7 +52,7 @@ The entire app was built on a phone using [Claude Code](https://claude.ai), depl
 | :computer: | **Multi-Machine Tracking** | Aggregate usage across laptops, desktops, and cloud instances |
 | :frame_with_picture: | **Shareable Social Cards** | OG-image-ready SVG cards with your stats for Twitter/LinkedIn |
 | :lock: | **Google OAuth** | One-click sign-in, no passwords |
-| :ticket: | **Invite-Only Registration** | Each user gets 3 invite codes to share |
+| :busts_in_silhouette: | **Public Registration** | Anyone with a Google account can join |
 | :gear: | **Admin Panel** | Bulk invite generation, platform-wide stats |
 | :new_moon: | **Dark Theme** | Beautiful dark UI, fully responsive on mobile |
 | :moneybag: | **Zero Cost Hosting** | Runs entirely on Cloudflare Workers + D1 free tier |
@@ -158,9 +158,9 @@ Pi usage is imported automatically from `~/.pi/agent/sessions` when present. See
 
 Generate your token in **Settings → Git Metadata**.
 
-### Invite your team
+### Join the leaderboard
 
-Each user gets 3 invite codes. Go to **Invites** to generate and share them. Admins can bulk-generate from the admin panel.
+Registration is public. Sign in with Google and your account is created automatically.
 
 ---
 
