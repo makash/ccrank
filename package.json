@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs",
     "db:create": "wrangler d1 create claude-leaderboard-db",
     "db:migrate": "wrangler d1 execute claude-leaderboard-db --file=migrations/0001_initial.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0003_add_source.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0004_drop_old_index.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0005_add_sharing.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0006_add_fav_tools.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0007_add_git_metadata.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0008_add_git_machine.sql && wrangler d1 execute claude-leaderboard-db --file=migrations/0009_add_platform.sql",
     "db:migrate:local": "wrangler d1 execute claude-leaderboard-db --local --file=migrations/0001_initial.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0003_add_source.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0004_drop_old_index.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0005_add_sharing.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0006_add_fav_tools.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0007_add_git_metadata.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0008_add_git_machine.sql && wrangler d1 execute claude-leaderboard-db --local --file=migrations/0009_add_platform.sql",
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250109.0",
+    "esbuild": "^0.27.3",
     "typescript": "^5.7.0",
     "wrangler": "^4.65.0"
   }

@@ -10,6 +10,7 @@ import {
   getGoogleAuthorizeUrl,
   exchangeGoogleCode,
   getGoogleUser,
+  findOrCreateGoogleUser,
   type SessionPayload,
   type GoogleUser,
 } from './auth';
@@ -954,11 +955,10 @@ app.post('/api/tokens/revoke', async (c) => {
 // ─── Auth Routes ────────────────────────────────────────────────────────────────
 
 app.get('/auth/google', (c) => {
-  const invite = c.req.query('invite') || '';
   const nonce = generateId();
 
-  // Store invite code and nonce in a cookie for the callback
-  const stateData = JSON.stringify({ invite, nonce });
+  // Store a nonce in a cookie so the callback can reject forged requests.
+  const stateData = JSON.stringify({ nonce });
   const stateB64 = btoa(stateData);
 
   setCookie(c, 'oauth_state', stateB64, {
@@ -985,14 +985,6 @@ app.get('/auth/google/callback', async (c) => {
     return c.html(errorPage('Auth Error', 'Invalid OAuth state. Please try again.'), 400);
   }
 
-  let invite = '';
-  try {
-    const stateData = JSON.parse(atob(stateParam));
-    invite = stateData.invite || '';
-  } catch {
-    // ignore parse errors
-  }
-
   let googleUser: GoogleUser;
   try {
     const redirectUri = `${getBaseUrl(c)}/auth/google/callback`;
@@ -1007,61 +999,15 @@ app.get('/auth/google/callback', async (c) => {
     return c.html(errorPage('Auth Error', err.message || 'Failed to authenticate with Google.'), 400);
   }
 
-  // Check if user already exists
-  let user = await c.env.DB.prepare('SELECT * FROM users WHERE google_id = ?')
-    .bind(googleUser.id)
-    .first();
-
-  if (!user) {
-    // New user — invite code required
-    if (!invite) {
-      return c.html(
-        errorPage(
-          'Invite Required',
-          'You need an invite code to sign up. Go back and enter your invite code before signing in.'
-        ),
-        403
-      );
-    }
-
-    // Validate invite code
-    const inviteRow = await c.env.DB.prepare(
-      'SELECT * FROM invite_codes WHERE code = ? AND use_count < max_uses'
-    )
-      .bind(invite.toUpperCase())
-      .first();
-
-    if (!inviteRow) {
-      return c.html(
-        errorPage('Invalid Invite', 'The invite code is invalid or has already been used.'),
-        403
-      );
-    }
-
-    // Create user
-    const userId = generateId();
-    const isAdmin = c.env.ADMIN_EMAIL && googleUser.email === c.env.ADMIN_EMAIL ? 1 : 0;
-
-    await c.env.DB.prepare(
-      `INSERT INTO users (id, google_id, email, display_name, avatar_url, is_admin)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-      .bind(userId, googleUser.id, googleUser.email, googleUser.name || googleUser.email, googleUser.picture, isAdmin)
-      .run();
-
-    // Mark invite as used
-    await c.env.DB.prepare(
-      'UPDATE invite_codes SET use_count = use_count + 1, used_by = ?, used_at = datetime(\'now\') WHERE code = ?'
-    )
-      .bind(userId, invite.toUpperCase())
-      .run();
-
-    user = { id: userId, email: googleUser.email } as any;
-  }
+  const user = await findOrCreateGoogleUser(
+    c.env.DB,
+    googleUser,
+    c.env.ADMIN_EMAIL
+  );
 
   // Create session
   const token = await createSessionToken(
-    { userId: (user as any).id, email: (user as any).email },
+    { userId: user.id, email: user.email },
     c.env.SESSION_SECRET
   );
 

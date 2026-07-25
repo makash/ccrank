@@ -9,7 +9,7 @@ database_name = "claude-leaderboard-db"
 database_id = "e222d37b-6d03-4ba7-afbe-6728f2cbff42"
 
 [vars]
-GOOGLE_CLIENT_ID = "612403104394-5it1f3ntgkgagvum5b728a163e80l586.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = "642319038963-knba6q844ordptje16nu1ptbf4cjgb6u.apps.googleusercontent.com"
 ADMIN_EMAIL = "akash@kloudle.com"
 
 # Set these via `wrangler secret put`:

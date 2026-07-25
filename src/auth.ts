@@ -125,8 +125,45 @@ export async function hashApiToken(token: string): Promise<string> {
 export interface GoogleUser {
   id: string;
   email: string;
+  verified_email: boolean;
   name: string;
   picture: string;
+}
+
+export interface AuthenticatedUser {
+  id: string;
+  email: string;
+}
+
+export async function findOrCreateGoogleUser(
+  db: D1Database,
+  googleUser: GoogleUser,
+  adminEmail: string
+): Promise<AuthenticatedUser> {
+  const existingUser = await db.prepare('SELECT * FROM users WHERE google_id = ?')
+    .bind(googleUser.id)
+    .first<AuthenticatedUser>();
+
+  if (existingUser) return existingUser;
+
+  const userId = generateId();
+  const isAdmin = adminEmail && googleUser.email === adminEmail ? 1 : 0;
+
+  await db.prepare(
+    `INSERT INTO users (id, google_id, email, display_name, avatar_url, is_admin)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      userId,
+      googleUser.id,
+      googleUser.email,
+      googleUser.name || googleUser.email,
+      googleUser.picture,
+      isAdmin
+    )
+    .run();
+
+  return { id: userId, email: googleUser.email };
 }
 
 export function getGoogleAuthorizeUrl(
@@ -180,5 +217,10 @@ export async function getGoogleUser(accessToken: string): Promise<GoogleUser> {
     throw new Error(`Google API error: ${res.status}`);
   }
 
-  return (await res.json()) as GoogleUser;
+  const user = (await res.json()) as GoogleUser;
+  if (!user.email || !user.verified_email) {
+    throw new Error('Google account must have a verified email address');
+  }
+
+  return user;
 }
