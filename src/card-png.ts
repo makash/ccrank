@@ -14,7 +14,7 @@ function getRankAccent(rank: number): { color: string; label: string } {
 }
 
 export function generateCardHtml(data: CardData, mode: 'simple' | 'full'): string {
-  const title = getTitle(data.totalCost);
+  const title = getTitle(data.totalTokens);
   const rankInfo = getRankAccent(data.rank);
   const displayName = data.displayName.length > 20
     ? data.displayName.slice(0, 18) + '...'
@@ -53,14 +53,14 @@ export function generateCardHtml(data: CardData, mode: 'simple' | 'full'): strin
     </div>
 
     <div style="display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px;">
-      <div style="display: flex; font-size: 72px; font-weight: 700; color: #c084fc;">${formatCost(data.totalCost)}</div>
-      <div style="display: flex; font-size: 24px; color: #9ca3af;">total spent</div>
+      <div style="display: flex; font-size: 72px; font-weight: 700; color: #22d3ee;">${formatTokens(data.totalTokens)}</div>
+      <div style="display: flex; font-size: 24px; color: #9ca3af;">total tokens</div>
     </div>
 
     <div style="display: flex; gap: 40px; margin-bottom: ${mode === 'full' ? '24px' : '0'};">
       <div style="display: flex; flex-direction: column;">
-        <div style="display: flex; font-size: 32px; font-weight: 700; color: #e5e7eb;">${formatTokens(data.totalTokens)}</div>
-        <div style="display: flex; font-size: 16px; color: #9ca3af;">Tokens</div>
+        <div style="display: flex; font-size: 32px; font-weight: 700; color: #e5e7eb;">${formatCost(data.totalCost)}</div>
+        <div style="display: flex; font-size: 16px; color: #9ca3af;">Estimated Cost</div>
       </div>
       <div style="display: flex; flex-direction: column;">
         <div style="display: flex; font-size: 32px; font-weight: 700; color: #e5e7eb;">${formatTokens(data.totalOutputTokens)}</div>

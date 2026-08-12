@@ -1,8 +1,8 @@
 <div align="center">
 
-# Claude Leaderboard
+# AI Coding Token Leaderboard
 
-### Who burns the most Claude tokens on your team?
+### Who gets the most leverage from AI coding tokens?
 
 [![Live Demo](https://img.shields.io/badge/demo-ccrank.dev-8B5CF6?style=for-the-badge)](https://ccrank.dev)
 
@@ -12,8 +12,8 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind%20CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-**Track, compare, and compete on [Claude Code](https://claude.ai) usage across your team.**
-Install the ccrank CLI (powered by [ccusage](https://github.com/ryoppippi/ccusage)). See the leaderboard. Earn titles. Talk trash.
+**Track, compare, and compete on Claude Code, Codex CLI, and Kimi Code token usage.**
+Install the ccrank CLI (powered by [ccusage](https://github.com/ryoppippi/ccusage) plus native session importers). See the leaderboard. Earn titles. Talk trash.
 
 Deploy to Cloudflare Workers in under 10 minutes. Free tier. Zero cost.
 
@@ -46,8 +46,8 @@ The entire app was built on a phone using [Claude Code](https://claude.ai), depl
 
 | | Feature | Description |
 |---|---|---|
-| :trophy: | **Live Leaderboard** | Ranked by total cost, tokens, days active, and last activity |
-| :medal_sports: | **Gamified Titles** | Apprentice, Practitioner, Power User, Token Whale, Claude Maximalist |
+| :trophy: | **Live Leaderboard** | Ranked by total tokens, with estimated cost and activity as supporting stats |
+| :medal_sports: | **Gamified Titles** | Apprentice, Practitioner, Power User, Token Whale, Token Maximalist |
 | :clock3: | **Time-Travel History** | Browse daily, weekly, and monthly snapshots with date navigation |
 | :computer: | **Multi-Machine Tracking** | Aggregate usage across laptops, desktops, and cloud instances |
 | :frame_with_picture: | **Shareable Social Cards** | OG-image-ready SVG cards with your stats for Twitter/LinkedIn |
@@ -148,13 +148,13 @@ Then upload git metadata:
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-Include local coding-agent usage from ccusage, Pi, and other supported sources:
+Include local coding-agent usage from ccusage, Pi, Kimi Code, and other supported sources:
 
 ```bash
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
 ```
 
-Pi usage is imported automatically from `~/.pi/agent/sessions` when present. See `docs/git-metadata.md` for OS-specific downloads and details.
+Pi usage is imported automatically from `~/.pi/agent/sessions`, with Moonshot/Kimi models attributed to Kimi. Native Kimi Code usage is imported from both `~/.kimi/sessions` and `~/.kimi-code/sessions`, with migrated duplicate records counted once. Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
 
 Generate your token in **Settings → Git Metadata**.
 

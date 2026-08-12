@@ -30,7 +30,7 @@ import {
   profilePage,
   errorPage,
 } from './html';
-import { isValidView, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, type ViewType } from './utils';
+import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, type ViewType } from './utils';
 import { generateCardSvg, type CardData } from './card';
 import { generateCardHtml } from './card-png';
 import { uploadCardSvg, getCardPngUrl } from './sirv';
@@ -171,7 +171,7 @@ app.get('/history', async (c) => {
 
   // Platform filter
   const platformParam = c.req.query('platform') || '';
-  const historyPlatform: string | null = (platformParam === 'claude' || platformParam === 'codex') ? platformParam : null;
+  const historyPlatform = isValidPlatform(platformParam) ? platformParam : null;
 
   const dateRange = getDateRange(view, dateStr);
 
@@ -196,8 +196,8 @@ app.get('/history', async (c) => {
     JOIN daily_usage d ON u.id = d.user_id
     WHERE d.date >= ? AND d.date <= ? ${histPlatformSQL}
     GROUP BY u.id
-    HAVING total_cost > 0
-    ORDER BY total_cost DESC
+    HAVING total_tokens > 0
+    ORDER BY total_tokens DESC
     LIMIT 10`
   )
     .bind(...histBindings)
@@ -245,8 +245,8 @@ app.get('/', async (c) => {
       FROM users u
       LEFT JOIN daily_usage d ON u.id = d.user_id
       GROUP BY u.id
-      HAVING total_cost > 0
-      ORDER BY total_cost DESC
+      HAVING total_tokens > 0
+      ORDER BY total_tokens DESC
       LIMIT 3`
     ).all();
 
@@ -284,9 +284,9 @@ app.get('/', async (c) => {
   // Get user rank
   const rankResult = await c.env.DB.prepare(
     `SELECT COUNT(*) + 1 as rank FROM (
-      SELECT user_id, SUM(cost_usd) as total_cost FROM daily_usage GROUP BY user_id
-    ) WHERE total_cost > (
-      SELECT COALESCE(SUM(cost_usd), 0) FROM daily_usage WHERE user_id = ?
+      SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage GROUP BY user_id
+    ) WHERE total_tokens > (
+      SELECT COALESCE(SUM(total_tokens), 0) FROM daily_usage WHERE user_id = ?
     )`
   )
     .bind(user.id)
@@ -329,16 +329,16 @@ app.get('/', async (c) => {
 
 app.get('/leaderboard', async (c) => {
   const user = c.get('user');
-  const sortParam = c.req.query('sort') || 'cost';
-  const sort = ['cost', 'tokens', 'output_per_dollar', 'cache_rate', 'output_ratio'].includes(sortParam) ? sortParam : 'cost';
+  const sortParam = c.req.query('sort') || 'tokens';
+  const sort = ['cost', 'tokens', 'output_per_dollar', 'cache_rate', 'output_ratio'].includes(sortParam) ? sortParam : 'tokens';
 
   // Time filter support (like history page)
   const viewParam = c.req.query('view') || '';
   const view: ViewType | null = isValidView(viewParam) ? viewParam : null;
 
-  // Platform filter (all / claude / codex)
+  // Platform filter (all / claude / codex / kimi)
   const platformParam = c.req.query('platform') || '';
-  const platform: string | null = (platformParam === 'claude' || platformParam === 'codex') ? platformParam : null;
+  const platform = isValidPlatform(platformParam) ? platformParam : null;
 
   let dateRange: ReturnType<typeof getDateRange> | null = null;
   let lbBindings: string[] = [];
@@ -383,8 +383,8 @@ app.get('/leaderboard', async (c) => {
     JOIN daily_usage d ON u.id = d.user_id
     ${whereSQL}
     GROUP BY u.id
-    HAVING total_cost > 0
-    ORDER BY total_cost DESC`;
+    HAVING total_tokens > 0
+    ORDER BY total_tokens DESC`;
 
   const stmt = c.env.DB.prepare(query);
   const results = lbBindings.length > 0
@@ -408,10 +408,10 @@ app.get('/leaderboard', async (c) => {
   }));
 
   let entries;
-  if (sort === 'cost') {
+  if (sort === 'tokens') {
     entries = allRows.map((row: any, i: number) => ({ ...row, rank: i + 1 }));
-  } else if (sort === 'tokens') {
-    const sorted = [...allRows].sort((a: any, b: any) => b.total_tokens - a.total_tokens);
+  } else if (sort === 'cost') {
+    const sorted = [...allRows].sort((a: any, b: any) => b.total_cost - a.total_cost);
     entries = sorted.map((row: any, i: number) => ({ ...row, rank: i + 1 }));
   } else {
     const qualified = allRows.filter((r: any) => r.meets_efficiency_threshold);
@@ -506,8 +506,8 @@ app.get('/user/:slug', async (c) => {
   ).bind((profileUser as any).id).first();
 
   const rankResult = await c.env.DB.prepare(
-    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(cost_usd) as total_cost FROM daily_usage GROUP BY user_id)
-     WHERE total_cost > (SELECT COALESCE(SUM(cost_usd), 0) FROM daily_usage WHERE user_id = ?)`
+    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage GROUP BY user_id)
+     WHERE total_tokens > (SELECT COALESCE(SUM(total_tokens), 0) FROM daily_usage WHERE user_id = ?)`
   ).bind((profileUser as any).id).first();
 
   // Heatmap: daily data for past 365 days
@@ -686,8 +686,8 @@ app.get('/card/:slug/image.svg', async (c) => {
   ).bind((user as any).id).first();
 
   const rankResult = await c.env.DB.prepare(
-    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(cost_usd) as total_cost FROM daily_usage GROUP BY user_id)
-     WHERE total_cost > (SELECT COALESCE(SUM(cost_usd), 0) FROM daily_usage WHERE user_id = ?)`
+    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage GROUP BY user_id)
+     WHERE total_tokens > (SELECT COALESCE(SUM(total_tokens), 0) FROM daily_usage WHERE user_id = ?)`
   ).bind((user as any).id).first();
 
   const mode = c.req.query('mode') === 'full' ? 'full' : 'simple';
@@ -748,8 +748,8 @@ app.get('/card/:slug/image.png', async (c) => {
   ).bind((user as any).id).first();
 
   const rankResult = await c.env.DB.prepare(
-    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(cost_usd) as total_cost FROM daily_usage GROUP BY user_id)
-     WHERE total_cost > (SELECT COALESCE(SUM(cost_usd), 0) FROM daily_usage WHERE user_id = ?)`
+    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage GROUP BY user_id)
+     WHERE total_tokens > (SELECT COALESCE(SUM(total_tokens), 0) FROM daily_usage WHERE user_id = ?)`
   ).bind((user as any).id).first();
 
   const mode = c.req.query('mode') === 'simple' ? 'simple' : 'full';
@@ -800,8 +800,8 @@ app.get('/card/:slug', async (c) => {
   ).bind((user as any).id).first();
 
   const rankResult = await c.env.DB.prepare(
-    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(cost_usd) as total_cost FROM daily_usage GROUP BY user_id)
-     WHERE total_cost > (SELECT COALESCE(SUM(cost_usd), 0) FROM daily_usage WHERE user_id = ?)`
+    `SELECT COUNT(*) + 1 as rank FROM (SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage GROUP BY user_id)
+     WHERE total_tokens > (SELECT COALESCE(SUM(total_tokens), 0) FROM daily_usage WHERE user_id = ?)`
   ).bind((user as any).id).first();
 
   const mode = c.req.query('mode') === 'full' ? 'full' : 'simple';
@@ -1035,7 +1035,7 @@ app.post('/api/upload', async (c) => {
   const user = sessionUser || tokenUser;
   if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
 
-  let body: { json: string; source?: string; platform?: string };
+  let body: { json: string; source?: string; platform?: string; replace?: boolean };
   try {
     body = await c.req.json();
   } catch {
@@ -1056,7 +1056,7 @@ app.post('/api/upload', async (c) => {
   }
 
   // Allow explicit platform override from CLI (e.g., ccrank-git sends platform)
-  const platformOverride = body.platform === 'codex' ? 'codex' : body.platform === 'claude' ? 'claude' : null;
+  const platformOverride = isValidPlatform(body.platform) ? body.platform : null;
   if (platformOverride) {
     report.platform = platformOverride;
     for (const entry of report.entries) {
@@ -1078,17 +1078,20 @@ app.post('/api/upload', async (c) => {
     .run();
 
   // Upsert daily usage entries (source + platform tracking)
+  const mergeValue = (column: string) => body.replace === true
+    ? `excluded.${column}`
+    : `MAX(excluded.${column}, daily_usage.${column})`;
   const stmt = c.env.DB.prepare(
     `INSERT INTO daily_usage (id, upload_id, user_id, date, source, platform, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, models_used)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, date, source, platform) DO UPDATE SET
        upload_id = excluded.upload_id,
-       input_tokens = MAX(excluded.input_tokens, daily_usage.input_tokens),
-       output_tokens = MAX(excluded.output_tokens, daily_usage.output_tokens),
-       cache_creation_tokens = MAX(excluded.cache_creation_tokens, daily_usage.cache_creation_tokens),
-       cache_read_tokens = MAX(excluded.cache_read_tokens, daily_usage.cache_read_tokens),
-       total_tokens = MAX(excluded.total_tokens, daily_usage.total_tokens),
-       cost_usd = MAX(excluded.cost_usd, daily_usage.cost_usd),
+       input_tokens = ${mergeValue('input_tokens')},
+       output_tokens = ${mergeValue('output_tokens')},
+       cache_creation_tokens = ${mergeValue('cache_creation_tokens')},
+       cache_read_tokens = ${mergeValue('cache_read_tokens')},
+       total_tokens = ${mergeValue('total_tokens')},
+       cost_usd = ${mergeValue('cost_usd')},
        models_used = excluded.models_used`
   );
 
@@ -1263,7 +1266,7 @@ app.post('/api/git/feedback', async (c) => {
 
 app.get('/api/leaderboard', async (c) => {
   const platformFilter = c.req.query('platform');
-  const validPlatform = platformFilter === 'claude' || platformFilter === 'codex' ? platformFilter : null;
+  const validPlatform = isValidPlatform(platformFilter) ? platformFilter : null;
 
   const apiLbBindings: string[] = [];
   let apiPlatformSQL = '';
@@ -1298,8 +1301,8 @@ app.get('/api/leaderboard', async (c) => {
     LEFT JOIN daily_usage d ON u.id = d.user_id
     ${apiPlatformSQL}
     GROUP BY u.id
-    HAVING total_cost > 0
-    ORDER BY total_cost DESC`
+    HAVING total_tokens > 0
+    ORDER BY total_tokens DESC`
   );
 
   const results = apiLbBindings.length > 0
@@ -1399,22 +1402,23 @@ app.get('/api/me/usage', async (c) => {
   ).bind(user.id, dateRange.startDate, dateRange.endDate).first();
 
   const totalCost = Number((stats as any)?.total_cost ?? 0);
+  const totalTokens = Number((stats as any)?.total_tokens ?? 0);
   let rank = 0;
-  if (totalCost > 0) {
+  if (totalTokens > 0) {
     const rankResult = await c.env.DB.prepare(
       `SELECT COUNT(*) + 1 as rank FROM (
-        SELECT user_id, SUM(cost_usd) as total_cost
+        SELECT user_id, SUM(total_tokens) as total_tokens
         FROM daily_usage
         WHERE date >= ? AND date <= ?
         GROUP BY user_id
-        HAVING total_cost > 0
+        HAVING total_tokens > 0
       )
-      WHERE total_cost > ?`
-    ).bind(dateRange.startDate, dateRange.endDate, totalCost).first();
+      WHERE total_tokens > ?`
+    ).bind(dateRange.startDate, dateRange.endDate, totalTokens).first();
     rank = Number((rankResult as any)?.rank ?? 0);
   }
 
-  const leaderboardUrl = `${getBaseUrl(c)}/leaderboard?sort=cost&view=${view}&date=${dateRange.startDate}`;
+  const leaderboardUrl = `${getBaseUrl(c)}/leaderboard?sort=tokens&view=${view}&date=${dateRange.startDate}`;
 
   return c.json({
     ok: true,
@@ -1428,7 +1432,7 @@ app.get('/api/me/usage', async (c) => {
       start_date: dateRange.startDate,
       end_date: dateRange.endDate,
       total_cost: totalCost,
-      total_tokens: Number((stats as any)?.total_tokens ?? 0),
+      total_tokens: totalTokens,
       total_output_tokens: Number((stats as any)?.total_output_tokens ?? 0),
       total_cache_read: Number((stats as any)?.total_cache_read ?? 0),
       days_active: Number((stats as any)?.days_active ?? 0),

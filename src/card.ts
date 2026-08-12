@@ -52,7 +52,7 @@ function getRankAccent(rank: number): { color: string; label: string } {
 export async function generateCardSvg(data: CardData, mode: 'simple' | 'full'): Promise<string> {
   await ensureYogaInit();
   const font = await getFont();
-  const title = getTitle(data.totalCost);
+  const title = getTitle(data.totalTokens);
   const rankInfo = getRankAccent(data.rank);
 
   const children: any[] = [
@@ -164,7 +164,7 @@ export async function generateCardSvg(data: CardData, mode: 'simple' | 'full'): 
         ],
       },
     },
-    // Main stat: cost
+    // Main stat: tokens
     {
       type: 'div',
       props: {
@@ -181,9 +181,9 @@ export async function generateCardSvg(data: CardData, mode: 'simple' | 'full'): 
               style: {
                 fontSize: 72,
                 fontWeight: 700,
-                color: '#c084fc',
+                color: '#22d3ee',
               },
-              children: formatCost(data.totalCost),
+              children: formatTokens(data.totalTokens),
             },
           },
           {
@@ -193,7 +193,7 @@ export async function generateCardSvg(data: CardData, mode: 'simple' | 'full'): 
                 fontSize: 24,
                 color: '#9ca3af',
               },
-              children: 'total spent',
+              children: 'total tokens',
             },
           },
         ],
@@ -209,7 +209,7 @@ export async function generateCardSvg(data: CardData, mode: 'simple' | 'full'): 
           marginBottom: mode === 'full' ? 24 : 0,
         },
         children: [
-          statBox('Tokens', formatTokens(data.totalTokens)),
+          statBox('Estimated Cost', formatCost(data.totalCost)),
           statBox('Output', formatTokens(data.totalOutputTokens)),
           statBox('Days Active', String(data.daysActive)),
         ],

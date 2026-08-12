@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +101,91 @@ func TestIsHigherUsageSnapshotDetectsTokenAndCostIncreases(t *testing.T) {
 	}
 }
 
+func TestCombinedMaximaV2AllowsKimiSplitToLowerLegacyRows(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cacheDir := filepath.Join(home, ".ccrank")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`
+	if err := os.WriteFile(filepath.Join(cacheDir, "usage-maxima-combined.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := map[string]any{"type": "daily"}
+	entries := []map[string]any{{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0}}
+	normalized, err := normalizeAndFilterUsageReport(report, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(normalized, `"totalTokens":400`) {
+		t.Fatalf("expected corrected lower row, got %s", normalized)
+	}
+
+	cache, err := os.ReadFile(filepath.Join(cacheDir, "usage-maxima-combined.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cache), `"version": 2`) {
+		t.Fatalf("expected versioned cache, got %s", cache)
+	}
+}
+
+func TestUploadCcusageRequestsAggregateReplacement(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	if err := uploadCcusage(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", true); err != nil {
+		t.Fatal(err)
+	}
+	if payload["replace"] != true {
+		t.Fatalf("replace = %#v", payload["replace"])
+	}
+	if payload["platform"] != "kimi" {
+		t.Fatalf("platform = %#v", payload["platform"])
+	}
+	if err := uploadCcusage(server.URL, "test-token", `{"daily":[]}`, "secrig", "claude", false); err != nil {
+		t.Fatal(err)
+	}
+	if payload["replace"] != false {
+		t.Fatalf("replace = %#v", payload["replace"])
+	}
+}
+
+func TestUploadUsageReportResetsMaximaAfterFailedUpload(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cacheDir := filepath.Join(home, ".ccrank")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(cacheDir, "usage-maxima-kimi.json")
+	if err := os.WriteFile(cachePath, []byte(`{"version":2,"daily":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "try again", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	err := uploadUsageReport(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", "kimi", true)
+	if err == nil {
+		t.Fatal("expected failed upload")
+	}
+	if _, statErr := os.Stat(cachePath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected retry cache removal, got %v", statErr)
+	}
+}
+
 func TestUsageSnapshotForDateSumsMatchingRows(t *testing.T) {
 	entries := []map[string]any{
 		{
@@ -139,6 +226,16 @@ func TestUsageSnapshotForDateSumsMatchingRows(t *testing.T) {
 	}
 }
 
+func TestCombineUsageSnapshotsIncludesSeparateKimiUpload(t *testing.T) {
+	combined := &UsageSnapshot{Date: "2026-08-12", TotalTokens: 100, OutputTokens: 20, TotalCost: 1}
+	kimi := &UsageSnapshot{Date: "2026-08-12", TotalTokens: 430, OutputTokens: 30, TotalCost: 0.25}
+
+	total := combineUsageSnapshots(combined, kimi)
+	if total.TotalTokens != 530 || total.OutputTokens != 50 || total.TotalCost != 1.25 {
+		t.Fatalf("combined snapshot = %#v", total)
+	}
+}
+
 func TestUsageDisplayFormattingMatchesLeaderboard(t *testing.T) {
 	snapshot := UsageSnapshot{
 		TotalCost:   558.2712551500013,
@@ -162,13 +259,13 @@ func TestUsageDisplayFormattingMatchesLeaderboard(t *testing.T) {
 func TestParsePublicDailyLeaderboardRows(t *testing.T) {
 	html := `<table><tbody><tr class="rank-1">
 		<td><span>&#x1f947;</span>1</td>
-		<td><div class="font-medium"><a href="/user/arbaz-khan">Arbaz Khan</a></div><div>Claude Maximalist</div></td>
-		<td>$547.29</td>
+		<td><div class="font-medium"><a href="/user/arbaz-khan">Arbaz Khan</a></div><div>Token Maximalist</div></td>
 		<td>562.5M</td>
+		<td>$547.29</td>
 		<td>4.3K t/$</td>
 	</tr></tbody></table>`
 
-	rows := parsePublicDailyLeaderboardRows(html, "2026-06-23", "https://ccrank.dev/leaderboard?sort=cost&view=daily")
+	rows := parsePublicDailyLeaderboardRows(html, "2026-06-23", "https://ccrank.dev/leaderboard?sort=tokens&view=daily")
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
@@ -274,6 +371,185 @@ func TestLoadAntigravityUsageEntriesBuildsEstimatedDailyRows(t *testing.T) {
 	models, ok := entry["modelsUsed"].([]string)
 	if !ok || len(models) != 1 || models[0] != "gemini-3-5-flash-high-antigravity-estimate" {
 		t.Fatalf("modelsUsed = %#v", entry["modelsUsed"])
+	}
+}
+
+func TestLoadKimiUsageEntriesAggregatesTurnsAndDeduplicatesMigratedSessions(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	duplicateRecords := []map[string]any{
+		{
+			"type":       "usage.record",
+			"time":       float64(1786038447534),
+			"model":      "moonshot-ai/kimi-k3",
+			"usageScope": "turn",
+			"usage": map[string]any{
+				"inputOther":         100,
+				"output":             20,
+				"inputCacheRead":     200,
+				"inputCacheCreation": 10,
+			},
+		},
+		{
+			"type":       "usage.record",
+			"time":       float64(1786038448000),
+			"model":      "moonshot-ai/kimi-k3",
+			"usageScope": "session",
+			"usage": map[string]any{
+				"inputOther": 9999,
+				"output":     9999,
+			},
+		},
+	}
+
+	writeJSONL := func(path string, records []map[string]any) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var data []byte
+		for _, record := range records {
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = append(data, encoded...)
+			data = append(data, '\n')
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	legacyWire := filepath.Join(home, ".kimi", "sessions", "work-a", "session-1", "wire.jsonl")
+	currentWire := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "main", "wire.jsonl")
+	writeJSONL(legacyWire, duplicateRecords)
+	writeJSONL(currentWire, duplicateRecords)
+
+	subagentWire := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "agent-0", "wire.jsonl")
+	writeJSONL(subagentWire, []map[string]any{
+		{
+			"type":       "usage.record",
+			"time":       float64(1786038450000),
+			"model":      "moonshot-ai/kimi-k3",
+			"usageScope": "turn",
+			"usage": map[string]any{
+				"inputOther":         50,
+				"output":             10,
+				"inputCacheRead":     25,
+				"inputCacheCreation": 5,
+			},
+		},
+	})
+
+	entries, err := loadKimiUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+
+	entry := entries[0]
+	if got := numberValue(entry["inputTokens"]); got != 150 {
+		t.Fatalf("inputTokens = %v", got)
+	}
+	if got := numberValue(entry["outputTokens"]); got != 30 {
+		t.Fatalf("outputTokens = %v", got)
+	}
+	if got := numberValue(entry["cacheReadTokens"]); got != 225 {
+		t.Fatalf("cacheReadTokens = %v", got)
+	}
+	if got := numberValue(entry["cacheCreationTokens"]); got != 15 {
+		t.Fatalf("cacheCreationTokens = %v", got)
+	}
+	if got := numberValue(entry["totalTokens"]); got != 420 {
+		t.Fatalf("totalTokens = %v", got)
+	}
+	if got := usageCostValue(entry); got != 0 {
+		t.Fatalf("cost = %v", got)
+	}
+	models, ok := entry["modelsUsed"].([]string)
+	if !ok || len(models) != 1 || models[0] != "moonshot-ai/kimi-k3" {
+		t.Fatalf("modelsUsed = %#v", entry["modelsUsed"])
+	}
+}
+
+func TestPiKimiUsageIsSplitFromTheLegacyCombinedPlatform(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	records := []map[string]any{
+		{"type": "model_change", "provider": "moonshot", "modelId": "kimi-k2"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 100, "output": 20, "cacheRead": 300, "cacheWrite": 10,
+				"totalTokens": 430, "cost": map[string]any{"total": 0.25},
+			}},
+		},
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:01:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+	}
+
+	var data []byte
+	for _, record := range records {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, encoded...)
+		data = append(data, '\n')
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	combined, err := loadPiUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kimi, err := loadPiKimiUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 55 {
+		t.Fatalf("combined entries = %#v", combined)
+	}
+	if len(kimi) != 1 || numberValue(kimi[0]["totalTokens"]) != 430 {
+		t.Fatalf("Kimi entries = %#v", kimi)
+	}
+	if got := usageCostValue(kimi[0]); got != 0.25 {
+		t.Fatalf("Kimi cost = %v", got)
+	}
+
+	_, _, complete, err := parseCcusageReportWithLocalExtras([]byte(`not-json`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("local-only fallback must not be marked complete for replacement upload")
 	}
 }
 
