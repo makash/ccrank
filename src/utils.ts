@@ -36,7 +36,7 @@ export interface LeaderboardEntry {
 
 export type SortKey = 'cost' | 'tokens' | 'output_per_dollar' | 'cache_rate' | 'output_ratio';
 
-export type Platform = 'claude' | 'codex';
+export type Platform = 'claude' | 'codex' | 'kimi';
 
 export type ViewType = 'daily' | 'weekly' | 'monthly';
 
@@ -95,11 +95,11 @@ export function escapeHtml(str: string): string {
 
 // ─── Title system ───────────────────────────────────────────────────────────────
 
-export function getTitle(cost: number): { label: string; color: string } {
-  if (cost >= 500) return { label: 'Claude Maximalist', color: '#f59e0b' };
-  if (cost >= 100) return { label: 'Token Whale', color: '#8b5cf6' };
-  if (cost >= 50) return { label: 'Power User', color: '#06b6d4' };
-  if (cost >= 10) return { label: 'Practitioner', color: '#10b981' };
+export function getTitle(tokens: number): { label: string; color: string } {
+  if (tokens >= 500_000_000) return { label: 'Token Maximalist', color: '#f59e0b' };
+  if (tokens >= 100_000_000) return { label: 'Token Whale', color: '#8b5cf6' };
+  if (tokens >= 50_000_000) return { label: 'Power User', color: '#06b6d4' };
+  if (tokens >= 10_000_000) return { label: 'Practitioner', color: '#10b981' };
   return { label: 'Apprentice', color: '#6b7280' };
 }
 
@@ -107,6 +107,10 @@ export function getTitle(cost: number): { label: string; color: string } {
 
 export function isValidView(view: string | undefined): view is ViewType {
   return view === 'daily' || view === 'weekly' || view === 'monthly';
+}
+
+export function isValidPlatform(platform: string | undefined): platform is Platform {
+  return platform === 'claude' || platform === 'codex' || platform === 'kimi';
 }
 
 export function isValidDateString(date: string): boolean {

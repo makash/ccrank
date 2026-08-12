@@ -148,12 +148,12 @@ func main() {
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
 	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
-	report, localToday, err := runCcusage()
+	report, localToday, combinedComplete, err := runCcusage()
 	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
-		err = uploadCcusage(*urlFlag, *tokenFlag, report, machine, "claude")
+		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, "claude", "combined", combinedComplete)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -162,17 +162,31 @@ func main() {
 		}
 	}
 
-	if localToday != nil {
-		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
-			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
-		}
-	}
-
 	fmt.Println("  Codex CLI: included in combined usage upload")
 	fmt.Println("  Gemini Antigravity: included from local transcripts when present")
 
 	if usageErr != nil && shouldPrintCcusageHelp(usageErr) {
 		printCcusageHelp()
+	}
+
+	// Kimi Code exposes exact token counts in its native wire logs. Keep native
+	// and Pi-hosted Kimi usage in a separate platform so zero-cost usage is
+	// preserved instead of being folded into the legacy combined bucket.
+	fmt.Println("Checking Kimi usage from native Kimi Code and Pi sessions...")
+	kimiReport, kimiToday, err := runKimiUsage()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "  Kimi Code: skipped -", err.Error())
+	} else if err := uploadUsageReport(*urlFlag, *tokenFlag, kimiReport, machine, "kimi", "kimi", true); err != nil {
+		fmt.Fprintln(os.Stderr, "  Kimi Code: upload failed -", err.Error())
+	} else {
+		fmt.Println("  Kimi Code: upload complete")
+	}
+
+	localToday = combineUsageSnapshots(localToday, kimiToday)
+	if localToday != nil {
+		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
+			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
+		}
 	}
 
 	printSummary(summary, *jsonSummary)
@@ -296,60 +310,64 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 	return nil
 }
 
-func runCcusage() (string, *UsageSnapshot, error) {
+func runCcusage() (string, *UsageSnapshot, bool, error) {
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json")
 	out, err := cmd.Output()
 	if err != nil {
 		report := map[string]any{"daily": []map[string]any{}}
-		entries := loadLocalUsageEntries(nil, report)
+		entries, _ := loadLocalUsageEntries(nil, report)
 		if len(entries) == 0 {
-			return "", nil, errors.New("no combined usage data found (is Node installed?)")
+			return "", nil, false, errors.New("no combined usage data found (is Node installed?)")
 		}
 		localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 		normalized, err := normalizeAndFilterUsageReport(report, entries)
 		if err != nil {
-			return "", localToday, err
+			return "", localToday, false, err
 		}
-		return normalized, localToday, nil
+		return normalized, localToday, false, nil
 	}
-	report, entries, err := parseCcusageReportWithLocalExtras(out)
+	report, entries, complete, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
 	localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 	normalized, err := normalizeAndFilterUsageReport(report, entries)
 	if err != nil {
-		return "", localToday, err
+		return "", localToday, false, err
 	}
-	return normalized, localToday, nil
+	return normalized, localToday, complete, nil
 }
 
 func normalizeAndFilterCcusageReport(out []byte) (string, error) {
-	report, entries, err := parseCcusageReportWithLocalExtras(out)
+	report, entries, _, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
 		return "", err
 	}
 	return normalizeAndFilterUsageReport(report, entries)
 }
 
-func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
+func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, bool, error) {
 	report, entries, err := parseCcusageReport(out)
+	complete := err == nil
 	if err != nil {
 		report = map[string]any{"daily": []map[string]any{}}
 		entries = nil
 	}
 
-	entries = loadLocalUsageEntries(entries, report)
+	var extrasComplete bool
+	entries, extrasComplete = loadLocalUsageEntries(entries, report)
 	if len(entries) == 0 && err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	return report, entries, nil
+	return report, entries, complete && extrasComplete, nil
 }
 
-func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []map[string]any {
+func loadLocalUsageEntries(entries []map[string]any, report map[string]any) ([]map[string]any, bool) {
+	complete := true
 	piEntries, err := loadPiUsageEntries()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Pi: skipped -", err.Error())
+		complete = false
 	} else if len(piEntries) > 0 {
 		entries = mergeUsageEntries(entries, piEntries)
 		setReportEntries(report, entries)
@@ -358,15 +376,20 @@ func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []ma
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Gemini Antigravity: skipped -", err.Error())
+		complete = false
 	} else if len(antigravityEntries) > 0 {
 		entries = mergeUsageEntries(entries, antigravityEntries)
 		setReportEntries(report, entries)
 	}
-	return entries
+	return entries, complete
 }
 
 func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]any) (string, error) {
-	maxima, err := loadUsageMaxima()
+	return normalizeAndFilterUsageReportFor(report, entries, "combined", "no higher combined usage rows found")
+}
+
+func normalizeAndFilterUsageReportFor(report map[string]any, entries []map[string]any, cacheName, unchangedMessage string) (string, error) {
+	maxima, err := loadUsageMaxima(cacheName)
 	if err != nil {
 		return "", err
 	}
@@ -387,12 +410,12 @@ func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]a
 		}
 	}
 
-	if err := writeUsageMaxima(maxima); err != nil {
+	if err := writeUsageMaxima(cacheName, maxima); err != nil {
 		return "", err
 	}
 
 	if len(changed) == 0 {
-		return "", errors.New("no higher combined usage rows found")
+		return "", errors.New(unchangedMessage)
 	}
 
 	filtered := map[string]any{
@@ -429,6 +452,24 @@ func usageSnapshotForDate(entries []map[string]any, date string) *UsageSnapshot 
 		snapshot.OutputTokens += numberValue(entry["outputTokens"])
 	}
 	return snapshot
+}
+
+func combineUsageSnapshots(first, second *UsageSnapshot) *UsageSnapshot {
+	if first == nil {
+		return second
+	}
+	if second == nil {
+		return first
+	}
+	if first.Date != second.Date {
+		return first
+	}
+	return &UsageSnapshot{
+		Date:         first.Date,
+		TotalCost:    first.TotalCost + second.TotalCost,
+		TotalTokens:  first.TotalTokens + second.TotalTokens,
+		OutputTokens: first.OutputTokens + second.OutputTokens,
+	}
 }
 
 func isHigherUsageSnapshot(current, cached map[string]any) bool {
@@ -737,6 +778,7 @@ type piDailyUsage struct {
 	TotalTokens  float64
 	Cost         float64
 	Messages     int
+	ExcludedKimi bool
 	SessionFiles map[string]bool
 	Models       map[string]*piModelUsage
 }
@@ -751,6 +793,14 @@ type piModelUsage struct {
 }
 
 func loadPiUsageEntries() ([]map[string]any, error) {
+	return loadPiUsageEntriesFor(false)
+}
+
+func loadPiKimiUsageEntries() ([]map[string]any, error) {
+	return loadPiUsageEntriesFor(true)
+}
+
+func loadPiUsageEntriesFor(kimiOnly bool) ([]map[string]any, error) {
 	root, err := piSessionsPath()
 	if err != nil {
 		return nil, err
@@ -765,12 +815,12 @@ func loadPiUsageEntries() ([]map[string]any, error) {
 	byDate := map[string]*piDailyUsage{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		return readPiSession(path, byDate)
+		return readPiSession(path, byDate, kimiOnly)
 	})
 	if err != nil {
 		return nil, err
@@ -785,7 +835,7 @@ func loadPiUsageEntries() ([]map[string]any, error) {
 	entries := make([]map[string]any, 0, len(dates))
 	for _, date := range dates {
 		usage := byDate[date]
-		if usage.TotalTokens == 0 {
+		if usage.TotalTokens == 0 && !(usage.ExcludedKimi && !kimiOnly) {
 			continue
 		}
 
@@ -834,10 +884,10 @@ func loadPiUsageEntries() ([]map[string]any, error) {
 	return entries, nil
 }
 
-func readPiSession(path string, byDate map[string]*piDailyUsage) error {
+func readPiSession(path string, byDate map[string]*piDailyUsage, kimiOnly bool) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer file.Close()
 
@@ -867,6 +917,21 @@ func readPiSession(path string, byDate map[string]*piDailyUsage) error {
 			date = piUsageDate(entry.Message.Timestamp)
 		}
 		if date == "" {
+			continue
+		}
+		isKimi := isKimiModelName(modelName)
+		if isKimi != kimiOnly {
+			// Preserve a zero row when migrating Kimi out of the legacy combined
+			// platform. That lets the first version-2 upload overwrite a stale
+			// Kimi-only combined row instead of leaving it ranked twice.
+			if isKimi && !kimiOnly {
+				day := byDate[date]
+				if day == nil {
+					day = &piDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*piModelUsage{}}
+					byDate[date] = day
+				}
+				day.ExcludedKimi = true
+			}
 			continue
 		}
 
@@ -936,6 +1001,11 @@ func piModelName(provider, modelID string) string {
 	return strings.Join(parts, "-")
 }
 
+func isKimiModelName(modelName string) bool {
+	lower := strings.ToLower(modelName)
+	return strings.Contains(lower, "kimi") || strings.Contains(lower, "moonshot")
+}
+
 func piUsageDate(raw any) string {
 	switch value := raw.(type) {
 	case string:
@@ -997,7 +1067,7 @@ func loadAntigravityUsageEntries() ([]map[string]any, error) {
 	byDate := map[string]*antigravityDailyUsage{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() || filepath.Base(path) != "transcript.jsonl" {
 			return nil
@@ -1072,7 +1142,7 @@ func loadAntigravityUsageEntries() ([]map[string]any, error) {
 func readAntigravityTranscript(path string, byDate map[string]*antigravityDailyUsage) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer file.Close()
 
@@ -1227,8 +1297,8 @@ func usageTotals(entries []map[string]any) map[string]any {
 	return totals
 }
 
-func loadUsageMaxima() (map[string]map[string]any, error) {
-	path, err := usageMaximaPath()
+func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
+	path, err := usageMaximaPath(cacheName)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,7 +1314,12 @@ func loadUsageMaxima() (map[string]map[string]any, error) {
 
 	var report map[string]any
 	if err := json.Unmarshal(data, &report); err != nil {
-		return nil, errors.New("invalid ~/.ccrank/usage-maxima-combined.json")
+		return nil, fmt.Errorf("invalid ~/.ccrank/usage-maxima-%s.json", cacheName)
+	}
+	if cacheName == "combined" && numberValue(report["version"]) != 2 {
+		// Version 2 splits Kimi out of the legacy combined platform. Treat the
+		// older maxima as empty once so lower corrected rows can overwrite it.
+		return maxima, nil
 	}
 
 	rawEntries, _ := report["daily"].([]any)
@@ -1263,8 +1338,8 @@ func loadUsageMaxima() (map[string]map[string]any, error) {
 	return maxima, nil
 }
 
-func writeUsageMaxima(maxima map[string]map[string]any) error {
-	path, err := usageMaximaPath()
+func writeUsageMaxima(cacheName string, maxima map[string]map[string]any) error {
+	path, err := usageMaximaPath(cacheName)
 	if err != nil {
 		return err
 	}
@@ -1281,8 +1356,9 @@ func writeUsageMaxima(maxima map[string]map[string]any) error {
 	}
 
 	report := map[string]any{
-		"daily":  entries,
-		"totals": usageTotals(entries),
+		"version": 2,
+		"daily":   entries,
+		"totals":  usageTotals(entries),
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -1296,12 +1372,15 @@ func writeUsageMaxima(maxima map[string]map[string]any) error {
 	return os.WriteFile(path, out, 0o600)
 }
 
-func usageMaximaPath() (string, error) {
+func usageMaximaPath(cacheName string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".ccrank", "usage-maxima-combined.json"), nil
+	if cacheName != "combined" && cacheName != "kimi" {
+		return "", errors.New("invalid usage maxima cache name")
+	}
+	return filepath.Join(home, ".ccrank", "usage-maxima-"+cacheName+".json"), nil
 }
 
 func printCcusageHelp() {
@@ -1310,9 +1389,10 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "  2) From a repo folder, run:")
 	fmt.Fprintln(os.Stderr, "     Combined all agents: npx ccusage@latest daily --json")
 	fmt.Fprintln(os.Stderr, "  Pi usage is imported automatically from ~/.pi/agent/sessions when present.")
+	fmt.Fprintln(os.Stderr, "  Kimi Code usage is imported automatically from ~/.kimi/sessions and ~/.kimi-code/sessions.")
 }
 
-func uploadCcusage(baseURL, token, report, machine, platform string) error {
+func uploadCcusage(baseURL, token, report, machine, platform string, replace bool) error {
 	baseURL = strings.TrimRight(baseURL, "/")
 	endpoint := baseURL + "/api/upload"
 
@@ -1324,6 +1404,7 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 		"json":     report,
 		"source":   source,
 		"platform": platform,
+		"replace":  replace,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1349,6 +1430,20 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 		return fmt.Errorf("%s", strings.TrimSpace(string(respBody)))
 	}
 
+	return nil
+}
+
+func uploadUsageReport(baseURL, token, report, machine, platform, cacheName string, replace bool) error {
+	if err := uploadCcusage(baseURL, token, report, machine, platform, replace); err != nil {
+		path, pathErr := usageMaximaPath(cacheName)
+		if pathErr != nil {
+			return fmt.Errorf("%w (could not resolve retry cache: %v)", err, pathErr)
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("%w (could not reset retry cache: %v)", err, removeErr)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -1378,8 +1473,8 @@ func printDailyUsageComparison(baseURL, token string, local UsageSnapshot) error
 		remoteLabel = "leaderboard " + remote.DisplayName
 	}
 	fmt.Printf("  Daily leaderboard check: %s for %s\n", status, local.Date)
-	fmt.Printf("    Local: %s / %s tokens\n", snapshotCostText(local), snapshotTokensText(local))
-	fmt.Printf("    %s: %s / %s tokens\n", remoteLabel, snapshotCostText(*remote), snapshotTokensText(*remote))
+	fmt.Printf("    Local: %s tokens / %s\n", snapshotTokensText(local), snapshotCostText(local))
+	fmt.Printf("    %s: %s tokens / %s\n", remoteLabel, snapshotTokensText(*remote), snapshotCostText(*remote))
 	if status != "same" && remote.SourceURL != "" {
 		fmt.Printf("    URL: %s\n", remote.SourceURL)
 	}
@@ -1497,7 +1592,7 @@ func fetchPublicDailyLeaderboardRows(baseURL, date string) ([]UsageSnapshot, str
 
 func dailyLeaderboardURL(baseURL, date string) string {
 	values := url.Values{}
-	values.Set("sort", "cost")
+	values.Set("sort", "tokens")
 	values.Set("view", "daily")
 	if strings.TrimSpace(date) != "" {
 		values.Set("date", date)
@@ -1516,8 +1611,8 @@ func parsePublicDailyLeaderboardRows(body, date, sourceURL string) []UsageSnapsh
 			continue
 		}
 
-		costText := cleanHTMLText(cells[2][1])
-		tokensText := cleanHTMLText(cells[3][1])
+		tokensText := cleanHTMLText(cells[2][1])
+		costText := cleanHTMLText(cells[3][1])
 		cost, costErr := parseUsageCostText(costText)
 		tokens, tokensErr := parseUsageTokensText(tokensText)
 		if costErr != nil || tokensErr != nil {
@@ -1984,7 +2079,7 @@ func gitRemoteURL(repoPath string) string {
 }
 
 func printOnboardingMessage() {
-	fmt.Println("Welcome to ccrank — track your Claude Code & Codex CLI usage.")
+	fmt.Println("Welcome to ccrank — track your Claude Code, Codex CLI & Kimi Code usage.")
 	fmt.Println("We created ~/.ccrank/repos.json to store the repos you want to upload.")
 	fmt.Println("")
 	fmt.Println("To add a single repo, run this inside a project folder:")
@@ -1994,5 +2089,5 @@ func printOnboardingMessage() {
 	fmt.Println("  ccrank-git --add-repo")
 	fmt.Println("It will scan recursively and add the 30 most recently active repos.")
 	fmt.Println("")
-	fmt.Println("Git metadata uploads by default. Use --upload-usage to include combined ccusage data for Claude Code, Codex, Hermes, ...")
+	fmt.Println("Git metadata uploads by default. Use --upload-usage to include Claude Code, Codex, Kimi, Pi, Hermes, and other supported usage.")
 }

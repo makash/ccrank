@@ -19,6 +19,12 @@ import {
 } from './utils';
 import { IMG_RAJAN_MESSAGE, IMG_CLAUDE_BUILDING, IMG_APP_SHARED, IMG_DOMAIN_PURCHASE } from './images';
 
+const PLATFORM_META = [
+  { key: 'claude', label: 'Claude Code', shortLabel: 'Claude', dot: 'bg-purple-400', text: 'text-purple-300' },
+  { key: 'codex', label: 'Codex CLI', shortLabel: 'Codex', dot: 'bg-emerald-400', text: 'text-emerald-300' },
+  { key: 'kimi', label: 'Kimi Code', shortLabel: 'Kimi', dot: 'bg-sky-400', text: 'text-sky-300' },
+] as const;
+
 function layout(title: string, content: string, user: User | null = null, ogOverrides?: { image?: string; description?: string }): string {
   const nav = user
     ? `<nav class="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
@@ -111,9 +117,9 @@ function layout(title: string, content: string, user: User | null = null, ogOver
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)} | ccrank.dev</title>
   <meta name="author" content="Akash Mahajan">
-  <meta name="description" content="Install the ccrank CLI to track your Claude Code & Codex CLI usage and see where you rank.">
+  <meta name="description" content="Install the ccrank CLI to track Claude Code, Codex CLI, and Kimi Code token usage and see where you rank.">
   <meta property="og:title" content="${escapeHtml(title)} | ccrank.dev">
-  <meta property="og:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track your Claude Code & Codex CLI usage and see where you rank.'}">
+  <meta property="og:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, and Kimi Code token usage and see where you rank.'}">
   <meta property="og:type" content="website">
   <meta property="og:image" content="${ogOverrides?.image || 'https://imgs.kloudle.com/kloudle-customer-logos/ccrank-dev/ccrank-open-graph-image.webp'}">
   <meta property="og:image:width" content="1200">
@@ -121,7 +127,7 @@ function layout(title: string, content: string, user: User | null = null, ogOver
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:creator" content="@makash">
   <meta name="twitter:title" content="${escapeHtml(title)} | ccrank.dev">
-  <meta name="twitter:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track your Claude Code & Codex CLI usage and see where you rank.'}">
+  <meta name="twitter:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, and Kimi Code token usage and see where you rank.'}">
   <meta name="twitter:image" content="${ogOverrides?.image || 'https://imgs.kloudle.com/kloudle-customer-logos/ccrank-dev/ccrank-open-graph-image.webp'}">
   <meta property="og:site_name" content="ccrank.dev">
   <meta property="og:url" content="https://ccrank.dev/">
@@ -131,8 +137,8 @@ function layout(title: string, content: string, user: User | null = null, ogOver
   {
     "@context": "https://schema.org",
     "@type": "WebApplication",
-    "name": "Claude & Codex Leaderboard",
-    "description": "Install the ccrank CLI to track your Claude Code & Codex CLI usage and see where you rank.",
+    "name": "AI Coding Token Leaderboard",
+    "description": "Install the ccrank CLI to track Claude Code, Codex CLI, and Kimi Code token usage and see where you rank.",
     "url": "https://ccrank.dev/",
     "applicationCategory": "DeveloperApplication",
     "creator": {
@@ -209,7 +215,7 @@ function layout(title: string, content: string, user: User | null = null, ogOver
 export function landingPage(topEntries: LeaderboardEntry[]): string {
   // Build podium card for a single entry
   function podiumCard(e: LeaderboardEntry): string {
-    const title = getTitle(e.total_cost);
+    const title = getTitle(e.total_tokens);
     const isFirst = e.rank === 1;
     const rankLabel = e.rank === 1 ? '#1' : e.rank === 2 ? '#2' : '#3';
     const rankColor = e.rank === 1 ? 'text-yellow-400' : e.rank === 2 ? 'text-gray-300' : 'text-amber-500';
@@ -217,7 +223,7 @@ export function landingPage(topEntries: LeaderboardEntry[]): string {
     const avatarSize = isFirst ? 'w-20 h-20' : 'w-16 h-16';
     const avatarText = isFirst ? 'text-2xl' : 'text-lg';
     const avatarRing = isFirst ? 'ring-4' : 'ring-2';
-    const costSize = isFirst ? 'text-3xl' : 'text-2xl';
+    const tokenSize = isFirst ? 'text-3xl' : 'text-2xl';
     const padding = isFirst ? 'p-8' : 'p-6';
     const rankSize = isFirst ? 'text-3xl' : 'text-2xl';
 
@@ -233,8 +239,8 @@ export function landingPage(topEntries: LeaderboardEntry[]): string {
         : escapeHtml(e.display_name)}</div>
 
       <div class="text-xs mb-3" style="color:${title.color}">${title.label}</div>
-      <div class="${costSize} font-bold text-purple-400 mb-1">${formatCost(e.total_cost)}</div>
-      <div class="text-xs text-gray-500">${formatTokens(e.total_tokens)} tokens &middot; ${e.days_active}d active</div>
+      <div class="${tokenSize} font-bold text-cyan-400 mb-1">${formatTokens(e.total_tokens)} tokens</div>
+      <div class="text-xs text-gray-500">${formatCost(e.total_cost)} estimated &middot; ${e.days_active}d active</div>
     </div>`;
   }
 
@@ -248,7 +254,7 @@ export function landingPage(topEntries: LeaderboardEntry[]): string {
     // Desktop: flex with items-end, 2nd - 1st - 3rd order, 1st is taller
     // Mobile: stack in natural 1-2-3 order
     podiumSection = `<div class="mb-12">
-      <h2 class="text-lg font-semibold text-gray-300 text-center mb-8">Top Claude Users</h2>
+      <h2 class="text-lg font-semibold text-gray-300 text-center mb-8">Top AI Coding Users</h2>
       <!-- Mobile: natural order -->
       <div class="flex flex-col gap-4 md:hidden max-w-sm mx-auto">
         ${first ? podiumCard(first) : ''}
@@ -285,7 +291,7 @@ export function landingPage(topEntries: LeaderboardEntry[]): string {
           ccrank.dev
         </h1>
         <p class="text-xl text-gray-400 max-w-lg mx-auto leading-relaxed">
-          Track Claude & Codex usage. Benchmark your leverage.
+          Track Claude, Codex & Kimi tokens. Benchmark your leverage.
         </p>
         <p class="text-xs text-gray-500 mt-2">by <a href="https://x.com/makash?utm_source=ccrank&utm_medium=web&utm_campaign=hero" target="_blank" rel="noopener" class="text-gray-400 hover:text-gray-300 transition">@makash</a></p>
       </div>
@@ -343,7 +349,7 @@ export function loginPage(): string {
 }
 
 export function dashboardPage(user: User, stats: { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number; rank: number; upload_count: number; platformBreakdown?: Record<string, { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number }> }): string {
-  const title = getTitle(stats.total_cost);
+  const title = getTitle(stats.total_tokens);
   return layout(
     'Dashboard',
     `<div class="mb-8">
@@ -356,10 +362,6 @@ export function dashboardPage(user: User, stats: { total_cost: number; total_tok
 
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-        <div class="text-sm text-gray-400 mb-1">Total Cost</div>
-        <div class="text-2xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
-      </div>
-      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <div class="text-sm text-gray-400 mb-1">Total Tokens</div>
         <div class="text-2xl font-bold text-cyan-400">${formatTokens(stats.total_tokens)}</div>
       </div>
@@ -371,38 +373,31 @@ export function dashboardPage(user: User, stats: { total_cost: number; total_tok
         <div class="text-sm text-gray-400 mb-1">Days Active</div>
         <div class="text-2xl font-bold text-yellow-400">${stats.days_active}</div>
       </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <div class="text-sm text-gray-400 mb-1">Estimated Cost</div>
+        <div class="text-2xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
+      </div>
     </div>
 
     ${(() => {
       const pb = stats.platformBreakdown;
       if (!pb || Object.keys(pb).length <= 1) return '';
-      const claude = pb['claude'];
-      const codex = pb['codex'];
-      if (!claude && !codex) return '';
-      return `<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-        ${claude ? `<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+      const cards = PLATFORM_META.flatMap((platform) => {
+        const usage = pb[platform.key];
+        if (!usage) return [];
+        return [`<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <div class="flex items-center gap-2 mb-3">
-            <span class="w-2 h-2 rounded-full bg-purple-400"></span>
-            <span class="text-sm font-medium text-purple-300">Claude Code</span>
+            <span class="w-2 h-2 rounded-full ${platform.dot}"></span>
+            <span class="text-sm font-medium ${platform.text}">${platform.label}</span>
           </div>
           <div class="flex gap-6">
-            <div><div class="text-xs text-gray-500">Cost</div><div class="text-lg font-bold text-purple-400">${formatCost(claude.total_cost)}</div></div>
-            <div><div class="text-xs text-gray-500">Tokens</div><div class="text-lg font-bold text-cyan-400">${formatTokens(claude.total_tokens)}</div></div>
-            <div><div class="text-xs text-gray-500">Days</div><div class="text-lg font-bold text-yellow-400">${claude.days_active}</div></div>
+            <div><div class="text-xs text-gray-500">Tokens</div><div class="text-lg font-bold text-cyan-400">${formatTokens(usage.total_tokens)}</div></div>
+            <div><div class="text-xs text-gray-500">Days</div><div class="text-lg font-bold text-yellow-400">${usage.days_active}</div></div>
+            <div><div class="text-xs text-gray-500">Cost</div><div class="text-lg font-bold text-purple-400">${formatCost(usage.total_cost)}</div></div>
           </div>
-        </div>` : ''}
-        ${codex ? `<div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <div class="flex items-center gap-2 mb-3">
-            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-            <span class="text-sm font-medium text-emerald-300">Codex CLI</span>
-          </div>
-          <div class="flex gap-6">
-            <div><div class="text-xs text-gray-500">Cost</div><div class="text-lg font-bold text-purple-400">${formatCost(codex.total_cost)}</div></div>
-            <div><div class="text-xs text-gray-500">Tokens</div><div class="text-lg font-bold text-cyan-400">${formatTokens(codex.total_tokens)}</div></div>
-            <div><div class="text-xs text-gray-500">Days</div><div class="text-lg font-bold text-yellow-400">${codex.days_active}</div></div>
-          </div>
-        </div>` : ''}
-      </div>`;
+        </div>`];
+      }).join('');
+      return cards ? `<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">${cards}</div>` : '';
     })()}
 
     <div class="flex gap-4 mb-8">
@@ -441,7 +436,7 @@ export function dashboardPage(user: User, stats: { total_cost: number; total_tok
 export function leaderboardPage(
   entries: LeaderboardEntry[],
   user: User | null = null,
-  sort: string = 'cost',
+  sort: string = 'tokens',
   view: ViewType | null = null,
   dateRange: DateRange | null = null,
   platform: string | null = null
@@ -450,7 +445,7 @@ export function leaderboardPage(
 
   const rows = entries
     .map((e) => {
-      const title = getTitle(e.total_cost);
+      const title = getTitle(e.total_tokens);
       const rankClass = e.rank >= 1 && e.rank <= 3 ? `rank-${e.rank}` : '';
       const medal = e.rank === 1 ? '<span class="text-yellow-400 text-lg mr-1">&#x1f947;</span>' : e.rank === 2 ? '<span class="text-gray-300 text-lg mr-1">&#x1f948;</span>' : e.rank === 3 ? '<span class="text-amber-600 text-lg mr-1">&#x1f949;</span>' : '';
       const dimClass = isEfficiencySort && e.rank === 0 ? 'opacity-50' : '';
@@ -471,12 +466,13 @@ export function leaderboardPage(
                 <span class="text-xs" style="color:${title.color}">${title.label}</span>
                 ${(e.platforms || []).includes('claude') ? '<span class="w-1.5 h-1.5 rounded-full bg-purple-400" title="Claude Code"></span>' : ''}
                 ${(e.platforms || []).includes('codex') ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Codex CLI"></span>' : ''}
+                ${(e.platforms || []).includes('kimi') ? '<span class="w-1.5 h-1.5 rounded-full bg-sky-400" title="Kimi Code"></span>' : ''}
               </div>
             </div>
           </div>
         </td>
-        <td class="py-3 px-4 text-right font-mono text-purple-400">${formatCost(e.total_cost)}</td>
         <td class="py-3 px-4 text-right font-mono text-cyan-400">${formatTokens(e.total_tokens)}</td>
+        <td class="py-3 px-4 text-right font-mono text-purple-400">${formatCost(e.total_cost)}</td>
         <td class="py-3 px-4 text-right font-mono text-emerald-400">${formatEfficiency(e.output_per_dollar)} t/$</td>
         <td class="py-3 px-4 text-right font-mono text-blue-400">${formatPercent(e.cache_rate)}</td>
         <td class="py-3 px-4 text-right font-mono text-amber-400">${formatPercent(e.output_ratio)}</td>
@@ -487,8 +483,8 @@ export function leaderboardPage(
     .join('');
 
   const sortOptions = [
-    { key: 'cost', label: 'Cost' },
     { key: 'tokens', label: 'Tokens' },
+    { key: 'cost', label: 'Cost' },
     { key: 'output_per_dollar', label: 'Output/$' },
     { key: 'cache_rate', label: 'Cache Rate' },
     { key: 'output_ratio', label: 'Output Ratio' },
@@ -516,11 +512,10 @@ export function leaderboardPage(
     })
   ].join('');
 
-  // Platform filter tabs (All / Claude / Codex)
+  // Platform filter tabs (All / Claude / Codex / Kimi)
   const platformTabsHtml = [
     { key: null, label: 'All' },
-    { key: 'claude', label: 'Claude' },
-    { key: 'codex', label: 'Codex' },
+    ...PLATFORM_META.map(({ key, shortLabel }) => ({ key, label: shortLabel })),
   ].map(p => {
     const isActive = p.key === platform;
     const href = p.key ? `/leaderboard?sort=${sort}${viewParams}&platform=${p.key}` : `/leaderboard?sort=${sort}${viewParams}`;
@@ -544,8 +539,8 @@ export function leaderboardPage(
   }
 
   const sortDescriptions: Record<string, string> = {
-    cost: 'Who\'s pushing Claude Code & Codex the hardest? Ranked by total spend.',
-    tokens: 'Who\'s consuming the most tokens? Ranked by total token usage.',
+    tokens: 'Who\'s getting the most leverage from AI coding tools? Ranked by total token usage.',
+    cost: 'Who\'s spending the most across their AI coding tools? Ranked by estimated cost.',
     output_per_dollar: 'Who gets the most code written per dollar? Masters of prompting and task scoping.',
     cache_rate: 'Who reuses context best? High cache rates mean deep, focused work on consistent projects.',
     output_ratio: 'Who gets the most output per input? Efficient prompters who let Claude do the heavy lifting.',
@@ -557,7 +552,7 @@ export function leaderboardPage(
       <div class="flex items-center justify-between flex-wrap gap-4">
         <div>
           <h1 class="text-2xl font-bold mb-1">Leaderboard</h1>
-          <p class="text-gray-400">${sortDescriptions[sort] || sortDescriptions.cost}</p>
+          <p class="text-gray-400">${sortDescriptions[sort] || sortDescriptions.tokens}</p>
           ${isEfficiencySort ? '<p class="text-xs text-gray-600 mt-1">$100 minimum spend + 10 active days to qualify for efficiency rankings.</p>' : ''}
         </div>
         <div class="flex gap-1 flex-wrap">${tabsHtml}</div>
@@ -573,6 +568,7 @@ export function leaderboardPage(
     <div class="flex items-center gap-3 mb-4 text-xs text-gray-600">
       <span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-purple-400"></span> Claude</span>
       <span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Codex</span>
+      <span class="flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span> Kimi</span>
     </div>
 
     ${dateNavHtml}
@@ -589,8 +585,8 @@ export function leaderboardPage(
               <tr class="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
                 <th class="py-3 px-4 text-center w-16">Rank</th>
                 <th class="py-3 px-4 text-left">User</th>
-                <th class="py-3 px-4 text-right">Cost</th>
                 <th class="py-3 px-4 text-right">Tokens</th>
+                <th class="py-3 px-4 text-right">Cost</th>
                 <th class="py-3 px-4 text-right">Output/$</th>
                 <th class="py-3 px-4 text-right">Cache Rate</th>
                 <th class="py-3 px-4 text-right">Output %</th>
@@ -619,21 +615,21 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
       label: 'macOS (Apple Silicon)',
       file: 'ccrank-git_darwin_arm64',
       download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64',
-      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN',
+      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
     },
     {
       key: 'linux',
       label: 'Linux x64',
       file: 'ccrank-git_linux_amd64',
       download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64',
-      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN',
+      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
     },
     {
       key: 'windows',
       label: 'Windows x64',
       file: 'ccrank-git_windows_amd64.exe',
       download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe',
-      command: 'powershell -Command \"iwr -Uri https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe -OutFile ccrank-git.exe; .\\\\ccrank-git.exe --url https://ccrank.dev --token YOUR_TOKEN\"',
+      command: 'powershell -Command \"iwr -Uri https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe -OutFile ccrank-git.exe; .\\\\ccrank-git.exe --url https://ccrank.dev --token YOUR_TOKEN --upload-usage\"',
     },
   ];
 
@@ -703,6 +699,11 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
         <h2 class="text-sm font-semibold text-gray-200 mb-2">Multiple devices?</h2>
         <p class="text-sm text-gray-400">Add <code class="bg-gray-800 px-1 rounded">--machine laptop</code> so each device stays separate.</p>
+      </div>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
+        <h2 class="text-sm font-semibold text-gray-200 mb-2">Using Kimi Code?</h2>
+        <p class="text-sm text-gray-400">The CLI imports native Kimi token records automatically from <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi/sessions</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi-code/sessions</code> when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded">--upload-usage</code>. Migrated duplicate sessions are counted once, and only aggregated usage is uploaded&mdash;never raw prompts or responses.</p>
       </div>
 
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
@@ -935,7 +936,7 @@ export function aboutPage(user: User | null = null): string {
       <p class="text-gray-400 mb-10">How a WhatsApp message became a live leaderboard in minutes.</p>
 
       <p class="text-gray-400 mb-8 text-lg leading-relaxed">
-        ccrank.dev is an open-source developer ranking platform for Claude Code & Codex CLI usage.
+        ccrank.dev is an open-source developer ranking platform for Claude Code, Codex CLI, and Kimi Code token usage.
         Track, compare, and compete on your team's AI-assisted development metrics.
       </p>
 
@@ -983,10 +984,10 @@ export function aboutPage(user: User | null = null): string {
       <section class="mb-10">
         <h2 class="text-xl font-bold mb-4 text-yellow-400">What This Leaderboard Is For</h2>
         <ul class="text-gray-300 space-y-2">
-          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Track your Claude Code & Codex CLI usage across days and weeks</li>
-          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Friendly competition &mdash; who&rsquo;s the biggest Claude power user?</li>
-          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Cost awareness &mdash; see what Claude Code & Codex actually costs</li>
-          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Fun titles &mdash; from Apprentice to Claude Maximalist</li>
+          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Track AI coding token usage across days, weeks, tools, and machines</li>
+          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Friendly competition &mdash; who&rsquo;s getting the most AI coding leverage?</li>
+          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Compare Claude Code, Codex CLI, and Kimi Code on one profile</li>
+          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Fun titles &mdash; from Apprentice to Token Maximalist</li>
         </ul>
       </section>
 
@@ -1017,7 +1018,7 @@ export function aboutPage(user: User | null = null): string {
             <div class="text-sm font-semibold text-white mb-1">Powered by ccusage</div>
             <p class="text-sm text-gray-400">
               <a href="https://github.com/ryoppippi/ccusage?utm_source=claude-leaderboard&utm_medium=web&utm_campaign=about" target="_blank" rel="noopener" class="text-purple-400 hover:text-purple-300 transition">ccusage</a>
-              by <strong class="text-gray-300">ryoppippi</strong> &mdash; the CLI tool that makes Claude Code & Codex usage tracking possible.
+              by <strong class="text-gray-300">ryoppippi</strong> powers Claude Code and Codex usage tracking; ccrank&rsquo;s native importer adds Kimi Code.
               Without it, there&rsquo;d be no data to leaderboard.
             </p>
           </div>
@@ -1065,8 +1066,7 @@ export function historyPage(
   // Platform filter tabs
   const histPlatformTabs = [
     { key: null, label: 'All' },
-    { key: 'claude', label: 'Claude' },
-    { key: 'codex', label: 'Codex' },
+    ...PLATFORM_META.map(({ key, shortLabel }) => ({ key, label: shortLabel })),
   ].map(p => {
     const isActive = p.key === platform;
     const href = p.key ? `/history?view=${view}&platform=${p.key}` : `/history?view=${view}`;
@@ -1075,7 +1075,7 @@ export function historyPage(
 
   const rows = entries.length > 0
     ? entries.map((e) => {
-        const title = getTitle(e.total_cost);
+        const title = getTitle(e.total_tokens);
         const rankClass = e.rank <= 3 ? `rank-${e.rank}` : '';
         const medal = e.rank === 1 ? '<span class="text-yellow-400 mr-1">&#x1f947;</span>' : e.rank === 2 ? '<span class="text-gray-300 mr-1">&#x1f948;</span>' : e.rank === 3 ? '<span class="text-amber-600 mr-1">&#x1f949;</span>' : '';
         const profileHref = e.share_slug ? `/user/${escapeHtml(e.share_slug)}` : '#';
@@ -1094,8 +1094,8 @@ export function historyPage(
               </div>
             </div>
           </td>
-          <td class="py-3 px-4 text-right font-mono text-purple-400">${formatCost(e.total_cost)}</td>
           <td class="py-3 px-4 text-right font-mono text-cyan-400">${formatTokens(e.total_tokens)}</td>
+          <td class="py-3 px-4 text-right font-mono text-purple-400">${formatCost(e.total_cost)}</td>
           <td class="py-3 px-4 text-right text-sm text-gray-400">${e.days_active}</td>
         </tr>`;
       }).join('')
@@ -1142,8 +1142,8 @@ export function historyPage(
                 <tr class="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
                   <th class="py-3 px-4 text-center w-16">Rank</th>
                   <th class="py-3 px-4 text-left">User</th>
-                  <th class="py-3 px-4 text-right">Cost</th>
                   <th class="py-3 px-4 text-right">Tokens</th>
+                  <th class="py-3 px-4 text-right">Cost</th>
                   <th class="py-3 px-4 text-right">Days</th>
                 </tr>
               </thead>
@@ -1162,29 +1162,29 @@ export function cardPage(
   stats: { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number; rank: number; last_active: string | null },
   mode: 'simple' | 'full'
 ): string {
-  const title = getTitle(stats.total_cost);
+  const title = getTitle(stats.total_tokens);
   const rankLabel = `#${stats.rank}`;
   const rankColor = stats.rank === 1 ? '#eab308' : stats.rank === 2 ? '#9ca3af' : stats.rank === 3 ? '#b45309' : '#7c3aed';
   const cardUrl = `https://ccrank.dev/card/${escapeHtml(cardUser.share_slug)}`;
   const imageUrl = `https://ccrank.dev/card/${escapeHtml(cardUser.share_slug)}/image.png`;
-  const tweetText = encodeURIComponent(`I'm ranked ${rankLabel} on the ccrank.dev Leaderboard with ${formatCost(stats.total_cost)} spent! Check your ranking at ccrank.dev`);
+  const tweetText = encodeURIComponent(`I'm ranked ${rankLabel} on the ccrank.dev token leaderboard with ${formatTokens(stats.total_tokens)} tokens! Check your ranking at ccrank.dev`);
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(cardUser.display_name)}'s Claude Stats - ccrank.dev</title>
-  <meta property="og:title" content="${escapeHtml(cardUser.display_name)} - ${rankLabel} on the Claude Code & Codex Leaderboard | ccrank.dev">
-  <meta property="og:description" content="${title.label} with ${formatCost(stats.total_cost)} spent on AI coding tools. ${stats.days_active} days active. ccrank.dev is the leaderboard for AI coding power users.">
+  <title>${escapeHtml(cardUser.display_name)}'s AI Coding Stats - ccrank.dev</title>
+  <meta property="og:title" content="${escapeHtml(cardUser.display_name)} - ${rankLabel} on the AI Coding Token Leaderboard | ccrank.dev">
+  <meta property="og:description" content="${title.label} with ${formatTokens(stats.total_tokens)} tokens across AI coding tools. ${stats.days_active} days active.">
   <meta property="og:image" content="${imageUrl}">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:url" content="${cardUrl}">
   <meta property="og:type" content="profile">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="${escapeHtml(cardUser.display_name)} - ${rankLabel} on the Claude Code & Codex Leaderboard | ccrank.dev">
-  <meta name="twitter:description" content="${title.label} with ${formatCost(stats.total_cost)} spent. ${stats.days_active} days active. ccrank.dev is the leaderboard for AI coding power users.">
+  <meta name="twitter:title" content="${escapeHtml(cardUser.display_name)} - ${rankLabel} on the AI Coding Token Leaderboard | ccrank.dev">
+  <meta name="twitter:description" content="${title.label} with ${formatTokens(stats.total_tokens)} tokens. ${stats.days_active} days active.">
   <meta name="twitter:image" content="${imageUrl}">
   <meta name="twitter:creator" content="@makash">
   <script src="https://cdn.tailwindcss.com"></script>
@@ -1219,15 +1219,15 @@ export function cardPage(
 
       <!-- Main stat -->
       <div class="mb-6">
-        <div class="text-5xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
-        <div class="text-sm text-gray-500 mt-1">total spent on AI coding tools</div>
+        <div class="text-5xl font-bold text-cyan-400">${formatTokens(stats.total_tokens)}</div>
+        <div class="text-sm text-gray-500 mt-1">total tokens across AI coding tools</div>
       </div>
 
       <!-- Stats grid -->
       <div class="grid grid-cols-3 gap-4 ${mode === 'full' ? 'mb-6' : ''}">
         <div>
-          <div class="text-xl font-bold text-cyan-400">${formatTokens(stats.total_tokens)}</div>
-          <div class="text-xs text-gray-500">Total Tokens</div>
+          <div class="text-xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
+          <div class="text-xs text-gray-500">Estimated Cost</div>
         </div>
         <div>
           <div class="text-xl font-bold text-green-400">${formatTokens(stats.total_output_tokens)}</div>
@@ -1247,7 +1247,7 @@ export function cardPage(
     <!-- Footer -->
     <div class="px-8 py-4 bg-gray-800/50 border-t border-gray-800 flex items-center justify-between">
       <span class="text-sm text-gray-400">ccrank.dev</span>
-      <span class="text-xs text-gray-600">Claude Code & Codex Leaderboard</span>
+      <span class="text-xs text-gray-600">AI Coding Token Leaderboard</span>
     </div>
   </div>
 
@@ -1281,7 +1281,7 @@ export function cardPage(
 
   <!-- CTA for viewers -->
   <div class="mt-8 text-center">
-    <p class="text-sm text-gray-500 mb-2">Track your own Claude Code & Codex usage</p>
+    <p class="text-sm text-gray-500 mb-2">Track your own AI coding token usage</p>
     <a href="/" class="text-purple-400 hover:text-purple-300 font-medium transition">Join at ccrank.dev</a>
   </div>
 
@@ -1772,7 +1772,7 @@ export function profilePage(
   isOwner: boolean,
   viewer: User | null
 ): string {
-  const title = getTitle(stats.total_cost);
+  const title = getTitle(stats.total_tokens);
   const rankColor = stats.rank === 1 ? '#eab308' : stats.rank === 2 ? '#9ca3af' : stats.rank === 3 ? '#b45309' : '#7c3aed';
 
   // Build heatmaps for all 3 metrics server-side
@@ -1902,10 +1902,6 @@ export function profilePage(
 
     <!-- Stats Row -->
     <div class="grid grid-cols-2 ${isOwner ? 'md:grid-cols-5' : 'md:grid-cols-4'} gap-4 mb-8">
-      ${isOwner ? `<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
-        <div class="text-sm text-gray-400 mb-1">Total Cost</div>
-        <div class="text-xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
-      </div>` : ''}
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
         <div class="text-sm text-gray-400 mb-1">Total Tokens</div>
         <div class="text-xl font-bold text-cyan-400">${formatTokens(stats.total_tokens)}</div>
@@ -1918,6 +1914,10 @@ export function profilePage(
         <div class="text-sm text-gray-400 mb-1">Days Active</div>
         <div class="text-xl font-bold text-yellow-400">${stats.days_active}</div>
       </div>
+      ${isOwner ? `<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+        <div class="text-sm text-gray-400 mb-1">Estimated Cost</div>
+        <div class="text-xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
+      </div>` : ''}
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
         <div class="text-sm text-gray-400 mb-1">Last Active</div>
         <div class="text-xl font-bold text-gray-300">${timeAgo(stats.last_active)}</div>
@@ -1944,61 +1944,38 @@ export function profilePage(
     ${(() => {
       const pb = stats.platformBreakdown;
       if (!pb || Object.keys(pb).length <= 1) return '';
-      const claude = pb['claude'];
-      const codex = pb['codex'];
-      if (!claude && !codex) return '';
+      const cards = PLATFORM_META.flatMap((platform) => {
+        const usage = pb[platform.key];
+        if (!usage) return [];
+        return [`<div class="bg-gray-800/60 border border-gray-700 rounded-xl p-5">
+          <div class="flex items-center gap-2 mb-3">
+            <span class="w-2.5 h-2.5 rounded-full ${platform.dot}"></span>
+            <span class="text-sm font-semibold ${platform.text}">${platform.label}</span>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <div class="text-xs text-gray-500">Tokens</div>
+              <div class="text-lg font-bold text-cyan-400">${formatTokens(usage.total_tokens)}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-500">Output</div>
+              <div class="text-lg font-bold text-green-400">${formatTokens(usage.total_output_tokens)}</div>
+            </div>
+            <div>
+              <div class="text-xs text-gray-500">Days</div>
+              <div class="text-lg font-bold text-yellow-400">${usage.days_active}</div>
+            </div>
+            ${isOwner ? `<div>
+              <div class="text-xs text-gray-500">Cost</div>
+              <div class="text-lg font-bold text-purple-400">${formatCost(usage.total_cost)}</div>
+            </div>` : ''}
+          </div>
+        </div>`];
+      }).join('');
+      if (!cards) return '';
       return `<div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8">
         <h2 class="text-lg font-semibold mb-4">Platform Breakdown</h2>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          ${claude ? `<div class="bg-gray-800/60 border border-gray-700 rounded-xl p-5">
-            <div class="flex items-center gap-2 mb-3">
-              <span class="w-2.5 h-2.5 rounded-full bg-purple-400"></span>
-              <span class="text-sm font-semibold text-purple-300">Claude Code</span>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              ${isOwner ? `<div>
-                <div class="text-xs text-gray-500">Cost</div>
-                <div class="text-lg font-bold text-purple-400">${formatCost(claude.total_cost)}</div>
-              </div>` : ''}
-              <div>
-                <div class="text-xs text-gray-500">Tokens</div>
-                <div class="text-lg font-bold text-cyan-400">${formatTokens(claude.total_tokens)}</div>
-              </div>
-              <div>
-                <div class="text-xs text-gray-500">Output</div>
-                <div class="text-lg font-bold text-green-400">${formatTokens(claude.total_output_tokens)}</div>
-              </div>
-              <div>
-                <div class="text-xs text-gray-500">Days</div>
-                <div class="text-lg font-bold text-yellow-400">${claude.days_active}</div>
-              </div>
-            </div>
-          </div>` : ''}
-          ${codex ? `<div class="bg-gray-800/60 border border-gray-700 rounded-xl p-5">
-            <div class="flex items-center gap-2 mb-3">
-              <span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
-              <span class="text-sm font-semibold text-emerald-300">Codex CLI</span>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              ${isOwner ? `<div>
-                <div class="text-xs text-gray-500">Cost</div>
-                <div class="text-lg font-bold text-purple-400">${formatCost(codex.total_cost)}</div>
-              </div>` : ''}
-              <div>
-                <div class="text-xs text-gray-500">Tokens</div>
-                <div class="text-lg font-bold text-cyan-400">${formatTokens(codex.total_tokens)}</div>
-              </div>
-              <div>
-                <div class="text-xs text-gray-500">Output</div>
-                <div class="text-lg font-bold text-green-400">${formatTokens(codex.total_output_tokens)}</div>
-              </div>
-              <div>
-                <div class="text-xs text-gray-500">Days</div>
-                <div class="text-lg font-bold text-yellow-400">${codex.days_active}</div>
-              </div>
-            </div>
-          </div>` : ''}
-        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">${cards}</div>
       </div>`;
     })()}
 
@@ -2009,14 +1986,14 @@ export function profilePage(
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-lg font-semibold">Activity</h2>
         <div class="flex gap-1">
-          <button id="tab-cost" onclick="showHeatmap('cost')" class="px-3 py-1 text-xs font-medium rounded-md bg-purple-600 text-white transition">Cost</button>
-          <button id="tab-tokens" onclick="showHeatmap('tokens')" class="px-3 py-1 text-xs font-medium rounded-md bg-gray-700 text-gray-400 transition">Tokens</button>
+          <button id="tab-tokens" onclick="showHeatmap('tokens')" class="px-3 py-1 text-xs font-medium rounded-md bg-purple-600 text-white transition">Tokens</button>
+          <button id="tab-cost" onclick="showHeatmap('cost')" class="px-3 py-1 text-xs font-medium rounded-md bg-gray-700 text-gray-400 transition">Cost</button>
           <button id="tab-sessions" onclick="showHeatmap('sessions')" class="px-3 py-1 text-xs font-medium rounded-md bg-gray-700 text-gray-400 transition">Sessions</button>
         </div>
       </div>
       <div class="overflow-x-auto">
-        <div id="heatmap-cost">${heatmapCost}</div>
-        <div id="heatmap-tokens" class="hidden">${heatmapTokens}</div>
+        <div id="heatmap-tokens">${heatmapTokens}</div>
+        <div id="heatmap-cost" class="hidden">${heatmapCost}</div>
         <div id="heatmap-sessions" class="hidden">${heatmapSessions}</div>
       </div>
       <div class="flex items-center justify-end gap-2 mt-3 text-xs text-gray-500">

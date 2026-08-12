@@ -23,13 +23,13 @@ Run:
 ./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-Usage upload is opt-in and requires Node.js for `ccusage`:
+Usage upload is opt-in. Node.js is needed for the `ccusage` sources, but native Kimi and Pi imports do not require it:
 
 ```bash
 ./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
 ```
 
-The usage upload combines `ccusage` output with supported local agent logs, including Pi sessions from `~/.pi/agent/sessions` when present. If Node is missing, install `mise` and verify:
+The usage upload combines `ccusage` output with supported local agent logs. It imports Pi sessions from `~/.pi/agent/sessions` (attributing Moonshot/Kimi models to Kimi) and Kimi Code token records from both `~/.kimi/sessions` and `~/.kimi-code/sessions` when present. Kimi records copied during the `.kimi` to `.kimi-code` migration are deduplicated. If Node is missing, install `mise` and verify:
 
 ```bash
 npx ccusage@latest daily --json
@@ -112,6 +112,7 @@ Usage data with `--upload-usage`:
 
 - Daily token and cost totals from `ccusage`
 - Daily token and cost totals from Pi session usage in `~/.pi/agent/sessions`
+- Daily Kimi Code token totals from `~/.kimi/sessions` and `~/.kimi-code/sessions` (native cost is recorded as unknown/zero)
 - Model breakdowns where available
 
-No raw commit messages, diffs, prompts, responses, or Pi transcript content are uploaded.
+No raw commit messages, diffs, prompts, responses, or agent transcript content are uploaded.
