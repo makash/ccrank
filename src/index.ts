@@ -30,7 +30,7 @@ import {
   profilePage,
   errorPage,
 } from './html';
-import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, type ViewType } from './utils';
+import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, PLATFORMS, type ViewType } from './utils';
 import { generateCardSvg, type CardData } from './card';
 import { generateCardHtml } from './card-png';
 import { uploadCardSvg, getCardPngUrl } from './sirv';
@@ -190,8 +190,8 @@ app.get('/history', async (c) => {
       COALESCE(SUM(d.cost_usd), 0) as total_cost,
       COALESCE(SUM(d.total_tokens), 0) as total_tokens,
       COALESCE(SUM(d.output_tokens), 0) as total_output_tokens,
-      COUNT(DISTINCT d.date) as days_active,
-      MAX(d.date) as last_active
+      COUNT(DISTINCT CASE WHEN d.total_tokens > 0 THEN d.date END) as days_active,
+      MAX(CASE WHEN d.total_tokens > 0 THEN d.date END) as last_active
     FROM users u
     JOIN daily_usage d ON u.id = d.user_id
     WHERE d.date >= ? AND d.date <= ? ${histPlatformSQL}
@@ -240,8 +240,8 @@ app.get('/', async (c) => {
         COALESCE(SUM(d.cost_usd), 0) as total_cost,
         COALESCE(SUM(d.total_tokens), 0) as total_tokens,
         COALESCE(SUM(d.output_tokens), 0) as total_output_tokens,
-        COUNT(DISTINCT d.date) as days_active,
-        MAX(d.date) as last_active
+        COUNT(DISTINCT CASE WHEN d.total_tokens > 0 THEN d.date END) as days_active,
+        MAX(CASE WHEN d.total_tokens > 0 THEN d.date END) as last_active
       FROM users u
       LEFT JOIN daily_usage d ON u.id = d.user_id
       GROUP BY u.id
@@ -275,7 +275,7 @@ app.get('/', async (c) => {
       COALESCE(SUM(cost_usd), 0) as total_cost,
       COALESCE(SUM(total_tokens), 0) as total_tokens,
       COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-      COUNT(DISTINCT date) as days_active
+      COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active
     FROM daily_usage WHERE user_id = ?`
   )
     .bind(user.id)
@@ -300,7 +300,7 @@ app.get('/', async (c) => {
   const dashPlatformStats = await c.env.DB.prepare(
     `SELECT COALESCE(platform, 'claude') as platform,
      COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
-     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT date) as days_active
+     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active
      FROM daily_usage WHERE user_id = ? GROUP BY COALESCE(platform, 'claude')`
   ).bind(user.id).all();
 
@@ -336,7 +336,7 @@ app.get('/leaderboard', async (c) => {
   const viewParam = c.req.query('view') || '';
   const view: ViewType | null = isValidView(viewParam) ? viewParam : null;
 
-  // Platform filter (all / claude / codex / kimi)
+  // Platform filter (all, or one of PLATFORMS)
   const platformParam = c.req.query('platform') || '';
   const platform = isValidPlatform(platformParam) ? platformParam : null;
 
@@ -367,8 +367,8 @@ app.get('/leaderboard', async (c) => {
       COALESCE(SUM(d.total_tokens), 0) as total_tokens,
       COALESCE(SUM(d.output_tokens), 0) as total_output_tokens,
       COALESCE(SUM(d.cache_read_tokens), 0) as total_cache_read,
-      COUNT(DISTINCT d.date) as days_active,
-      MAX(d.date) as last_active,
+      COUNT(DISTINCT CASE WHEN d.total_tokens > 0 THEN d.date END) as days_active,
+      MAX(CASE WHEN d.total_tokens > 0 THEN d.date END) as last_active,
       GROUP_CONCAT(DISTINCT COALESCE(d.platform, 'claude')) as platforms,
       CASE WHEN COALESCE(SUM(d.cost_usd), 0) > 0
         THEN COALESCE(SUM(d.output_tokens), 0) / COALESCE(SUM(d.cost_usd), 1)
@@ -501,7 +501,7 @@ app.get('/user/:slug', async (c) => {
   const stats = await c.env.DB.prepare(
     `SELECT COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
      COALESCE(SUM(output_tokens), 0) as total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
-     COUNT(DISTINCT date) as days_active, MAX(date) as last_active
+     COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active, MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
      FROM daily_usage WHERE user_id = ?`
   ).bind((profileUser as any).id).first();
 
@@ -598,7 +598,7 @@ app.get('/user/:slug', async (c) => {
     `SELECT COALESCE(platform, 'claude') as platform,
      COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
      COALESCE(SUM(output_tokens), 0) as total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
-     COUNT(DISTINCT date) as days_active, MAX(date) as last_active
+     COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active, MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
      FROM daily_usage WHERE user_id = ? GROUP BY COALESCE(platform, 'claude')`
   ).bind((profileUser as any).id).all();
 
@@ -681,7 +681,7 @@ app.get('/card/:slug/image.svg', async (c) => {
   const stats = await c.env.DB.prepare(
     `SELECT COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
      COALESCE(SUM(output_tokens), 0) as total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
-     COUNT(DISTINCT date) as days_active, MAX(date) as last_active
+     COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active, MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
      FROM daily_usage WHERE user_id = ?`
   ).bind((user as any).id).first();
 
@@ -743,7 +743,7 @@ app.get('/card/:slug/image.png', async (c) => {
   const stats = await c.env.DB.prepare(
     `SELECT COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
      COALESCE(SUM(output_tokens), 0) as total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
-     COUNT(DISTINCT date) as days_active, MAX(date) as last_active
+     COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active, MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
      FROM daily_usage WHERE user_id = ?`
   ).bind((user as any).id).first();
 
@@ -795,7 +795,7 @@ app.get('/card/:slug', async (c) => {
 
   const stats = await c.env.DB.prepare(
     `SELECT COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
-     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT date) as days_active, MAX(date) as last_active
+     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active, MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
      FROM daily_usage WHERE user_id = ?`
   ).bind((user as any).id).first();
 
@@ -1264,6 +1264,12 @@ app.post('/api/git/feedback', async (c) => {
   return c.json({ ok: true });
 });
 
+// Capability probe for the CLI. A client that uploads under a platform this
+// deployment does not know would have its explicit platform silently dropped and
+// be re-detected as `claude`, letting a replacing upload overwrite the combined
+// bucket. The CLI checks here first and holds back platforms we do not list.
+app.get('/api/platforms', (c) => c.json({ platforms: PLATFORMS }));
+
 app.get('/api/leaderboard', async (c) => {
   const platformFilter = c.req.query('platform');
   const validPlatform = isValidPlatform(platformFilter) ? platformFilter : null;
@@ -1285,8 +1291,8 @@ app.get('/api/leaderboard', async (c) => {
       COALESCE(SUM(d.total_tokens), 0) as total_tokens,
       COALESCE(SUM(d.output_tokens), 0) as total_output_tokens,
       COALESCE(SUM(d.cache_read_tokens), 0) as total_cache_read,
-      COUNT(DISTINCT d.date) as days_active,
-      MAX(d.date) as last_active,
+      COUNT(DISTINCT CASE WHEN d.total_tokens > 0 THEN d.date END) as days_active,
+      MAX(CASE WHEN d.total_tokens > 0 THEN d.date END) as last_active,
       GROUP_CONCAT(DISTINCT COALESCE(d.platform, 'claude')) as platforms,
       CASE WHEN COALESCE(SUM(d.cost_usd), 0) > 0
         THEN COALESCE(SUM(d.output_tokens), 0) / COALESCE(SUM(d.cost_usd), 1)
@@ -1340,7 +1346,7 @@ app.get('/api/me', async (c) => {
       COALESCE(SUM(cost_usd), 0) as total_cost,
       COALESCE(SUM(total_tokens), 0) as total_tokens,
       COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-      COUNT(DISTINCT date) as days_active
+      COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active
     FROM daily_usage WHERE user_id = ?`
   )
     .bind(user.id)
@@ -1350,7 +1356,7 @@ app.get('/api/me', async (c) => {
   const mePlatformStats = await c.env.DB.prepare(
     `SELECT COALESCE(platform, 'claude') as platform,
      COALESCE(SUM(cost_usd), 0) as total_cost, COALESCE(SUM(total_tokens), 0) as total_tokens,
-     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT date) as days_active
+     COALESCE(SUM(output_tokens), 0) as total_output_tokens, COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active
      FROM daily_usage WHERE user_id = ? GROUP BY COALESCE(platform, 'claude')`
   ).bind(user.id).all();
 
@@ -1395,8 +1401,8 @@ app.get('/api/me/usage', async (c) => {
       COALESCE(SUM(total_tokens), 0) as total_tokens,
       COALESCE(SUM(output_tokens), 0) as total_output_tokens,
       COALESCE(SUM(cache_read_tokens), 0) as total_cache_read,
-      COUNT(DISTINCT date) as days_active,
-      MAX(date) as last_active
+      COUNT(DISTINCT CASE WHEN total_tokens > 0 THEN date END) as days_active,
+      MAX(CASE WHEN total_tokens > 0 THEN date END) as last_active
     FROM daily_usage
     WHERE user_id = ? AND date >= ? AND date <= ?`
   ).bind(user.id, dateRange.startDate, dateRange.endDate).first();

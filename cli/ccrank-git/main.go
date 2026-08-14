@@ -153,7 +153,7 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
-		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, "claude", "combined", combinedComplete)
+		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined", combinedComplete)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -169,20 +169,50 @@ func main() {
 		printCcusageHelp()
 	}
 
+	supported := resolveSupportedPlatforms(*urlFlag, *tokenFlag)
+
 	// Kimi Code exposes exact token counts in its native wire logs. Keep native
 	// and Pi-hosted Kimi usage in a separate platform so zero-cost usage is
 	// preserved instead of being folded into the legacy combined bucket.
-	fmt.Println("Checking Kimi usage from native Kimi Code and Pi sessions...")
-	kimiReport, kimiToday, err := runKimiUsage()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "  Kimi Code: skipped -", err.Error())
-	} else if err := uploadUsageReport(*urlFlag, *tokenFlag, kimiReport, machine, "kimi", "kimi", true); err != nil {
-		fmt.Fprintln(os.Stderr, "  Kimi Code: upload failed -", err.Error())
-	} else {
-		fmt.Println("  Kimi Code: upload complete")
-	}
+	kimiToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformKimi, Label: "Kimi Code",
+		Checking:  "Checking Kimi usage from native Kimi Code and Pi sessions...",
+		Supported: supported, Run: runKimiUsage,
+	})
+
+	// Grok CLI records per-turn token counts and a list-price cost in its
+	// session updates; ccusage has no Grok importer.
+	grokToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformGrok, Label: "Grok CLI",
+		Checking:  "Checking Grok usage from native Grok CLI and Pi sessions...",
+		Supported: supported, Run: runGrokUsage,
+	})
+
+	// Z Code logs exact GLM token counts per request but carries no pricing;
+	// ccusage has no GLM importer either.
+	glmToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformGLM, Label: "GLM (Z Code)",
+		Checking:  "Checking GLM usage from native Z Code and Pi sessions...",
+		Supported: supported, Run: runGLMUsage,
+	})
+
+	// Pi rides its own platform now. ccusage imports Pi natively, so the
+	// combined bucket holds it out and everything Pi ran that is not owned by
+	// a dedicated platform is uploaded here instead.
+	piToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformPi, Label: "Pi",
+		Checking:  "Checking Pi agent usage from Pi sessions...",
+		Supported: supported, Run: runPiUsage,
+	})
 
 	localToday = combineUsageSnapshots(localToday, kimiToday)
+	localToday = combineUsageSnapshots(localToday, grokToday)
+	localToday = combineUsageSnapshots(localToday, glmToday)
+	localToday = combineUsageSnapshots(localToday, piToday)
 	if localToday != nil {
 		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
 			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
@@ -190,6 +220,67 @@ func main() {
 	}
 
 	printSummary(summary, *jsonSummary)
+}
+
+// legacyPlatforms are the buckets every deployment has understood since before
+// /api/platforms existed. A leaderboard without the probe still accepts these,
+// so they remain safe to upload when we cannot ask what it supports.
+var legacyPlatforms = map[string]bool{
+	platformCombined: true,
+	"codex":          true,
+	platformKimi:     true,
+}
+
+// resolveSupportedPlatforms asks the leaderboard what it accepts, falling back
+// to the pre-probe set. Falling back is the conservative answer: it keeps the
+// long-standing platforms uploading while holding back the newer ones, which an
+// older server would misfile into the combined bucket.
+func resolveSupportedPlatforms(baseURL, token string) map[string]bool {
+	supported, err := loadSupportedPlatforms(baseURL, token)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "  Platform check: skipped -", err.Error())
+		return legacyPlatforms
+	}
+	if supported == nil {
+		fmt.Fprintln(os.Stderr, "  Platform check: this leaderboard predates per-agent platforms; update your deployment to rank Grok, GLM, and Pi separately")
+		return legacyPlatforms
+	}
+	return supported
+}
+
+type dedicatedPlatformUpload struct {
+	BaseURL   string
+	Token     string
+	Machine   string
+	Platform  string
+	Label     string
+	Checking  string
+	Supported map[string]bool
+	Run       func() (string, *UsageSnapshot, error)
+}
+
+// uploadDedicatedPlatform imports and uploads one platform ccusage does not
+// cover, but only after the leaderboard has confirmed it knows the name. It
+// returns the day's snapshot when something was uploaded, so the caller can fold
+// it into the daily comparison.
+func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
+	if !job.Supported[job.Platform] {
+		fmt.Fprintf(os.Stderr, "  %s: skipped - this leaderboard does not accept the %q platform yet\n", job.Label, job.Platform)
+		return nil
+	}
+
+	fmt.Println(job.Checking)
+	report, today, err := job.Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "  "+job.Label+": skipped -", err.Error())
+		return nil
+	}
+	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform, true); err != nil {
+		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
+		return nil
+	}
+	fmt.Println("  " + job.Label + ": upload complete")
+	return today
 }
 
 func shouldShowOnboarding(created bool, repoCount int, uploadUsage bool, dryRun bool) bool {
@@ -311,7 +402,9 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 }
 
 func runCcusage() (string, *UsageSnapshot, bool, error) {
-	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json")
+	// --by-agent splits each daily row per source CLI so agents ccrank uploads
+	// under their own platform can be held out of the combined bucket.
+	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json", "--by-agent")
 	out, err := cmd.Output()
 	if err != nil {
 		report := map[string]any{"daily": []map[string]any{}}
@@ -352,6 +445,12 @@ func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string
 	if err != nil {
 		report = map[string]any{"daily": []map[string]any{}}
 		entries = nil
+	} else {
+		entries, err = rebuildCombinedEntries(entries)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		setReportEntries(report, entries)
 	}
 
 	var extrasComplete bool
@@ -362,16 +461,11 @@ func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string
 	return report, entries, complete && extrasComplete, nil
 }
 
+// loadLocalUsageEntries folds in agents ccusage cannot see. Pi is deliberately
+// absent: ccusage imports it natively now, and ccrank uploads it under its own
+// platform, so merging it here would count every Pi session twice.
 func loadLocalUsageEntries(entries []map[string]any, report map[string]any) ([]map[string]any, bool) {
 	complete := true
-	piEntries, err := loadPiUsageEntries()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "  Pi: skipped -", err.Error())
-		complete = false
-	} else if len(piEntries) > 0 {
-		entries = mergeUsageEntries(entries, piEntries)
-		setReportEntries(report, entries)
-	}
 
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
@@ -382,6 +476,99 @@ func loadLocalUsageEntries(entries []map[string]any, report map[string]any) ([]m
 		setReportEntries(report, entries)
 	}
 	return entries, complete
+}
+
+// ccusage imports Pi and Kimi natively, and ccrank uploads both under their own
+// platform. Holding them out of the combined bucket keeps usage a dedicated
+// importer already reports from being counted twice.
+var ccusageDedicatedAgents = map[string]bool{
+	"pi":   true,
+	"kimi": true,
+}
+
+// rebuildCombinedEntries drops the per-agent slices ccrank uploads separately.
+// Since every ccusage invocation requests --by-agent, accepting a row without
+// those slices could permanently double-count usage from dedicated platforms.
+// A date whose usage came entirely from those agents collapses to a zero row
+// rather than disappearing, so an inflated row written by an earlier ccrank
+// version is overwritten instead of left ranked.
+func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) {
+	rebuilt := make([]map[string]any, 0, len(entries))
+	for index, entry := range entries {
+		agents, ok := entry["agents"].([]any)
+		if !ok {
+			date := usageDate(entry)
+			if date == "" {
+				date = fmt.Sprintf("index %d", index)
+			}
+			return nil, fmt.Errorf("ccusage --by-agent row %s is missing a usable agents[] array", date)
+		}
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+
+		var input, output, cacheCreation, cacheRead, total, cost float64
+		modelNames := []string{}
+		modelBreakdowns := []any{}
+		for _, raw := range agents {
+			agent, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"])))
+			if ccusageDedicatedAgents[name] {
+				continue
+			}
+			input += numberValue(agent["inputTokens"])
+			output += numberValue(agent["outputTokens"])
+			cacheCreation += numberValue(agent["cacheCreationTokens"])
+			cacheRead += numberValue(agent["cacheReadTokens"])
+			total += numberValue(agent["totalTokens"])
+			cost += usageCostValue(agent)
+			for _, model := range extractModelNames(agent["modelsUsed"]) {
+				modelNames = append(modelNames, model)
+			}
+			if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
+				modelBreakdowns = append(modelBreakdowns, breakdowns...)
+			}
+		}
+		sort.Strings(modelNames)
+
+		rebuilt = append(rebuilt, map[string]any{
+			"date":                     date,
+			"inputTokens":              input,
+			"outputTokens":             output,
+			"cacheCreationTokens":      cacheCreation,
+			"cacheReadTokens":          cacheRead,
+			"totalInputTokens":         input,
+			"totalOutputTokens":        output,
+			"totalCacheCreationTokens": cacheCreation,
+			"totalCacheReadTokens":     cacheRead,
+			"totalTokens":              total,
+			"totalCost":                cost,
+			"totalCostUSD":             cost,
+			"costUSD":                  cost,
+			"modelsUsed":               modelNames,
+			"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
+		})
+	}
+	return rebuilt, nil
+}
+
+func extractModelNames(raw any) []string {
+	values, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(values))
+	for _, value := range values {
+		name := strings.TrimSpace(fmt.Sprint(value))
+		if name != "" && name != "<nil>" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]any) (string, error) {
@@ -778,7 +965,7 @@ type piDailyUsage struct {
 	TotalTokens  float64
 	Cost         float64
 	Messages     int
-	ExcludedKimi bool
+	Excluded     bool
 	SessionFiles map[string]bool
 	Models       map[string]*piModelUsage
 }
@@ -792,15 +979,35 @@ type piModelUsage struct {
 	Cost        float64
 }
 
-func loadPiUsageEntries() ([]map[string]any, error) {
-	return loadPiUsageEntriesFor(false)
-}
+// Platform buckets ccrank uploads under. Agents without a dedicated importer
+// stay in the legacy combined bucket, which production still reads as "claude".
+const (
+	platformCombined = "claude"
+	platformPi       = "pi"
+	platformKimi     = "kimi"
+	platformGrok     = "grok"
+	platformGLM      = "glm"
+)
 
 func loadPiKimiUsageEntries() ([]map[string]any, error) {
-	return loadPiUsageEntriesFor(true)
+	return loadPiUsageEntriesFor(platformKimi)
 }
 
-func loadPiUsageEntriesFor(kimiOnly bool) ([]map[string]any, error) {
+func runPiUsage() (string, *UsageSnapshot, error) {
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(entries) == 0 {
+		return "", nil, errors.New("no Pi usage found")
+	}
+	localToday := usageSnapshotForDate(entries, todayDate())
+	report := map[string]any{"type": "daily", "daily": entries}
+	normalized, err := normalizeAndFilterUsageReportFor(report, entries, platformPi, "no higher Pi usage rows found")
+	return normalized, localToday, err
+}
+
+func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	root, err := piSessionsPath()
 	if err != nil {
 		return nil, err
@@ -815,12 +1022,17 @@ func loadPiUsageEntriesFor(kimiOnly bool) ([]map[string]any, error) {
 	byDate := map[string]*piDailyUsage{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// Pi can lock live session files; skip what we cannot read instead
+			// of failing every platform imported from the shared session tree.
+			if os.IsPermission(err) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		return readPiSession(path, byDate, kimiOnly)
+		return readPiSession(path, byDate, platform)
 	})
 	if err != nil {
 		return nil, err
@@ -835,7 +1047,7 @@ func loadPiUsageEntriesFor(kimiOnly bool) ([]map[string]any, error) {
 	entries := make([]map[string]any, 0, len(dates))
 	for _, date := range dates {
 		usage := byDate[date]
-		if usage.TotalTokens == 0 && !(usage.ExcludedKimi && !kimiOnly) {
+		if usage.TotalTokens == 0 && !(usage.Excluded && platform == platformPi) {
 			continue
 		}
 
@@ -884,9 +1096,12 @@ func loadPiUsageEntriesFor(kimiOnly bool) ([]map[string]any, error) {
 	return entries, nil
 }
 
-func readPiSession(path string, byDate map[string]*piDailyUsage, kimiOnly bool) error {
+func readPiSession(path string, byDate map[string]*piDailyUsage, platform string) error {
 	file, err := os.Open(path)
 	if err != nil {
+		if os.IsPermission(err) {
+			return nil
+		}
 		return err
 	}
 	defer file.Close()
@@ -919,18 +1134,17 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, kimiOnly bool) 
 		if date == "" {
 			continue
 		}
-		isKimi := isKimiModelName(modelName)
-		if isKimi != kimiOnly {
-			// Preserve a zero row when migrating Kimi out of the legacy combined
-			// platform. That lets the first version-2 upload overwrite a stale
-			// Kimi-only combined row instead of leaving it ranked twice.
-			if isKimi && !kimiOnly {
+		if piPlatformForModel(modelName) != platform {
+			// Preserve a zero row when a model moves out of the Pi bucket into
+			// a dedicated platform. That lets the upload overwrite a stale Pi
+			// row instead of leaving it ranked twice.
+			if platform == platformPi {
 				day := byDate[date]
 				if day == nil {
 					day = &piDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*piModelUsage{}}
 					byDate[date] = day
 				}
-				day.ExcludedKimi = true
+				day.Excluded = true
 			}
 			continue
 		}
@@ -1006,6 +1220,22 @@ func isKimiModelName(modelName string) bool {
 	return strings.Contains(lower, "kimi") || strings.Contains(lower, "moonshot")
 }
 
+// piPlatformForModel routes a Pi session model to the platform that owns it. Pi
+// fronts models from several vendors, and every vendor ccrank imports natively
+// is ranked under its own platform rather than under Pi.
+func piPlatformForModel(modelName string) string {
+	lower := strings.ToLower(modelName)
+	switch {
+	case isKimiModelName(modelName):
+		return platformKimi
+	case strings.Contains(lower, "grok"), strings.Contains(lower, "xai"):
+		return platformGrok
+	case strings.Contains(lower, "glm"), strings.Contains(lower, "zai"), strings.Contains(lower, "z-ai"):
+		return platformGLM
+	}
+	return platformPi
+}
+
 func piUsageDate(raw any) string {
 	switch value := raw.(type) {
 	case string:
@@ -1067,6 +1297,13 @@ func loadAntigravityUsageEntries() ([]map[string]any, error) {
 	byDate := map[string]*antigravityDailyUsage{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// An unreadable transcript must not mark the combined report
+			// incomplete: that downgrades the upload to a max merge, which
+			// would silently discard the corrected, smaller rows this version
+			// uploads after splitting agents into their own platforms.
+			if os.IsPermission(err) {
+				return nil
+			}
 			return err
 		}
 		if d.IsDir() || filepath.Base(path) != "transcript.jsonl" {
@@ -1142,6 +1379,9 @@ func loadAntigravityUsageEntries() ([]map[string]any, error) {
 func readAntigravityTranscript(path string, byDate map[string]*antigravityDailyUsage) error {
 	file, err := os.Open(path)
 	if err != nil {
+		if os.IsPermission(err) {
+			return nil
+		}
 		return err
 	}
 	defer file.Close()
@@ -1297,6 +1537,10 @@ func usageTotals(entries []map[string]any) map[string]any {
 	return totals
 }
 
+// usageMaximaVersion gates the monotonic upload cache. Bump it whenever a
+// change makes correct rows smaller than ones already uploaded.
+const usageMaximaVersion = 3
+
 func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	path, err := usageMaximaPath(cacheName)
 	if err != nil {
@@ -1316,9 +1560,11 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	if err := json.Unmarshal(data, &report); err != nil {
 		return nil, fmt.Errorf("invalid ~/.ccrank/usage-maxima-%s.json", cacheName)
 	}
-	if cacheName == "combined" && numberValue(report["version"]) != 2 {
-		// Version 2 splits Kimi out of the legacy combined platform. Treat the
-		// older maxima as empty once so lower corrected rows can overwrite it.
+	if cacheName == "combined" && numberValue(report["version"]) != usageMaximaVersion {
+		// Version 2 split Kimi out of the legacy combined platform; version 3
+		// splits out Pi, which ccusage began importing natively and ccrank was
+		// merging on top of. Both shrink the combined bucket, so treat older
+		// maxima as empty once and let the lower corrected rows overwrite it.
 		return maxima, nil
 	}
 
@@ -1356,7 +1602,7 @@ func writeUsageMaxima(cacheName string, maxima map[string]map[string]any) error 
 	}
 
 	report := map[string]any{
-		"version": 2,
+		"version": usageMaximaVersion,
 		"daily":   entries,
 		"totals":  usageTotals(entries),
 	}
@@ -1377,7 +1623,9 @@ func usageMaximaPath(cacheName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if cacheName != "combined" && cacheName != "kimi" {
+	switch cacheName {
+	case "combined", platformKimi, platformGrok, platformGLM, platformPi:
+	default:
 		return "", errors.New("invalid usage maxima cache name")
 	}
 	return filepath.Join(home, ".ccrank", "usage-maxima-"+cacheName+".json"), nil
@@ -1387,9 +1635,62 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "To enable usage uploads:")
 	fmt.Fprintln(os.Stderr, "  1) Install mise: https://mise.jdx.dev")
 	fmt.Fprintln(os.Stderr, "  2) From a repo folder, run:")
-	fmt.Fprintln(os.Stderr, "     Combined all agents: npx ccusage@latest daily --json")
+	fmt.Fprintln(os.Stderr, "     Combined all agents: npx ccusage@latest daily --json --by-agent")
 	fmt.Fprintln(os.Stderr, "  Pi usage is imported automatically from ~/.pi/agent/sessions when present.")
 	fmt.Fprintln(os.Stderr, "  Kimi Code usage is imported automatically from ~/.kimi/sessions and ~/.kimi-code/sessions.")
+	fmt.Fprintln(os.Stderr, "  Grok CLI usage is imported automatically from ~/.grok/sessions.")
+	fmt.Fprintln(os.Stderr, "  GLM usage is imported automatically from ~/.zcode/cli/rollout.")
+}
+
+// loadSupportedPlatforms asks the leaderboard which platforms it understands.
+//
+// A deployment that predates a platform drops the CLI's explicit platform as
+// invalid and re-detects the rows from their model names, which lands them in
+// the combined bucket. Because these uploads replace rather than max-merge,
+// that would overwrite the user's real Claude and Codex totals with, say,
+// Grok-only numbers. Uploading a dedicated platform is therefore only safe once
+// the server has confirmed it knows the name.
+//
+// Returns nil when the endpoint is absent, which means the server is older than
+// this capability probe and no dedicated platform may be uploaded.
+func loadSupportedPlatforms(baseURL, token string) (map[string]bool, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
+	req, err := http.NewRequest("GET", baseURL+"/api/platforms", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Platforms []string `json:"platforms"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, errors.New("leaderboard returned an invalid platform list")
+	}
+	if len(payload.Platforms) == 0 {
+		return nil, nil
+	}
+
+	supported := make(map[string]bool, len(payload.Platforms))
+	for _, platform := range payload.Platforms {
+		supported[strings.ToLower(strings.TrimSpace(platform))] = true
+	}
+	return supported, nil
 }
 
 func uploadCcusage(baseURL, token, report, machine, platform string, replace bool) error {
