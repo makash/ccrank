@@ -14,6 +14,17 @@ bd sync               # Sync with git
 
 ## Landing the Plane (Session Completion)
 
+## Data Invariant — Usage History (never break this)
+
+**Usage totals may only ever go UP.** Local agent logs get pruned over time, so
+the server's `daily_usage` rows hold historical peaks that no machine can
+reproduce. Nothing may rewrite history downward through the upload path:
+`/api/upload` always max-merges (`MAX(excluded.col, daily_usage.col)`) and the
+`replace` flag is ignored (v1.2.1, after a replace=true migration destroyed
+~27B tokens on 2026-08-15). A legit downward correction goes through an
+audited admin process with a fresh export taken first — never a client flag.
+`test/never-lower.test.mjs` fails any PR that reintroduces the lowering path.
+
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
 
 **MANDATORY WORKFLOW:**
