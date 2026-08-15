@@ -281,9 +281,9 @@ func TestLoadSupportedPlatformsTreatsAMissingProbeAsALegacyServer(t *testing.T) 
 
 func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 	// A deployment that predates a platform drops the explicit platform and
-	// re-detects the rows as `claude`. Because these uploads replace rather
-	// than max-merge, sending one would overwrite the user's real combined
-	// totals with, say, Grok-only numbers.
+	// re-detects the rows as `claude`. The server max-merges, so sending one
+	// would add those tokens onto the user's real combined totals rather
+	// than overwrite them — still wrong attribution.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/platforms" {
 			http.NotFound(w, r)
