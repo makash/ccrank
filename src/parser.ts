@@ -11,7 +11,7 @@
  * versions where daily rows use `period` instead of `date`.
  */
 
-export type Platform = 'claude' | 'codex' | 'kimi';
+export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi';
 
 export interface DailyEntry {
   date: string;
@@ -79,13 +79,23 @@ function num(val: unknown): number {
   return typeof val === 'number' ? val : 0;
 }
 
+// Vendor checks run before the Pi check so a model Pi merely fronts is ranked
+// under the vendor that owns it, matching piPlatformForModel in the CLI.
 export function detectPlatform(models: string[]): Platform {
   const kimiContains = ['kimi', 'moonshot'];
+  const grokContains = ['grok', 'xai'];
+  const glmContains = ['glm', 'zai', 'z-ai'];
   const codexPrefixes = ['gpt-', 'codex-', 'o1-', 'o3-', 'o4-'];
   const codexContains = ['codex', 'openai'];
+  const piPrefixes = ['pi-', '[pi] '];
   for (const model of models) {
     const lower = model.toLowerCase();
     if (kimiContains.some((part) => lower.includes(part))) return 'kimi';
+    if (grokContains.some((part) => lower.includes(part))) return 'grok';
+    if (glmContains.some((part) => lower.includes(part))) return 'glm';
+    // Pi is checked before Codex so an OpenAI model Pi fronts is ranked as Pi
+    // usage rather than as Codex CLI usage, which is what the CLI does.
+    if (piPrefixes.some((prefix) => lower.startsWith(prefix))) return 'pi';
     if (codexPrefixes.some((prefix) => lower.startsWith(prefix))) return 'codex';
     if (codexContains.some((part) => lower.includes(part))) return 'codex';
   }

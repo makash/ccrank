@@ -12,7 +12,7 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind%20CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-**Track, compare, and compete on Claude Code, Codex CLI, and Kimi Code token usage.**
+**Track, compare, and compete on Claude Code, Codex CLI, Kimi, Grok, GLM, and Pi token usage.**
 Install the ccrank CLI (powered by [ccusage](https://github.com/ryoppippi/ccusage) plus native session importers). See the leaderboard. Earn titles. Talk trash.
 
 Deploy to Cloudflare Workers in under 10 minutes. Free tier. Zero cost.
@@ -148,13 +148,27 @@ Then upload git metadata:
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-Include local coding-agent usage from ccusage, Pi, Kimi Code, and other supported sources:
+Include local coding-agent usage from ccusage, Pi, Kimi Code, Grok CLI, GLM, and other supported sources:
 
 ```bash
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
 ```
 
-Pi usage is imported automatically from `~/.pi/agent/sessions`, with Moonshot/Kimi models attributed to Kimi. Native Kimi Code usage is imported from both `~/.kimi/sessions` and `~/.kimi-code/sessions`, with migrated duplicate records counted once. Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
+Each agent is ranked on its own platform. `ccusage` supplies Claude Code, Codex, and the other agents it detects; ccrank reads the rest natively:
+
+| Platform | Source | Cost |
+| :-- | :-- | :-- |
+| `claude` | `ccusage` (Claude Code, Codex, Hermes, Antigravity, …), minus the `pi` and `kimi` agents | From `ccusage` |
+| `pi` | `~/.pi/agent/sessions` | From Pi's own records |
+| `kimi` | `~/.kimi/sessions`, `~/.kimi-code/sessions`, and Kimi models run through Pi | Zero for native sessions; from Pi's records for the Pi-fronted share |
+| `grok` | `~/.grok/sessions` and Grok models run through Pi | Grok's reported list price; from Pi's records for the Pi-fronted share |
+| `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi | Zero for native sessions; from Pi's records for the Pi-fronted share |
+
+`ccusage` imports Pi and Kimi natively too, so ccrank holds those two agents out of the combined `claude` bucket to keep them from being counted twice.
+
+Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` what the leaderboard accepts and holds back anything missing from that list, so a CLI that runs ahead of the deployment simply skips Grok, GLM, and Pi and says so, rather than having those uploads refiled into the combined bucket.
+
+A model that Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, and retried Z Code requests. Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
 
 Generate your token in **Settings → Git Metadata**.
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -41,7 +42,17 @@ func TestNormalizeAndFilterCcusageReportOnlySkipsUnchangedRows(t *testing.T) {
 				"cacheReadTokens": 85,
 				"totalTokens": 100,
 				"totalCost": 1.25,
-				"modelsUsed": ["gpt-5.5"]
+				"modelsUsed": ["gpt-5.5"],
+				"agents": [{
+					"agent": "claude",
+					"inputTokens": 10,
+					"outputTokens": 5,
+					"cacheCreationTokens": 0,
+					"cacheReadTokens": 85,
+					"totalTokens": 100,
+					"totalCost": 1.25,
+					"modelsUsed": ["gpt-5.5"]
+				}]
 			}
 		]
 	}`)
@@ -70,7 +81,17 @@ func TestNormalizeAndFilterCcusageReportOnlySkipsUnchangedRows(t *testing.T) {
 				"cacheReadTokens": 132,
 				"totalTokens": 150,
 				"totalCost": 1.75,
-				"modelsUsed": ["gpt-5.5"]
+				"modelsUsed": ["gpt-5.5"],
+				"agents": [{
+					"agent": "claude",
+					"inputTokens": 12,
+					"outputTokens": 6,
+					"cacheCreationTokens": 0,
+					"cacheReadTokens": 132,
+					"totalTokens": 150,
+					"totalCost": 1.75,
+					"modelsUsed": ["gpt-5.5"]
+				}]
 			}
 		]
 	}`)
@@ -101,34 +122,54 @@ func TestIsHigherUsageSnapshotDetectsTokenAndCostIncreases(t *testing.T) {
 	}
 }
 
-func TestCombinedMaximaV2AllowsKimiSplitToLowerLegacyRows(t *testing.T) {
+func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T) {
+	// Each split moves usage out of the combined bucket, so the corrected rows
+	// are smaller than what an older ccrank already uploaded. Every stale cache
+	// version must reset once to let those lower rows through.
+	for _, legacy := range []string{
+		`{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
+		`{"version":2,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		cacheDir := filepath.Join(home, ".ccrank")
+		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cacheDir, "usage-maxima-combined.json"), []byte(legacy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		report := map[string]any{"type": "daily"}
+		entries := []map[string]any{{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0}}
+		normalized, err := normalizeAndFilterUsageReport(report, entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(normalized, `"totalTokens":400`) {
+			t.Fatalf("expected corrected lower row, got %s", normalized)
+		}
+
+		cache, err := os.ReadFile(filepath.Join(cacheDir, "usage-maxima-combined.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(cache), fmt.Sprintf(`"version": %d`, usageMaximaVersion)) {
+			t.Fatalf("expected version %d cache, got %s", usageMaximaVersion, cache)
+		}
+	}
+}
+
+func TestUsageMaximaPathAcceptsEveryUploadedPlatform(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	cacheDir := filepath.Join(home, ".ccrank")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		t.Fatal(err)
+	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi} {
+		if _, err := usageMaximaPath(cacheName); err != nil {
+			t.Fatalf("usageMaximaPath(%q) = %v", cacheName, err)
+		}
 	}
-	legacy := `{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`
-	if err := os.WriteFile(filepath.Join(cacheDir, "usage-maxima-combined.json"), []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	report := map[string]any{"type": "daily"}
-	entries := []map[string]any{{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0}}
-	normalized, err := normalizeAndFilterUsageReport(report, entries)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(normalized, `"totalTokens":400`) {
-		t.Fatalf("expected corrected lower row, got %s", normalized)
-	}
-
-	cache, err := os.ReadFile(filepath.Join(cacheDir, "usage-maxima-combined.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(cache), `"version": 2`) {
-		t.Fatalf("expected versioned cache, got %s", cache)
+	if _, err := usageMaximaPath("../escape"); err == nil {
+		t.Fatal("expected unknown cache names to be rejected")
 	}
 }
 
@@ -480,7 +521,7 @@ func TestLoadKimiUsageEntriesAggregatesTurnsAndDeduplicatesMigratedSessions(t *t
 	}
 }
 
-func TestPiKimiUsageIsSplitFromTheLegacyCombinedPlatform(t *testing.T) {
+func TestPiUsageIsRoutedToThePlatformThatOwnsEachModel(t *testing.T) {
 	oldLocal := time.Local
 	time.Local = time.UTC
 	t.Cleanup(func() { time.Local = oldLocal })
@@ -511,6 +552,24 @@ func TestPiKimiUsageIsSplitFromTheLegacyCombinedPlatform(t *testing.T) {
 				"cost": map[string]any{"total": 0.1},
 			}},
 		},
+		{"type": "model_change", "provider": "hetzner", "modelId": "GLM-5.2-NVFP4"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:02:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 70, "output": 7, "totalTokens": 77,
+				"cost": map[string]any{"total": 0.2},
+			}},
+		},
+		{"type": "model_change", "provider": "xai", "modelId": "grok-4.6"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:03:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 80, "output": 8, "totalTokens": 88,
+				"cost": map[string]any{"total": 0.3},
+			}},
+		},
 	}
 
 	var data []byte
@@ -526,30 +585,188 @@ func TestPiKimiUsageIsSplitFromTheLegacyCombinedPlatform(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	combined, err := loadPiUsageEntries()
-	if err != nil {
-		t.Fatal(err)
-	}
-	kimi, err := loadPiKimiUsageEntries()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 55 {
-		t.Fatalf("combined entries = %#v", combined)
-	}
-	if len(kimi) != 1 || numberValue(kimi[0]["totalTokens"]) != 430 {
-		t.Fatalf("Kimi entries = %#v", kimi)
-	}
-	if got := usageCostValue(kimi[0]); got != 0.25 {
-		t.Fatalf("Kimi cost = %v", got)
+	for _, tc := range []struct {
+		platform string
+		tokens   float64
+		cost     float64
+	}{
+		{platformPi, 55, 0.1},
+		{platformKimi, 430, 0.25},
+		{platformGLM, 77, 0.2},
+		{platformGrok, 88, 0.3},
+	} {
+		entries, err := loadPiUsageEntriesFor(tc.platform)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != tc.tokens {
+			t.Fatalf("%s entries = %#v", tc.platform, entries)
+		}
+		if got := usageCostValue(entries[0]); got != tc.cost {
+			t.Fatalf("%s cost = %v, want %v", tc.platform, got, tc.cost)
+		}
 	}
 
-	_, _, complete, err := parseCcusageReportWithLocalExtras([]byte(`not-json`))
+	// Pi no longer backfills the combined bucket: ccusage imports it natively
+	// and ccrank uploads it under the Pi platform, so a failed ccusage run has
+	// nothing left to report as combined usage.
+	if _, _, _, err := parseCcusageReportWithLocalExtras([]byte(`not-json`)); err == nil {
+		t.Fatal("expected an error when ccusage fails and no local extras remain")
+	}
+}
+
+func TestLoadPiUsageEntriesSkipsUnreadableSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".pi", "agent", "sessions")
+	records := []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+	}
+	writeJSONL(t, filepath.Join(root, "readable.jsonl"), records)
+	lockedFile := filepath.Join(root, "locked.jsonl")
+	writeJSONL(t, lockedFile, records)
+	lockedDir := filepath.Join(root, "locked-directory")
+	writeJSONL(t, filepath.Join(lockedDir, "session.jsonl"), records)
+	if err := os.Chmod(lockedFile, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockedDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(lockedFile, 0o600)
+		_ = os.Chmod(lockedDir, 0o700)
+	})
+
+	file, fileErr := os.Open(lockedFile)
+	if fileErr == nil {
+		_ = file.Close()
+	}
+	_, dirErr := os.ReadDir(lockedDir)
+	if !os.IsPermission(fileErr) || !os.IsPermission(dirErr) {
+		t.Skip("filesystem does not enforce permission bits")
+	}
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if complete {
-		t.Fatal("local-only fallback must not be marked complete for replacement upload")
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 55 {
+		t.Fatalf("entries = %#v", entries)
+	}
+}
+
+func TestPiUsageIsHeldOutOfTheCombinedBucket(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"cacheReadTokens":900,"totalTokens":1230,"totalCost":3,
+		"agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1,"modelsUsed":["claude-opus-5"]},
+			{"agent":"pi","inputTokens":150,"outputTokens":15,"cacheReadTokens":300,"totalTokens":465,"totalCost":1.5,"modelsUsed":["[pi] GLM-5.2-NVFP4"]},
+			{"agent":"kimi","inputTokens":50,"outputTokens":5,"cacheReadTokens":200,"totalTokens":255,"totalCost":0.5,"modelsUsed":["kimi-k2"]}
+		]}]}`)
+
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined) != 1 {
+		t.Fatalf("combined entries = %#v", combined)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 510 {
+		t.Fatalf("combined totalTokens = %v, want only the Claude agent's 510", got)
+	}
+	if got := usageCostValue(combined[0]); got != 1 {
+		t.Fatalf("combined cost = %v, want 1", got)
+	}
+	if got := numberValue(combined[0]["cacheReadTokens"]); got != 400 {
+		t.Fatalf("combined cacheReadTokens = %v, want 400", got)
+	}
+}
+
+func TestCombinedRebuildRejectsRowsWithoutByAgentBreakdown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3}]}`)
+	_, _, _, err := parseCcusageReportWithLocalExtras(report)
+	if err == nil || !strings.Contains(err.Error(), "--by-agent") || !strings.Contains(err.Error(), "agents[]") {
+		t.Fatalf("expected a clear by-agent contract error, got %v", err)
+	}
+}
+
+func TestCombinedRebuildEmitsAZeroRowWhenOnlyDedicatedAgentsRan(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":150,"outputTokens":15,"totalTokens":465,"totalCost":1.5,
+		"agents":[{"agent":"pi","inputTokens":150,"outputTokens":15,"cacheReadTokens":300,"totalTokens":465,"totalCost":1.5,"modelsUsed":["[pi] GLM-5.2-NVFP4"]}]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The row must survive at zero so an inflated row uploaded by an earlier
+	// ccrank version is overwritten rather than left ranked.
+	if len(combined) != 1 {
+		t.Fatalf("combined entries = %#v", combined)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 0 {
+		t.Fatalf("combined totalTokens = %v, want 0", got)
+	}
+	if got := usageDate(combined[0]); got != "2026-08-14" {
+		t.Fatalf("combined date = %q", got)
+	}
+}
+
+func TestCombinedRebuildMergesMatchingModelBreakdowns(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-08-14","agents":[
+		{"agent":"claude","inputTokens":10,"outputTokens":2,"cacheCreationTokens":3,"cacheReadTokens":4,"totalTokens":19,"totalCost":0.5,
+		 "modelBreakdowns":[
+			{"modelName":"zeta","inputTokens":1,"outputTokens":1,"cacheCreationTokens":1,"cacheReadTokens":1,"totalTokens":4,"cost":0.1},
+			{"modelName":"alpha","inputTokens":9,"outputTokens":1,"cacheCreationTokens":2,"cacheReadTokens":3,"totalTokens":15,"cost":0.4}
+		 ]},
+		{"agent":"codex","inputTokens":5,"outputTokens":6,"cacheCreationTokens":7,"cacheReadTokens":8,"totalTokens":26,"totalCost":0.6,
+		 "modelBreakdowns":[
+			{"modelName":"alpha","inputTokens":5,"outputTokens":6,"cacheCreationTokens":7,"cacheReadTokens":8,"totalTokens":26,"cost":0.6}
+		 ]}
+	]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 45 {
+		t.Fatalf("combined totalTokens = %v, want 45", got)
+	}
+	breakdowns := combined[0]["modelBreakdowns"].([]map[string]any)
+	if len(breakdowns) != 2 || modelBreakdownName(breakdowns[0]) != "alpha" || modelBreakdownName(breakdowns[1]) != "zeta" {
+		t.Fatalf("modelBreakdowns = %#v", breakdowns)
+	}
+	alpha := breakdowns[0]
+	for key, want := range map[string]float64{
+		"inputTokens":         14,
+		"outputTokens":        7,
+		"cacheCreationTokens": 9,
+		"cacheReadTokens":     11,
+		"totalTokens":         41,
+		"cost":                1,
+	} {
+		if got := numberValue(alpha[key]); got != want {
+			t.Errorf("alpha %s = %v, want %v", key, got, want)
+		}
 	}
 }
 
