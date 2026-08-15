@@ -188,7 +188,7 @@ test('API leaderboard accepts Kimi and keeps zero-cost token usage ranked', asyn
   assert.match(statements[0].sql, /ORDER BY total_tokens DESC/);
 });
 
-test('Kimi CLI uploads can replace migrated aggregates while legacy uploads keep max merge', async () => {
+test('uploads always max-merge, even when the CLI asks to replace', async () => {
   function createUploadDatabase() {
     const statements = [];
     const batches = [];
@@ -264,7 +264,9 @@ test('Kimi CLI uploads can replace migrated aggregates while legacy uploads keep
 
   assert.equal(replacementResponse.status, 200);
   assert.equal(replacementBody.platform, 'kimi');
-  assert.match(replacementUpsert.sql, /total_tokens = excluded\.total_tokens/);
+  // The never-lower invariant: replace:true must not unlock row lowering.
+  assert.match(replacementUpsert.sql, /total_tokens = MAX\(excluded\.total_tokens, daily_usage\.total_tokens\)/);
+  assert.doesNotMatch(replacementUpsert.sql, /total_tokens = excluded\.total_tokens/);
   assert.equal(replacement.batches[0][0].bindings[5], 'kimi');
   assert.equal(replacement.batches[0][0].bindings[10], 430);
   assert.equal(replacement.batches[0][0].bindings[11], 0);

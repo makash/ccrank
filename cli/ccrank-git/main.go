@@ -148,12 +148,16 @@ func main() {
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
 	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
-	report, localToday, combinedComplete, err := runCcusage()
+	report, localToday, _, err := runCcusage()
 	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
-		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined", combinedComplete)
+		// Never send replace=true for combined rows: the server holds the
+		// historical high-water mark for dates whose local logs were pruned,
+		// and a replace upload would bulldoze those peaks down to today's
+		// local view (this exact bug destroyed ~27B tokens on 2026-08-15).
+		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined", false)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -275,7 +279,7 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": skipped -", err.Error())
 		return nil
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform, true); err != nil {
+	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform, false); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
