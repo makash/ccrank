@@ -604,7 +604,7 @@ func TestPiUsageIsRoutedToThePlatformThatOwnsEachModel(t *testing.T) {
 	// Pi no longer backfills the combined bucket: ccusage imports it natively
 	// and ccrank uploads it under the Pi platform, so a failed ccusage run has
 	// nothing left to report as combined usage.
-	if _, _, _, err := parseCcusageReportWithLocalExtras([]byte(`not-json`)); err == nil {
+	if _, _, err := parseCcusageReportWithLocalExtras([]byte(`not-json`)); err == nil {
 		t.Fatal("expected an error when ccusage fails and no local extras remain")
 	}
 }
@@ -692,7 +692,7 @@ func TestCombinedRebuildRejectsRowsWithoutByAgentBreakdown(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3}]}`)
-	_, _, _, err := parseCcusageReportWithLocalExtras(report)
+	_, _, err := parseCcusageReportWithLocalExtras(report)
 	if err == nil || !strings.Contains(err.Error(), "--by-agent") || !strings.Contains(err.Error(), "agents[]") {
 		t.Fatalf("expected a clear by-agent contract error, got %v", err)
 	}

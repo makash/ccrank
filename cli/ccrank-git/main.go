@@ -148,7 +148,7 @@ func main() {
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
 	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
-	report, localToday, _, err := runCcusage()
+	report, localToday, err := runCcusage()
 	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
@@ -404,81 +404,79 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 	return nil
 }
 
-func runCcusage() (string, *UsageSnapshot, bool, error) {
+func runCcusage() (string, *UsageSnapshot, error) {
 	// --by-agent splits each daily row per source CLI so agents ccrank uploads
 	// under their own platform can be held out of the combined bucket.
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json", "--by-agent")
 	out, err := cmd.Output()
 	if err != nil {
 		report := map[string]any{"daily": []map[string]any{}}
-		entries, _ := loadLocalUsageEntries(nil, report)
+		entries := loadLocalUsageEntries(nil, report)
 		if len(entries) == 0 {
-			return "", nil, false, errors.New("no combined usage data found (is Node installed?)")
+			return "", nil, errors.New("no combined usage data found (is Node installed?)")
 		}
 		localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 		normalized, err := normalizeAndFilterUsageReport(report, entries)
 		if err != nil {
-			return "", localToday, false, err
+			return "", localToday, err
 		}
-		return normalized, localToday, false, nil
+		return normalized, localToday, nil
 	}
-	report, entries, complete, err := parseCcusageReportWithLocalExtras(out)
+	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
-		return "", nil, false, err
+		return "", nil, err
 	}
 	localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 	normalized, err := normalizeAndFilterUsageReport(report, entries)
 	if err != nil {
-		return "", localToday, false, err
+		return "", localToday, err
 	}
-	return normalized, localToday, complete, nil
+	return normalized, localToday, nil
 }
 
 func normalizeAndFilterCcusageReport(out []byte) (string, error) {
-	report, entries, _, err := parseCcusageReportWithLocalExtras(out)
+	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
 		return "", err
 	}
 	return normalizeAndFilterUsageReport(report, entries)
 }
 
-func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, bool, error) {
+func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
 	report, entries, err := parseCcusageReport(out)
-	complete := err == nil
 	if err != nil {
 		report = map[string]any{"daily": []map[string]any{}}
 		entries = nil
 	} else {
 		entries, err = rebuildCombinedEntries(entries)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, err
 		}
 		setReportEntries(report, entries)
 	}
 
-	var extrasComplete bool
-	entries, extrasComplete = loadLocalUsageEntries(entries, report)
+	entries = loadLocalUsageEntries(entries, report)
 	if len(entries) == 0 && err != nil {
-		return nil, nil, false, err
+		return nil, nil, err
 	}
-	return report, entries, complete && extrasComplete, nil
+	return report, entries, nil
 }
 
 // loadLocalUsageEntries folds in agents ccusage cannot see. Pi is deliberately
 // absent: ccusage imports it natively now, and ccrank uploads it under its own
 // platform, so merging it here would count every Pi session twice.
-func loadLocalUsageEntries(entries []map[string]any, report map[string]any) ([]map[string]any, bool) {
-	complete := true
-
+func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []map[string]any {
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
+		// Tolerate unreadable transcripts: they are skipped with a warning
+		// rather than failing the run. The combined upload always max-merges
+		// server-side, so a partial local view can never lower a row.
 		fmt.Fprintln(os.Stderr, "  Gemini Antigravity: skipped -", err.Error())
-		complete = false
 	} else if len(antigravityEntries) > 0 {
 		entries = mergeUsageEntries(entries, antigravityEntries)
 		setReportEntries(report, entries)
 	}
-	return entries, complete
+	return entries
 }
 
 // ccusage imports Pi and Kimi natively, and ccrank uploads both under their own
@@ -1649,10 +1647,10 @@ func printCcusageHelp() {
 //
 // A deployment that predates a platform drops the CLI's explicit platform as
 // invalid and re-detects the rows from their model names, which lands them in
-// the combined bucket. The server max-merges, so that would *add* those
-// tokens onto the user's real Claude/Codex totals rather than overwrite
-// them — still wrong attribution. Uploading a dedicated platform is therefore
-// only safe once the server has confirmed it knows the name.
+// the combined bucket. The server max-merges, so that would pollute the
+// combined row up to the Grok-only figure (bounded, never a sum) and
+// misattribute usage. Uploading a dedicated platform is therefore only safe
+// once the server has confirmed it knows the name.
 //
 // Returns nil when the endpoint is absent, which means the server is older than
 // this capability probe and no dedicated platform may be uploaded.

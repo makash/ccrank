@@ -282,8 +282,8 @@ func TestLoadSupportedPlatformsTreatsAMissingProbeAsALegacyServer(t *testing.T) 
 func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 	// A deployment that predates a platform drops the explicit platform and
 	// re-detects the rows as `claude`. The server max-merges, so sending one
-	// would add those tokens onto the user's real combined totals rather
-	// than overwrite them — still wrong attribution.
+	// would pollute the combined row up to the Grok-only figure (bounded,
+	// never a sum) and misattribute usage.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/platforms" {
 			http.NotFound(w, r)
@@ -322,10 +322,11 @@ func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 	}
 }
 
-func TestUnreadableLocalSessionsDoNotDowngradeTheCombinedUpload(t *testing.T) {
-	// An unreadable file must not mark the combined report incomplete: that
-	// downgrades the upload to a max merge, silently discarding the smaller
-	// corrected rows this version produces after splitting out the platforms.
+func TestUnreadableLocalSessionsDoNotFailTheCombinedUpload(t *testing.T) {
+	// An unreadable transcript or Pi session must be skipped with a warning,
+	// not fail the run — one unreadable file would otherwise take out every
+	// platform's upload. (This used to matter for the replace=false downgrade
+	// path; since the always-max-merge invariant it matters for availability.)
 	if os.Geteuid() == 0 {
 		t.Skip("root can read mode 0000 files")
 	}
