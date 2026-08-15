@@ -153,11 +153,10 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
 	} else {
-		// Never send replace=true for combined rows: the server holds the
-		// historical high-water mark for dates whose local logs were pruned,
-		// and a replace upload would bulldoze those peaks down to today's
-		// local view (this exact bug destroyed ~27B tokens on 2026-08-15).
-		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined", false)
+		// Combined rows are max-merged server-side (never-lower). Do not send
+		// a replace flag — the LDP CLI never had one, and a replace=true
+		// upload destroyed ~27B tokens of historical peaks on 2026-08-15.
+		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -279,7 +278,7 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": skipped -", err.Error())
 		return nil
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform, false); err != nil {
+	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
@@ -1650,10 +1649,10 @@ func printCcusageHelp() {
 //
 // A deployment that predates a platform drops the CLI's explicit platform as
 // invalid and re-detects the rows from their model names, which lands them in
-// the combined bucket. Because these uploads replace rather than max-merge,
-// that would overwrite the user's real Claude and Codex totals with, say,
-// Grok-only numbers. Uploading a dedicated platform is therefore only safe once
-// the server has confirmed it knows the name.
+// the combined bucket. The server max-merges, so that would *add* those
+// tokens onto the user's real Claude/Codex totals rather than overwrite
+// them — still wrong attribution. Uploading a dedicated platform is therefore
+// only safe once the server has confirmed it knows the name.
 //
 // Returns nil when the endpoint is absent, which means the server is older than
 // this capability probe and no dedicated platform may be uploaded.
@@ -1697,7 +1696,7 @@ func loadSupportedPlatforms(baseURL, token string) (map[string]bool, error) {
 	return supported, nil
 }
 
-func uploadCcusage(baseURL, token, report, machine, platform string, replace bool) error {
+func uploadCcusage(baseURL, token, report, machine, platform string) error {
 	baseURL = strings.TrimRight(baseURL, "/")
 	endpoint := baseURL + "/api/upload"
 
@@ -1705,11 +1704,13 @@ func uploadCcusage(baseURL, token, report, machine, platform string, replace boo
 	if source == "" {
 		source = "default"
 	}
+	// Never send a replace field. The server always max-merges. The LDP CLI
+	// never had this field; reintroducing it is how 2026-08-15 destroyed
+	// historical peaks. See test/never-lower.test.mjs.
 	payload := map[string]any{
 		"json":     report,
 		"source":   source,
 		"platform": platform,
-		"replace":  replace,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1738,8 +1739,8 @@ func uploadCcusage(baseURL, token, report, machine, platform string, replace boo
 	return nil
 }
 
-func uploadUsageReport(baseURL, token, report, machine, platform, cacheName string, replace bool) error {
-	if err := uploadCcusage(baseURL, token, report, machine, platform, replace); err != nil {
+func uploadUsageReport(baseURL, token, report, machine, platform, cacheName string) error {
+	if err := uploadCcusage(baseURL, token, report, machine, platform); err != nil {
 		path, pathErr := usageMaximaPath(cacheName)
 		if pathErr != nil {
 			return fmt.Errorf("%w (could not resolve retry cache: %v)", err, pathErr)

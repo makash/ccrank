@@ -71,23 +71,17 @@ test('no numeric column is ever blindly replaced by the upload handler', () => {
   }
 });
 
-test('the CLI never requests replacement on any upload call site', () => {
+test('the CLI never has a replace flag to send (LDP contract)', () => {
   const cliSource = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), '..', 'cli', 'ccrank-git', 'main.go'),
     'utf8',
   );
-  // Call sites only (lookbehind skips the func definition, whose signature
-  // naturally ends in the boolean parameter name rather than a literal).
-  const callSites = cliSource.match(/(?<!func )uploadUsageReport\([^)]*\)/g) ?? [];
-  assert.ok(callSites.length >= 2, 'expected the combined and dedicated call sites');
-  for (const call of callSites) {
-    assert.ok(
-      call.includes(', false)'),
-      `uploadUsageReport call must pass replace=false: ${call.replace(/\s+/g, ' ')}`,
-    );
-  }
   assert.ok(
-    !cliSource.includes('"combined", true'),
-    'the combined upload must never request replacement',
+    !/"replace"\s*:/.test(cliSource),
+    'CLI payload must not include a replace field — LDP never had one',
+  );
+  assert.ok(
+    !/replace\s+bool/.test(cliSource),
+    'CLI must not accept a replace parameter',
   );
 });

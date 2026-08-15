@@ -173,7 +173,7 @@ func TestUsageMaximaPathAcceptsEveryUploadedPlatform(t *testing.T) {
 	}
 }
 
-func TestUploadCcusageRequestsAggregateReplacement(t *testing.T) {
+func TestUploadCcusageNeverSendsReplace(t *testing.T) {
 	var payload map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -184,20 +184,14 @@ func TestUploadCcusageRequestsAggregateReplacement(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	if err := uploadCcusage(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", true); err != nil {
+	if err := uploadCcusage(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi"); err != nil {
 		t.Fatal(err)
 	}
-	if payload["replace"] != true {
-		t.Fatalf("replace = %#v", payload["replace"])
+	if _, ok := payload["replace"]; ok {
+		t.Fatalf("CLI must not send replace (got %#v) — LDP never had this field", payload["replace"])
 	}
 	if payload["platform"] != "kimi" {
 		t.Fatalf("platform = %#v", payload["platform"])
-	}
-	if err := uploadCcusage(server.URL, "test-token", `{"daily":[]}`, "secrig", "claude", false); err != nil {
-		t.Fatal(err)
-	}
-	if payload["replace"] != false {
-		t.Fatalf("replace = %#v", payload["replace"])
 	}
 }
 
@@ -218,7 +212,7 @@ func TestUploadUsageReportResetsMaximaAfterFailedUpload(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	err := uploadUsageReport(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", "kimi", true)
+	err := uploadUsageReport(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", "kimi")
 	if err == nil {
 		t.Fatal("expected failed upload")
 	}
