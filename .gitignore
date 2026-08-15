@@ -4,3 +4,4 @@ dist/
 .dev.vars
 *.log
 /ccrank-git
+cli/ccrank-git/ccrank-git

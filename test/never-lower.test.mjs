@@ -76,12 +76,18 @@ test('the CLI never has a replace flag to send (LDP contract)', () => {
     join(dirname(fileURLToPath(import.meta.url)), '..', 'cli', 'ccrank-git', 'main.go'),
     'utf8',
   );
+  // Case-insensitive + struct-tag aware: a typed `Replace bool` with a
+  // `json:"replace"` tag must be caught too, not just map literals.
   assert.ok(
-    !/"replace"\s*:/.test(cliSource),
+    !/["']replace["']\s*:/.test(cliSource),
     'CLI payload must not include a replace field — LDP never had one',
   );
   assert.ok(
-    !/replace\s+bool/.test(cliSource),
+    !/replace\s+bool/i.test(cliSource),
     'CLI must not accept a replace parameter',
+  );
+  assert.ok(
+    !/json:\s*["']replace["']/.test(cliSource),
+    'CLI structs must not serialize a replace field',
   );
 });
