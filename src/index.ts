@@ -1077,10 +1077,13 @@ app.post('/api/upload', async (c) => {
     .bind(uploadId, user.id, report.type, report.entries.length)
     .run();
 
-  // Upsert daily usage entries (source + platform tracking)
-  const mergeValue = (column: string) => body.replace === true
-    ? `excluded.${column}`
-    : `MAX(excluded.${column}, daily_usage.${column})`;
+  // Upsert daily usage entries (source + platform tracking).
+  // NOTE: the server always max-merges. A replace:true field from the CLI is
+  // deliberately ignored: on 2026-08-15 a replace=true migration rewrote
+  // every combined row to the machine's *current* local view and destroyed
+  // ~27B tokens of historical peaks whose source logs had since been pruned
+  // (totals may only ever go up — see ed592af and e6ed7d5).
+  const mergeValue = (column: string) => `MAX(excluded.${column}, daily_usage.${column})`;
   const stmt = c.env.DB.prepare(
     `INSERT INTO daily_usage (id, upload_id, user_id, date, source, platform, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, models_used)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
