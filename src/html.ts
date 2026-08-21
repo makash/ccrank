@@ -29,7 +29,7 @@ const PLATFORM_META = [
   { key: 'opencode', label: 'OpenCode', shortLabel: 'OpenCode', dot: 'bg-orange-400', text: 'text-orange-300' },
 ] as const;
 
-function layout(title: string, content: string, user: User | null = null, ogOverrides?: { image?: string; description?: string }): string {
+export function layout(title: string, content: string, user: User | null = null, ogOverrides?: { image?: string; description?: string }): string {
   const nav = user
     ? `<nav class="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
         <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
@@ -44,6 +44,7 @@ function layout(title: string, content: string, user: User | null = null, ogOver
               <summary class="text-sm text-gray-300 hover:text-white transition cursor-pointer list-none">More</summary>
               <div class="absolute right-0 mt-2 w-44 bg-gray-900 border border-gray-800 rounded-lg shadow-lg p-2">
                 <a href="/history" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">History</a>
+                <a href="/analytics" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">Analytics</a>
                 <a href="/about" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">About</a>
                 <a href="/settings" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">Settings</a>
                 ${user.is_admin ? '<a href="/admin" class="block px-3 py-2 text-sm text-yellow-400 hover:text-yellow-300 hover:bg-gray-800 rounded-md transition">Admin</a>' : ''}
@@ -91,6 +92,7 @@ function layout(title: string, content: string, user: User | null = null, ogOver
               <summary class="text-sm text-gray-300 hover:text-white transition cursor-pointer list-none">More</summary>
               <div class="absolute right-0 mt-2 w-36 bg-gray-900 border border-gray-800 rounded-lg shadow-lg p-2">
                 <a href="/history" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">History</a>
+                <a href="/analytics" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">Analytics</a>
                 <a href="/about" class="block px-3 py-2 text-sm text-gray-300 hover:text-white hover:bg-gray-800 rounded-md transition">About</a>
               </div>
             </details>

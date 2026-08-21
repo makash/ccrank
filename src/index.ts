@@ -30,6 +30,7 @@ import {
   profilePage,
   errorPage,
 } from './html';
+import { analyticsPage, type AnalyticsData, type AnalyticsDay, type AnalyticsUserSeries } from './analytics';
 import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, PLATFORMS, type ViewType } from './utils';
 import { generateCardSvg, type CardData } from './card';
 import { generateCardHtml } from './card-png';
@@ -424,6 +425,93 @@ app.get('/leaderboard', async (c) => {
   }
 
   return c.html(leaderboardPage(entries, user, sort, view, dateRange, platform));
+});
+
+app.get('/analytics', async (c) => {
+  const user = c.get('user');
+  const rangeParam = parseInt(c.req.query('range') || '30', 10);
+  const range = rangeParam === 90 ? 90 : 30;
+  const since = new Date();
+  since.setDate(since.getDate() - (range - 1));
+  const startDate = since.toISOString().slice(0, 10);
+
+  const [dailyRes, activesRes, topRes, countRes] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT date, COALESCE(platform,'claude') AS platform, SUM(total_tokens) AS t, SUM(cost_usd) AS c
+       FROM daily_usage WHERE total_tokens > 0 AND date >= ?
+       GROUP BY date, COALESCE(platform,'claude') ORDER BY date`
+    ).bind(startDate).all(),
+    c.env.DB.prepare(
+      `SELECT date, COUNT(DISTINCT user_id) AS u FROM daily_usage WHERE total_tokens > 0 AND date >= ? GROUP BY date ORDER BY date`
+    ).bind(startDate).all(),
+    c.env.DB.prepare(
+      `SELECT user_id, SUM(total_tokens) AS t FROM daily_usage WHERE total_tokens > 0 AND date >= ? GROUP BY user_id ORDER BY t DESC LIMIT 4`
+    ).bind(startDate).all(),
+    c.env.DB.prepare(`SELECT COUNT(DISTINCT user_id) AS u FROM daily_usage WHERE total_tokens > 0 AND date >= ?`)
+      .bind(startDate)
+      .all(),
+  ]);
+
+  const dayMap = new Map<string, AnalyticsDay>();
+  for (const row of (dailyRes.results || []) as any[]) {
+    const date = String(row.date);
+    let day = dayMap.get(date);
+    if (!day) {
+      day = { date, tokens: 0, cost: 0, users: 0, byPlatform: {} };
+      dayMap.set(date, day);
+    }
+    const tokens = Number(row.t) || 0;
+    day.tokens += tokens;
+    day.cost += Number(row.c) || 0;
+    const platform = String(row.platform);
+    day.byPlatform[platform] = (day.byPlatform[platform] || 0) + tokens;
+  }
+  for (const row of (activesRes.results || []) as any[]) {
+    const day = dayMap.get(String(row.date));
+    if (day) day.users = Number(row.u) || 0;
+  }
+  const days = [...dayMap.values()].sort((a, b) => a.date.localeCompare(b.date));
+
+  const topRows = (topRes.results || []) as any[];
+  let topUsers: AnalyticsUserSeries[] = [];
+  if (topRows.length > 0) {
+    const ids = topRows.map((row) => String(row.user_id));
+    const placeholders = ids.map(() => '?').join(',');
+    const seriesRes = await c.env.DB.prepare(
+      `SELECT d.user_id, u.display_name AS name, d.date, SUM(d.total_tokens) AS t
+       FROM daily_usage d JOIN users u ON u.id = d.user_id
+       WHERE d.total_tokens > 0 AND d.date >= ? AND d.user_id IN (${placeholders})
+       GROUP BY d.user_id, u.display_name, d.date ORDER BY d.date`
+    )
+      .bind(startDate, ...ids)
+      .all();
+    const byId = new Map<string, AnalyticsUserSeries>();
+    for (const row of (seriesRes.results || []) as any[]) {
+      const id = String(row.user_id);
+      let entry = byId.get(id);
+      if (!entry) {
+        entry = { name: String(row.name), total: 0, daily: {} };
+        byId.set(id, entry);
+      }
+      const tokens = Number(row.t) || 0;
+      entry.total += tokens;
+      entry.daily[String(row.date)] = tokens;
+    }
+    topUsers = ids.map((id) => byId.get(id)).filter((entry): entry is AnalyticsUserSeries => entry !== undefined);
+  }
+
+  const data: AnalyticsData = {
+    range,
+    days,
+    totals: {
+      tokens: days.reduce((sum, day) => sum + day.tokens, 0),
+      cost: days.reduce((sum, day) => sum + day.cost, 0),
+      users: Number(((countRes.results || [])[0] as any)?.u) || 0,
+    },
+    topUsers,
+  };
+
+  return c.html(analyticsPage(data, user));
 });
 
 app.get('/upload', (c) => {
