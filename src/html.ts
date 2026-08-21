@@ -354,8 +354,20 @@ export function loginPage(): string {
   );
 }
 
-export function dashboardPage(user: User, stats: { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number; rank: number; upload_count: number; platformBreakdown?: Record<string, { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number }> }): string {
+export function dashboardPage(user: User, stats: { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number; rank: number; upload_count: number; platformBreakdown?: Record<string, { total_cost: number; total_tokens: number; total_output_tokens: number; days_active: number }>; streak?: { current: number; longest: number }; rank_today?: number | null; rank_yesterday?: number | null; rank_delta?: number | null }): string {
   const title = getTitle(stats.total_tokens);
+  const streak = stats.streak ?? { current: 0, longest: 0 };
+  let rankLine: string;
+  if (stats.rank_today == null) {
+    rankLine = '<span class="text-gray-500">—</span>';
+  } else {
+    const d = stats.rank_delta ?? null;
+    const deltaHtml =
+      d != null && d > 0 ? ` <span class="text-green-400">(▲${d})</span>`
+      : d != null && d < 0 ? ` <span class="text-red-400">(▼${Math.abs(d)})</span>`
+      : ' <span class="text-gray-500">(—)</span>';
+    rankLine = `<span class="text-gray-300">#${stats.rank_today} today</span>${deltaHtml}`;
+  }
   return layout(
     'Dashboard',
     `<div class="mb-8">
@@ -366,7 +378,7 @@ export function dashboardPage(user: User, stats: { total_cost: number; total_tok
       </p>
     </div>
 
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <div class="text-sm text-gray-400 mb-1">Total Tokens</div>
         <div class="text-2xl font-bold text-cyan-400">${formatTokens(stats.total_tokens)}</div>
@@ -382,6 +394,11 @@ export function dashboardPage(user: User, stats: { total_cost: number; total_tok
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
         <div class="text-sm text-gray-400 mb-1">Estimated Cost</div>
         <div class="text-2xl font-bold text-purple-400">${formatCost(stats.total_cost)}</div>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+        <div class="text-sm text-gray-400 mb-1">🔥 Streak</div>
+        <div class="text-2xl font-bold text-orange-400">${streak.current}-day streak</div>
+        <div class="text-xs mt-1">${rankLine}</div>
       </div>
     </div>
 

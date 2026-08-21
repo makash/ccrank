@@ -32,6 +32,7 @@ import {
 } from './html';
 import { analyticsPage, type AnalyticsData, type AnalyticsDay, type AnalyticsUserSeries } from './analytics';
 import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, PLATFORMS, type ViewType } from './utils';
+import { computeStreak as computeDateStreak, computeRankDelta } from './stats';
 import { generateCardSvg, type CardData } from './card';
 import { generateCardHtml } from './card-png';
 import { uploadCardSvg, getCardPngUrl } from './sirv';
@@ -153,6 +154,53 @@ function computeStreak(values: number[]): number {
     else break;
   }
   return streak;
+}
+
+// Streak + daily-rank stats shared by the dashboard and /api/me/stats.
+// Ranks are the user's position among all users by SUM(total_tokens) for a
+// single calendar date (daily-view semantics); NULL when no usage that day.
+async function getStreakStats(c: any, userId: string) {
+  const today = new Date().toISOString().slice(0, 10);
+  const yDate = new Date();
+  yDate.setDate(yDate.getDate() - 1);
+  const yesterday = yDate.toISOString().slice(0, 10);
+
+  const [datesRes, dayTotals] = await Promise.all([
+    c.env.DB.prepare(
+      'SELECT DISTINCT date FROM daily_usage WHERE user_id = ? AND total_tokens > 0'
+    ).bind(userId).all(),
+    c.env.DB.prepare(
+      'SELECT date, SUM(total_tokens) as total_tokens FROM daily_usage WHERE user_id = ? AND date IN (?, ?) AND total_tokens > 0 GROUP BY date'
+    ).bind(userId, today, yesterday).all(),
+  ]);
+
+  const activeDates = ((datesRes.results || []) as any[]).map((row) => String(row.date));
+  const totalsByDate = new Map<string, number>();
+  for (const row of (dayTotals.results || []) as any[]) {
+    totalsByDate.set(String(row.date), Number(row.total_tokens) || 0);
+  }
+
+  const dailyRank = async (date: string): Promise<number | null> => {
+    const total = totalsByDate.get(date) ?? 0;
+    if (total <= 0) return null;
+    const r = await c.env.DB.prepare(
+      `SELECT COUNT(*) + 1 as rank FROM (
+        SELECT user_id, SUM(total_tokens) as total_tokens FROM daily_usage
+        WHERE date = ? AND total_tokens > 0 GROUP BY user_id
+      ) WHERE total_tokens > ?`
+    ).bind(date, total).first();
+    return Number((r as any)?.rank ?? 1);
+  };
+
+  const rank_today = await dailyRank(today);
+  const rank_yesterday = await dailyRank(yesterday);
+
+  return {
+    streak: computeDateStreak(activeDates, today),
+    rank_today,
+    rank_yesterday,
+    rank_delta: computeRankDelta(rank_today, rank_yesterday),
+  };
 }
 
 // ─── Pages ──────────────────────────────────────────────────────────────────────
@@ -297,6 +345,8 @@ app.get('/', async (c) => {
     .bind(user.id)
     .first();
 
+  const streakStats = await getStreakStats(c, user.id);
+
   // Platform breakdown for dashboard
   const dashPlatformStats = await c.env.DB.prepare(
     `SELECT COALESCE(platform, 'claude') as platform,
@@ -324,6 +374,10 @@ app.get('/', async (c) => {
       rank: (rankResult as any)?.rank ?? 0,
       upload_count: (uploadCount as any)?.cnt ?? 0,
       platformBreakdown: dashPlatformBreakdown,
+      streak: streakStats.streak,
+      rank_today: streakStats.rank_today,
+      rank_yesterday: streakStats.rank_yesterday,
+      rank_delta: streakStats.rank_delta,
     })
   );
 });
@@ -1470,6 +1524,23 @@ app.get('/api/me', async (c) => {
     },
     stats,
     platformBreakdown: mePlatformBreakdown,
+  });
+});
+
+app.get('/api/me/stats', async (c) => {
+  const sessionUser = c.get('user');
+  const tokenUser = sessionUser ? null : await getTokenUser(c);
+  const user = sessionUser || tokenUser;
+  if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const streakStats = await getStreakStats(c, user.id);
+
+  return c.json({
+    ok: true,
+    streak: streakStats.streak,
+    rank_today: streakStats.rank_today,
+    rank_yesterday: streakStats.rank_yesterday,
+    rank_delta: streakStats.rank_delta,
   });
 });
 

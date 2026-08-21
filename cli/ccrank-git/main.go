@@ -1845,7 +1845,72 @@ func printDailyUsageComparison(baseURL, token string, local UsageSnapshot) error
 	if status != "same" && remote.SourceURL != "" {
 		fmt.Printf("    URL: %s\n", remote.SourceURL)
 	}
+
+	printMyRankLine(baseURL, token)
 	return nil
+}
+
+// printMyRankLine best-effort prints today's leaderboard rank with the delta
+// vs yesterday, using /api/me/stats. Failures are silent: the rank line is a
+// nice-to-have next to the usage comparison above.
+func printMyRankLine(baseURL, token string) {
+	rankToday, rankDelta, err := fetchMyStats(baseURL, token)
+	if err != nil || rankToday == nil {
+		return
+	}
+	if rankDelta == nil || *rankDelta == 0 {
+		fmt.Printf("    Rank #%d today\n", *rankToday)
+		return
+	}
+	if *rankDelta > 0 {
+		fmt.Printf("    Rank #%d (▲%d vs yesterday)\n", *rankToday, *rankDelta)
+	} else {
+		fmt.Printf("    Rank #%d (▼%d vs yesterday)\n", *rankToday, -*rankDelta)
+	}
+}
+
+func fetchMyStats(baseURL, token string) (*int, *int, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, nil, errors.New("missing API token")
+	}
+
+	endpoint := strings.TrimRight(baseURL, "/") + "/api/me/stats"
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, nil, fmt.Errorf("stats unavailable: %s", strings.TrimSpace(string(body)))
+	}
+
+	var parsed struct {
+		OK            bool   `json:"ok"`
+		Error         string `json:"error"`
+		RankToday     *int   `json:"rank_today"`
+		RankYesterday *int   `json:"rank_yesterday"`
+		RankDelta     *int   `json:"rank_delta"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, nil, err
+	}
+	if !parsed.OK {
+		if parsed.Error == "" {
+			parsed.Error = "unknown response"
+		}
+		return nil, nil, errors.New(parsed.Error)
+	}
+	return parsed.RankToday, parsed.RankDelta, nil
 }
 
 func fetchAuthenticatedDailyUsage(baseURL, token, date string) (*UsageSnapshot, error) {
