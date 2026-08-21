@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,7 +28,16 @@ func TestShouldShowOnboardingDoesNotBlockUsageOnlyUpload(t *testing.T) {
 	}
 }
 
-func TestNormalizeAndFilterCcusageReportOnlySkipsUnchangedRows(t *testing.T) {
+func prepareCcusageUpload(t *testing.T, report []byte) (*pendingUsageUpload, error) {
+	t.Helper()
+	parsed, entries, err := parseCcusageReportWithLocalExtras(report)
+	if err != nil {
+		return nil, err
+	}
+	return prepareUsageUpload(parsed, entries, "combined", "no higher combined usage rows found")
+}
+
+func TestPrepareCcusageUploadOnlyOffersHigherRows(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -57,16 +67,19 @@ func TestNormalizeAndFilterCcusageReportOnlySkipsUnchangedRows(t *testing.T) {
 		]
 	}`)
 
-	first, err := normalizeAndFilterCcusageReport(report)
+	first, err := prepareCcusageUpload(t, report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(first, `"2026-05-27"`) {
-		t.Fatalf("expected first upload to contain the daily row: %s", first)
+	if !strings.Contains(first.Report, `"2026-05-27"`) {
+		t.Fatalf("expected first upload to contain the daily row: %s", first.Report)
+	}
+	// Emulate the confirmed upload so the maxima cache advances.
+	if err := first.Commit(); err != nil {
+		t.Fatal(err)
 	}
 
-	_, err = normalizeAndFilterCcusageReport(report)
-	if err == nil || !strings.Contains(err.Error(), "no higher combined usage rows found") {
+	if _, err := prepareCcusageUpload(t, report); err == nil || !strings.Contains(err.Error(), "no higher combined usage rows found") {
 		t.Fatalf("expected unchanged second upload to be skipped, got %v", err)
 	}
 
@@ -96,12 +109,12 @@ func TestNormalizeAndFilterCcusageReportOnlySkipsUnchangedRows(t *testing.T) {
 		]
 	}`)
 
-	third, err := normalizeAndFilterCcusageReport(higher)
+	third, err := prepareCcusageUpload(t, higher)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(third, `"totalTokens":150`) {
-		t.Fatalf("expected higher row to be uploaded, got %s", third)
+	if !strings.Contains(third.Report, `"totalTokens":150`) {
+		t.Fatalf("expected higher row to be uploaded, got %s", third.Report)
 	}
 }
 
@@ -142,14 +155,17 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 
 		report := map[string]any{"type": "daily"}
 		entries := []map[string]any{{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0}}
-		normalized, err := normalizeAndFilterUsageReport(report, entries)
+		pending, err := prepareUsageUpload(report, entries, "combined", "no higher combined usage rows found")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(normalized, `"totalTokens":400`) {
-			t.Fatalf("expected corrected lower row, got %s", normalized)
+		if !strings.Contains(pending.Report, `"totalTokens":400`) {
+			t.Fatalf("expected corrected lower row, got %s", pending.Report)
 		}
 
+		if err := pending.Commit(); err != nil {
+			t.Fatal(err)
+		}
 		cache, err := os.ReadFile(filepath.Join(cacheDir, "usage-maxima-combined.json"))
 		if err != nil {
 			t.Fatal(err)
@@ -212,12 +228,126 @@ func TestUploadUsageReportResetsMaximaAfterFailedUpload(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	err := uploadUsageReport(server.URL, "test-token", `{"daily":[]}`, "secrig", "kimi", "kimi")
+	pending := &pendingUsageUpload{
+		Report: `{"daily":[]}`,
+		Commit: func() error { t.Fatal("commit must not run for a failed upload"); return nil },
+	}
+	err := uploadUsageReport(server.URL, "test-token", pending, "secrig", "kimi", "kimi")
 	if err == nil {
 		t.Fatal("expected failed upload")
 	}
 	if _, statErr := os.Stat(cachePath); !os.IsNotExist(statErr) {
 		t.Fatalf("expected retry cache removal, got %v", statErr)
+	}
+}
+
+func TestFailedUploadLeavesNoMaximaBehindAndReoffersRows(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "try again", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	entries := []map[string]any{
+		{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0},
+		{"date": "2026-08-13", "totalTokens": 250.0, "totalCost": 0.5},
+	}
+	report := map[string]any{"type": "daily"}
+
+	pending, err := prepareUsageUpload(report, entries, platformKimi, "no higher Kimi usage rows found")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi, platformKimi); err == nil {
+		t.Fatal("expected the failed upload to surface")
+	}
+
+	cachePath := filepath.Join(home, ".ccrank", "usage-maxima-kimi.json")
+	if _, statErr := os.Stat(cachePath); !os.IsNotExist(statErr) {
+		t.Fatalf("failed upload must not leave a maxima cache behind, got %v", statErr)
+	}
+
+	// The same rows must be offered again on the next run.
+	retried, err := prepareUsageUpload(report, entries, platformKimi, "no higher Kimi usage rows found")
+	if err != nil {
+		t.Fatalf("rows must be re-offered after a failed upload, got %v", err)
+	}
+	if !strings.Contains(retried.Report, `"2026-08-12"`) || !strings.Contains(retried.Report, `"2026-08-13"`) {
+		t.Fatalf("retried report lost rows: %s", retried.Report)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+}
+
+func TestSuccessfulUploadCommitsExactRowsAndSuppressesAnIdenticalRerun(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	entries := []map[string]any{
+		{"date": "2026-08-12", "totalTokens": 400.0, "totalCost": 1.0},
+		{"date": "2026-08-13", "totalTokens": 250.0, "totalCost": 0.5},
+	}
+	report := map[string]any{"type": "daily"}
+
+	pending, err := prepareUsageUpload(report, entries, platformKimi, "no higher Kimi usage rows found")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi, platformKimi); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("uploads = %d, want 1", len(bodies))
+	}
+
+	cache, err := os.ReadFile(filepath.Join(home, ".ccrank", "usage-maxima-kimi.json"))
+	if err != nil {
+		t.Fatalf("successful upload must persist the maxima cache: %v", err)
+	}
+	var stored struct {
+		Daily []struct {
+			Date        string  `json:"date"`
+			TotalTokens float64 `json:"totalTokens"`
+			TotalCost   float64 `json:"totalCost"`
+		} `json:"daily"`
+	}
+	if err := json.Unmarshal(cache, &stored); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][2]float64{
+		"2026-08-12": {400, 1},
+		"2026-08-13": {250, 0.5},
+	}
+	if len(stored.Daily) != len(want) {
+		t.Fatalf("cached rows = %#v, want exactly the uploaded rows", stored.Daily)
+	}
+	for _, row := range stored.Daily {
+		expected, ok := want[row.Date]
+		if !ok || row.TotalTokens != expected[0] || row.TotalCost != expected[1] {
+			t.Fatalf("cached row %#v does not match the uploaded rows", row)
+		}
+	}
+
+	// A second identical run must offer nothing and hit the server zero times.
+	if _, err := prepareUsageUpload(report, entries, platformKimi, "no higher Kimi usage rows found"); err == nil || !strings.Contains(err.Error(), "no higher Kimi usage rows found") {
+		t.Fatalf("identical rerun must be suppressed by the cache, got %v", err)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("suppressed rerun must not upload, requests = %d", len(bodies))
 	}
 }
 
@@ -695,6 +825,70 @@ func TestCombinedRebuildRejectsRowsWithoutByAgentBreakdown(t *testing.T) {
 	_, _, err := parseCcusageReportWithLocalExtras(report)
 	if err == nil || !strings.Contains(err.Error(), "--by-agent") || !strings.Contains(err.Error(), "agents[]") {
 		t.Fatalf("expected a clear by-agent contract error, got %v", err)
+	}
+}
+
+func TestUnheldDedicatedAgentDetection(t *testing.T) {
+	cases := []struct {
+		agent string
+		want  string
+	}{
+		{"pi", ""},               // already held out
+		{"kimi", ""},             // already held out
+		{"PI", ""},               // held out, case-insensitive
+		{"Kimi", ""},             // held out, case-insensitive
+		{"claude", ""},           // unrelated agent
+		{"codex", ""},            // unrelated agent
+		{"gemini", ""},           // unrelated agent
+		{"hermes", ""},           // unrelated agent
+		{"antigravity", ""},      // unrelated agent
+		{"", ""},                 // blank slice name
+		{"grok", "grok"},         // dedicated platform with no ccusage importer yet
+		{"Grok CLI", "grok"},     // prefixed variant
+		{"grokcli", "grok"},      // glued variant
+		{"glm", "glm"},           // dedicated platform
+		{"GLM-5.3", "glm"},       // prefixed variant
+		{"opencode", "opencode"}, // dedicated platform
+		{"OpenCode", "opencode"}, // case-insensitive
+	}
+	for _, tc := range cases {
+		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
+			t.Errorf("unheldDedicatedAgent(%q) = %q, want %q", tc.agent, got, tc.want)
+		}
+	}
+}
+
+func TestCombinedRebuildRejectsUnheldDedicatedAgents(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
+		"agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
+			{"agent":"grok","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"totalTokens":220,"totalCost":2}
+		]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rebuildCombinedEntries(entries)
+	if err == nil || !strings.Contains(err.Error(), `"grok"`) || !strings.Contains(err.Error(), "ccusageDedicatedAgents") {
+		t.Fatalf("expected a loud dedicated-agent seam error, got %v", err)
+	}
+
+	// The same row without the suspicious agent still rebuilds cleanly.
+	report = []byte(`{"daily":[{"period":"2026-08-14","inputTokens":100,"outputTokens":10,"totalTokens":110,"totalCost":1,
+		"agents":[
+			{"agent":"claude","inputTokens":60,"outputTokens":6,"totalTokens":66,"totalCost":0.6},
+			{"agent":"codex","inputTokens":40,"outputTokens":4,"totalTokens":44,"totalCost":0.4}
+		]}]}`)
+	_, entries, err = parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatalf("claude/codex rows must never trip the detector, got %v", err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
+		t.Fatalf("combined entries = %#v", combined)
 	}
 }
 

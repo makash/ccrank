@@ -11,7 +11,7 @@
  * versions where daily rows use `period` instead of `date`.
  */
 
-export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi';
+export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode';
 
 export interface DailyEntry {
   date: string;
@@ -93,6 +93,8 @@ export function detectPlatform(models: string[]): Platform {
     if (kimiContains.some((part) => lower.includes(part))) return 'kimi';
     if (grokContains.some((part) => lower.includes(part))) return 'grok';
     if (glmContains.some((part) => lower.includes(part))) return 'glm';
+    // OpenCode models carry their provider prefix ("opencode/x-preview-f-free").
+    if (lower.startsWith('opencode/')) return 'opencode';
     // Pi is checked before Codex so an OpenAI model Pi fronts is ranked as Pi
     // usage rather than as Codex CLI usage, which is what the CLI does.
     if (piPrefixes.some((prefix) => lower.startsWith(prefix))) return 'pi';

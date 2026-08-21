@@ -47,23 +47,23 @@ type kimiModelUsage struct {
 	TotalTokens   float64
 }
 
-func runKimiUsage() (string, *UsageSnapshot, error) {
+func runKimiUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadKimiUsageEntries()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	piEntries, err := loadPiKimiUsageEntries()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	entries = mergeUsageEntries(entries, piEntries)
 	if len(entries) == 0 {
-		return "", nil, errors.New("no Kimi usage found")
+		return nil, nil, errors.New("no Kimi usage found")
 	}
 	localToday := usageSnapshotForDate(entries, todayDate())
 	report := map[string]any{"type": "daily", "daily": entries}
-	normalized, err := normalizeAndFilterUsageReportFor(report, entries, "kimi", "no higher Kimi usage rows found")
-	return normalized, localToday, err
+	pending, err := prepareUsageUpload(report, entries, "kimi", "no higher Kimi usage rows found")
+	return pending, localToday, err
 }
 
 func todayDate() string {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -42,20 +43,17 @@ type grokTurnUpdate struct {
 // grokUsage doubles as the per-model breakdown shape; only the turn-level
 // object carries ModelUsage.
 type grokUsage struct {
-	InputTokens         float64               `json:"inputTokens"`
-	OutputTokens        float64               `json:"outputTokens"`
-	TotalTokens         float64               `json:"totalTokens"`
-	CachedReadTokens    float64               `json:"cachedReadTokens"`
-	CacheCreationTokens float64               `json:"cacheCreationTokens"`
-	CostUsdTicks        float64               `json:"costUsdTicks"`
-	ModelUsage          map[string]*grokUsage `json:"modelUsage"`
+	InputTokens         float64 `json:"inputTokens"`
+	OutputTokens        float64 `json:"outputTokens"`
+	TotalTokens         float64 `json:"totalTokens"`
+	CachedReadTokens    float64 `json:"cachedReadTokens"`
+	CacheCreationTokens float64 `json:"cacheCreationTokens"`
+	// Kept only as an identity field for the fallback event fingerprint:
+	// Grok bills through a weekly credit plan (onDemandUsed: 0), so ticks are
+	// never converted to dollars.
+	CostUsdTicks float64               `json:"costUsdTicks"`
+	ModelUsage   map[string]*grokUsage `json:"modelUsage"`
 }
-
-// Grok reports cost in ticks rather than dollars. 1e10 ticks == 1 USD: at that
-// scale real session logs imply $1.8-2.8 per million fresh input tokens and
-// $0.4-0.9 per million cached reads, which match xAI list pricing. One order up
-// would price cached reads above any published rate.
-const grokCostTicksPerUSD = 1e10
 
 type grokDailyUsage struct {
 	Input         float64
@@ -63,7 +61,6 @@ type grokDailyUsage struct {
 	CacheRead     float64
 	CacheCreation float64
 	TotalTokens   float64
-	Cost          float64
 	Turns         int
 	SessionFiles  map[string]bool
 	Models        map[string]*grokModelUsage
@@ -75,26 +72,25 @@ type grokModelUsage struct {
 	CacheRead     float64
 	CacheCreation float64
 	TotalTokens   float64
-	Cost          float64
 }
 
-func runGrokUsage() (string, *UsageSnapshot, error) {
+func runGrokUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadGrokUsageEntries()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	piEntries, err := loadPiUsageEntriesFor(platformGrok)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	entries = mergeUsageEntries(entries, piEntries)
 	if len(entries) == 0 {
-		return "", nil, errors.New("no Grok usage found")
+		return nil, nil, errors.New("no Grok usage found")
 	}
 	localToday := usageSnapshotForDate(entries, todayDate())
 	report := map[string]any{"type": "daily", "daily": entries}
-	normalized, err := normalizeAndFilterUsageReportFor(report, entries, platformGrok, "no higher Grok usage rows found")
-	return normalized, localToday, err
+	pending, err := prepareUsageUpload(report, entries, platformGrok, "no higher Grok usage rows found")
+	return pending, localToday, err
 }
 
 func loadGrokUsageEntries() ([]map[string]any, error) {
@@ -158,8 +154,10 @@ func loadGrokUsageEntries() ([]map[string]any, error) {
 				"cacheCreationTokens": modelUsage.CacheCreation,
 				"cacheReadTokens":     modelUsage.CacheRead,
 				"totalTokens":         modelUsage.TotalTokens,
-				"cost":                modelUsage.Cost,
-				"source":              "grok-updates-jsonl",
+				// Grok bills through a weekly credit plan, so the ticks in the
+				// logs are phantom list-price spend, not cash.
+				"cost":   0.0,
+				"source": "grok-updates-jsonl",
 			})
 		}
 
@@ -174,14 +172,16 @@ func loadGrokUsageEntries() ([]map[string]any, error) {
 			"totalCacheCreationTokens": usage.CacheCreation,
 			"totalCacheReadTokens":     usage.CacheRead,
 			"totalTokens":              usage.TotalTokens,
-			"totalCost":                usage.Cost,
-			"totalCostUSD":             usage.Cost,
-			"costUSD":                  usage.Cost,
-			"modelsUsed":               modelNames,
-			"modelBreakdowns":          modelBreakdowns,
-			"messages":                 usage.Turns,
-			"sessionFiles":             len(usage.SessionFiles),
-			"source":                   "grok-updates-jsonl",
+			// Token-only, like the Kimi and GLM importers: the credit plan
+			// makes every tick-derived dollar figure fictional.
+			"totalCost":       0.0,
+			"totalCostUSD":    0.0,
+			"costUSD":         0.0,
+			"modelsUsed":      modelNames,
+			"modelBreakdowns": modelBreakdowns,
+			"messages":        usage.Turns,
+			"sessionFiles":    len(usage.SessionFiles),
+			"source":          "grok-updates-jsonl",
 		})
 	}
 	return entries, nil
@@ -197,90 +197,101 @@ func readGrokUpdates(path string, byDate map[string]*grokDailyUsage, seenEvents 
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var entry grokUpdateLine
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-		if entry.Params == nil || entry.Params.Update == nil {
-			continue
-		}
-		update := entry.Params.Update
-		if update.SessionUpdate != "turn_completed" || update.Usage == nil {
-			continue
-		}
+	// ReadBytes (rather than a Scanner) exposes each line's exact byte span,
+	// which the fallback event fingerprint needs to tell identical-looking
+	// turns apart.
+	reader := bufio.NewReader(file)
+	var offset int64
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		lineOffset := offset
+		offset += int64(len(line))
 
-		date := grokUsageDate(entry.Params.Meta, entry.Timestamp)
-		if date == "" {
-			continue
-		}
-
-		// Rewinding a session replays completed turns into updates.jsonl, so
-		// fold on the event id and count each turn once.
-		fingerprint := grokEventFingerprint(entry)
-		if seenEvents[fingerprint] {
-			continue
-		}
-		seenEvents[fingerprint] = true
-
-		day := byDate[date]
-		if day == nil {
-			day = &grokDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*grokModelUsage{}}
-			byDate[date] = day
-		}
-
-		perModel := update.Usage.ModelUsage
-		if len(perModel) == 0 {
-			perModel = map[string]*grokUsage{"grok-unknown": update.Usage}
-		}
-
-		counted := false
-		for modelName, modelUsage := range perModel {
-			if modelUsage == nil {
-				continue
+		if trimmed := strings.TrimSpace(string(line)); trimmed != "" {
+			var entry grokUpdateLine
+			if err := json.Unmarshal([]byte(trimmed), &entry); err == nil && entry.Params != nil {
+				grokRecordTurn(path, lineOffset, &entry, byDate, seenEvents)
 			}
-			input, output, cacheRead, cacheCreation, total := grokTokenSplit(modelUsage)
-			if total == 0 {
-				continue
-			}
-			cost := modelUsage.CostUsdTicks / grokCostTicksPerUSD
-
-			day.Input += input
-			day.Output += output
-			day.CacheRead += cacheRead
-			day.CacheCreation += cacheCreation
-			day.TotalTokens += total
-			day.Cost += cost
-			counted = true
-
-			name := strings.TrimSpace(modelName)
-			if name == "" {
-				name = "grok-unknown"
-			}
-			agg := day.Models[name]
-			if agg == nil {
-				agg = &grokModelUsage{}
-				day.Models[name] = agg
-			}
-			agg.Input += input
-			agg.Output += output
-			agg.CacheRead += cacheRead
-			agg.CacheCreation += cacheCreation
-			agg.TotalTokens += total
-			agg.Cost += cost
 		}
-		if counted {
-			day.Turns++
-			day.SessionFiles[path] = true
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
 		}
 	}
-	return scanner.Err()
+}
+
+// grokRecordTurn folds one turn_completed event into the daily aggregates.
+// lineOffset is the event's byte offset within path; it feeds the fallback
+// fingerprint so two distinct turns with identical payloads never collapse.
+func grokRecordTurn(path string, lineOffset int64, entry *grokUpdateLine, byDate map[string]*grokDailyUsage, seenEvents map[string]bool) {
+	update := entry.Params.Update
+	if update == nil || update.SessionUpdate != "turn_completed" || update.Usage == nil {
+		return
+	}
+
+	date := grokUsageDate(entry.Params.Meta, entry.Timestamp)
+	if date == "" {
+		return
+	}
+
+	// Rewinding a session replays completed turns into updates.jsonl, so
+	// fold on the event id and count each turn once.
+	fingerprint := grokEventFingerprint(entry, path, lineOffset)
+	if seenEvents[fingerprint] {
+		return
+	}
+	seenEvents[fingerprint] = true
+
+	day := byDate[date]
+	if day == nil {
+		day = &grokDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*grokModelUsage{}}
+		byDate[date] = day
+	}
+
+	perModel := update.Usage.ModelUsage
+	if len(perModel) == 0 {
+		perModel = map[string]*grokUsage{"grok-unknown": update.Usage}
+	}
+
+	counted := false
+	for modelName, modelUsage := range perModel {
+		if modelUsage == nil {
+			continue
+		}
+		input, output, cacheRead, cacheCreation, total := grokTokenSplit(modelUsage)
+		if total == 0 {
+			continue
+		}
+
+		day.Input += input
+		day.Output += output
+		day.CacheRead += cacheRead
+		day.CacheCreation += cacheCreation
+		day.TotalTokens += total
+		counted = true
+
+		name := strings.TrimSpace(modelName)
+		if name == "" {
+			name = "grok-unknown"
+		}
+		agg := day.Models[name]
+		if agg == nil {
+			agg = &grokModelUsage{}
+			day.Models[name] = agg
+		}
+		agg.Input += input
+		agg.Output += output
+		agg.CacheRead += cacheRead
+		agg.CacheCreation += cacheCreation
+		agg.TotalTokens += total
+	}
+	if counted {
+		day.Turns++
+		day.SessionFiles[path] = true
+	}
 }
 
 // grokTokenSplit converts Grok's counters into the additive convention ccusage
@@ -298,14 +309,20 @@ func grokTokenSplit(usage *grokUsage) (input, output, cacheRead, cacheCreation, 
 	return input, output, cacheRead, cacheCreation, total
 }
 
-func grokEventFingerprint(entry grokUpdateLine) string {
+// grokEventFingerprint identifies a turn_completed event. Real logs stamp
+// every event with _meta.eventId, so that alone stays the primary key. The
+// fallback for malformed or legacy lines pins the physical source location
+// (file path + byte offset) alongside the payload: two distinct turns can
+// otherwise carry identical values and silently collapse into one.
+func grokEventFingerprint(entry *grokUpdateLine, path string, offset int64) string {
 	if entry.Params.Meta != nil && strings.TrimSpace(entry.Params.Meta.EventID) != "" {
 		return entry.Params.Meta.EventID
 	}
 	usage := entry.Params.Update.Usage
-	return fmt.Sprintf("%s|%s|%g|%g|%g|%g",
+	return fmt.Sprintf("%s|%s|%g|%g|%g|%g|%s|%d",
 		entry.Params.SessionID, entry.Params.Update.PromptID, entry.Timestamp,
-		usage.InputTokens, usage.OutputTokens, usage.CostUsdTicks)
+		usage.InputTokens, usage.OutputTokens, usage.CostUsdTicks,
+		path, offset)
 }
 
 // grokUsageDate prefers the millisecond agent clock and falls back to the

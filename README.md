@@ -161,12 +161,13 @@ Each agent is ranked on its own platform. `ccusage` supplies Claude Code, Codex,
 | `claude` | `ccusage` (Claude Code, Codex, Hermes, Antigravity, …), minus the `pi` and `kimi` agents | From `ccusage` |
 | `pi` | `~/.pi/agent/sessions` | From Pi's own records |
 | `kimi` | `~/.kimi/sessions`, `~/.kimi-code/sessions`, and Kimi models run through Pi | Zero for native sessions; from Pi's records for the Pi-fronted share |
-| `grok` | `~/.grok/sessions` and Grok models run through Pi | Grok's reported list price; from Pi's records for the Pi-fronted share |
+| `grok` | `~/.grok/sessions` and Grok models run through Pi | Zero for native sessions (credit-plan billing); from Pi's records for the Pi-fronted share |
 | `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi | Zero for native sessions; from Pi's records for the Pi-fronted share |
+| `opencode` | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`), read read-only | From opencode's own records (often zero for free models) |
 
 `ccusage` imports Pi and Kimi natively too, so ccrank holds those two agents out of the combined `claude` bucket to keep them from being counted twice.
 
-Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` what the leaderboard accepts and holds back anything missing from that list, so a CLI that runs ahead of the deployment simply skips Grok, GLM, and Pi and says so, rather than having those uploads refiled into the combined bucket.
+Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` what the leaderboard accepts and holds back anything missing from that list, so a CLI that runs ahead of the deployment simply skips Grok, GLM, Pi, and OpenCode and says so, rather than having those uploads refiled into the combined bucket.
 
 A model that Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, and retried Z Code requests. Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
 

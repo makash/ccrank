@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,7 +61,7 @@ func grokTurn(eventID string, tsSeconds int64, model string, in, out, cachedRead
 	}
 }
 
-func TestGrokUsageSplitsCachedReadsOutOfInputAndConvertsTicks(t *testing.T) {
+func TestGrokUsageSplitsCachedReadsOutOfInputAndReportsZeroCost(t *testing.T) {
 	oldLocal := time.Local
 	time.Local = time.UTC
 	t.Cleanup(func() { time.Local = oldLocal })
@@ -93,8 +94,10 @@ func TestGrokUsageSplitsCachedReadsOutOfInputAndConvertsTicks(t *testing.T) {
 	if got := numberValue(entry["totalTokens"]); got != 1200 {
 		t.Fatalf("totalTokens = %v, want 1200", got)
 	}
-	if got := usageCostValue(entry); got != 1 {
-		t.Fatalf("cost = %v, want 1 USD for 1e10 ticks", got)
+	// Grok bills through a weekly credit plan (onDemandUsed: 0), so the
+	// tick-derived list price is phantom spend and must report as zero.
+	if got := usageCostValue(entry); got != 0 {
+		t.Fatalf("cost = %v, want 0 for credit-plan billing", got)
 	}
 	if got := usageDate(entry); got != "2026-08-12" {
 		t.Fatalf("date = %q", got)
@@ -126,11 +129,65 @@ func TestGrokUsageCountsAReplayedTurnOnce(t *testing.T) {
 	if got := numberValue(entries[0]["totalTokens"]); got != 1800 {
 		t.Fatalf("totalTokens = %v, want 1200+600 with the replay dropped", got)
 	}
-	if got := usageCostValue(entries[0]); got != 1.5 {
-		t.Fatalf("cost = %v, want 1.5", got)
+	if got := usageCostValue(entries[0]); got != 0 {
+		t.Fatalf("cost = %v, want 0 for credit-plan billing", got)
 	}
 	if got := numberValue(entries[0]["messages"]); got != 2 {
 		t.Fatalf("turns = %v, want 2", got)
+	}
+}
+
+func TestGrokUsageCountsIdenticalEventlessTurnsAtDifferentOffsets(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	const ts = 1786536000
+
+	// Two distinct turns whose legacy lines carry no _meta.eventId and are
+	// otherwise byte-for-byte identical. The fallback fingerprint must pin the
+	// physical line so both count instead of collapsing into one (this used to
+	// halve a real day's tokens from 2400 to 1200).
+	line := fmt.Sprintf(`{"timestamp":%d,"method":"_x.ai/session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-1","usage":{"inputTokens":1000,"outputTokens":200,"totalTokens":1200,"cachedReadTokens":700,"costUsdTicks":10000000000}}}}`, ts)
+	path := filepath.Join(home, ".grok", "sessions", "%2Ftmp%2Frepo", "sess-1", "updates.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(line+"\n"+line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadGrokUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 2400 {
+		t.Fatalf("totalTokens = %v, want 2400 with both eventless turns counted", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("turns = %v, want 2", got)
+	}
+
+	// The eventId path stays primary: a replayed eventless turn in a second
+	// file must also survive, while identical eventIds still dedupe across
+	// files (session copies).
+	writeJSONL(t, filepath.Join(home, ".grok", "sessions", "%2Ftmp%2Frepo", "sess-2", "updates.jsonl"), []map[string]any{
+		grokTurn("event-9", ts, "grok-4.6-build", 100, 10, 0, 1e9),
+	})
+	writeJSONL(t, filepath.Join(home, ".grok", "sessions", "%2Ftmp%2Frepo", "sess-3", "updates.jsonl"), []map[string]any{
+		grokTurn("event-9", ts, "grok-4.6-build", 100, 10, 0, 1e9),
+	})
+	entries, err = loadGrokUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 2510 {
+		t.Fatalf("entries = %#v, want 2400+110 with the copied eventId counted once", entries)
 	}
 }
 
@@ -311,9 +368,9 @@ func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 		today := uploadDedicatedPlatform(dedicatedPlatformUpload{
 			BaseURL: server.URL, Token: "test-token", Machine: "rig",
 			Platform: platform, Label: platform, Supported: supported,
-			Run: func() (string, *UsageSnapshot, error) {
+			Run: func() (*pendingUsageUpload, *UsageSnapshot, error) {
 				t.Errorf("%q importer must not run against a legacy server", platform)
-				return "", nil, nil
+				return nil, nil, nil
 			},
 		})
 		if today != nil {

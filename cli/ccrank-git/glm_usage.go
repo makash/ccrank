@@ -60,23 +60,23 @@ type glmModelUsage struct {
 	TotalTokens   float64
 }
 
-func runGLMUsage() (string, *UsageSnapshot, error) {
+func runGLMUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadGLMUsageEntries()
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	piEntries, err := loadPiUsageEntriesFor(platformGLM)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	entries = mergeUsageEntries(entries, piEntries)
 	if len(entries) == 0 {
-		return "", nil, errors.New("no GLM usage found")
+		return nil, nil, errors.New("no GLM usage found")
 	}
 	localToday := usageSnapshotForDate(entries, todayDate())
 	report := map[string]any{"type": "daily", "daily": entries}
-	normalized, err := normalizeAndFilterUsageReportFor(report, entries, platformGLM, "no higher GLM usage rows found")
-	return normalized, localToday, err
+	pending, err := prepareUsageUpload(report, entries, platformGLM, "no higher GLM usage rows found")
+	return pending, localToday, err
 }
 
 func loadGLMUsageEntries() ([]map[string]any, error) {

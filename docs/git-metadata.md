@@ -38,6 +38,7 @@ The usage upload combines `ccusage` output with local agent logs `ccusage` does 
 | `kimi` | `~/.kimi/sessions`, `~/.kimi-code/sessions`, and Kimi models run through Pi |
 | `grok` | `~/.grok/sessions` and Grok models run through Pi |
 | `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi |
+| `opencode` | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`), read read-only |
 
 `ccusage` imports Pi and Kimi natively, so ccrank holds those agents out of the combined `claude` bucket to keep them from being counted twice.
 
@@ -125,7 +126,7 @@ Usage data with `--upload-usage`:
 - Daily token and cost totals from `ccusage`
 - Daily token and cost totals from Pi session usage in `~/.pi/agent/sessions`
 - Daily Kimi Code token totals from `~/.kimi/sessions` and `~/.kimi-code/sessions` (native cost is recorded as unknown/zero)
-- Daily Grok token totals and reported list-price cost from `~/.grok/sessions`
+- Daily Grok token totals from `~/.grok/sessions` (Grok bills through a weekly credit plan, so native cost is recorded as zero)
 - Daily GLM token totals from `~/.zcode/cli/rollout` (Z Code logs carry no pricing, so cost is recorded as zero)
 - Kimi, Grok, and GLM models run through Pi, added to those platforms and carrying the cost Pi recorded for them
 - Model breakdowns where available

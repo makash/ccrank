@@ -49,7 +49,7 @@ test('advertises every supported platform so the CLI can probe before uploading'
   // The CLI holds back any platform missing from this list, because an older
   // server would drop the explicit platform and refile the rows as `claude`,
   // letting a replacing upload overwrite the user's combined totals.
-  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi']);
+  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode']);
 });
 
 test('a zero-token day never counts as an active day', async () => {
@@ -117,6 +117,13 @@ test('credits a model Pi merely fronts to the vendor that owns it', () => {
   assert.equal(parser.detectPlatform(['pi-openai-o3-mini']), 'pi');
 });
 
+test('detects OpenCode models by their provider prefix', () => {
+  assert.equal(parser.detectPlatform(['opencode/x-preview-f-free']), 'opencode');
+  assert.equal(parser.detectPlatform(['OpenCode/qwen3-coder-480b']), 'opencode');
+  // Vendor checks still win over a bare mention elsewhere in the name.
+  assert.equal(parser.detectPlatform(['kimi-k2-through-opencode']), 'kimi');
+});
+
 test('keeps detecting Codex CLI models that never went through Pi', () => {
   assert.equal(parser.detectPlatform(['gpt-5.5']), 'codex');
   assert.equal(parser.detectPlatform(['gpt-5.6-sol']), 'codex');
@@ -180,10 +187,10 @@ test('leaderboard offers a filter tab and legend swatch for every platform', () 
     cache_rate: 0.9,
     output_ratio: 0.01,
     meets_efficiency_threshold: true,
-    platforms: ['grok', 'glm', 'pi'],
+    platforms: ['grok', 'glm', 'pi', 'opencode'],
   }]);
 
-  for (const [platform, label] of [['grok', 'Grok CLI'], ['glm', 'GLM (Z Code)'], ['pi', 'Pi']]) {
+  for (const [platform, label] of [['grok', 'Grok CLI'], ['glm', 'GLM (Z Code)'], ['pi', 'Pi'], ['opencode', 'OpenCode']]) {
     assert.match(page, new RegExp(`platform=${platform}`), `${platform} filter tab`);
     assert.ok(page.includes(`title="${label}"`), `${platform} row dot`);
   }

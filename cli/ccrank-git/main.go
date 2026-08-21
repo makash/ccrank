@@ -148,7 +148,7 @@ func main() {
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
 	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
-	report, localToday, err := runCcusage()
+	pending, localToday, err := runCcusage()
 	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
@@ -156,7 +156,7 @@ func main() {
 		// Combined rows are max-merged server-side (never-lower). Do not send
 		// a replace flag — the LDP CLI never had one, and a replace=true
 		// upload destroyed ~27B tokens of historical peaks on 2026-08-15.
-		err = uploadUsageReport(*urlFlag, *tokenFlag, report, machine, platformCombined, "combined")
+		err = uploadUsageReport(*urlFlag, *tokenFlag, pending, machine, platformCombined, "combined")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -202,6 +202,15 @@ func main() {
 		Supported: supported, Run: runGLMUsage,
 	})
 
+	// OpenCode records every assistant reply in a local SQLite database with
+	// its own token counts and cost; ccusage has no OpenCode importer.
+	opencodeToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformOpenCode, Label: "OpenCode",
+		Checking:  "Checking OpenCode usage from its local session database...",
+		Supported: supported, Run: runOpenCodeUsage,
+	})
+
 	// Pi rides its own platform now. ccusage imports Pi natively, so the
 	// combined bucket holds it out and everything Pi ran that is not owned by
 	// a dedicated platform is uploaded here instead.
@@ -215,6 +224,7 @@ func main() {
 	localToday = combineUsageSnapshots(localToday, kimiToday)
 	localToday = combineUsageSnapshots(localToday, grokToday)
 	localToday = combineUsageSnapshots(localToday, glmToday)
+	localToday = combineUsageSnapshots(localToday, opencodeToday)
 	localToday = combineUsageSnapshots(localToday, piToday)
 	if localToday != nil {
 		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
@@ -259,7 +269,7 @@ type dedicatedPlatformUpload struct {
 	Label     string
 	Checking  string
 	Supported map[string]bool
-	Run       func() (string, *UsageSnapshot, error)
+	Run       func() (*pendingUsageUpload, *UsageSnapshot, error)
 }
 
 // uploadDedicatedPlatform imports and uploads one platform ccusage does not
@@ -273,12 +283,12 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 	}
 
 	fmt.Println(job.Checking)
-	report, today, err := job.Run()
+	pending, today, err := job.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": skipped -", err.Error())
 		return nil
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, report, job.Machine, job.Platform, job.Platform); err != nil {
+	if err := uploadUsageReport(job.BaseURL, job.Token, pending, job.Machine, job.Platform, job.Platform); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
@@ -404,7 +414,7 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 	return nil
 }
 
-func runCcusage() (string, *UsageSnapshot, error) {
+func runCcusage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	// --by-agent splits each daily row per source CLI so agents ccrank uploads
 	// under their own platform can be held out of the combined bucket.
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json", "--by-agent")
@@ -413,33 +423,25 @@ func runCcusage() (string, *UsageSnapshot, error) {
 		report := map[string]any{"daily": []map[string]any{}}
 		entries := loadLocalUsageEntries(nil, report)
 		if len(entries) == 0 {
-			return "", nil, errors.New("no combined usage data found (is Node installed?)")
+			return nil, nil, errors.New("no combined usage data found (is Node installed?)")
 		}
 		localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
-		normalized, err := normalizeAndFilterUsageReport(report, entries)
+		pending, err := prepareUsageUpload(report, entries, "combined", "no higher combined usage rows found")
 		if err != nil {
-			return "", localToday, err
+			return nil, localToday, err
 		}
-		return normalized, localToday, nil
+		return pending, localToday, nil
 	}
 	report, entries, err := parseCcusageReportWithLocalExtras(out)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
-	normalized, err := normalizeAndFilterUsageReport(report, entries)
+	pending, err := prepareUsageUpload(report, entries, "combined", "no higher combined usage rows found")
 	if err != nil {
-		return "", localToday, err
+		return nil, localToday, err
 	}
-	return normalized, localToday, nil
-}
-
-func normalizeAndFilterCcusageReport(out []byte) (string, error) {
-	report, entries, err := parseCcusageReportWithLocalExtras(out)
-	if err != nil {
-		return "", err
-	}
-	return normalizeAndFilterUsageReport(report, entries)
+	return pending, localToday, nil
 }
 
 func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
@@ -487,6 +489,27 @@ var ccusageDedicatedAgents = map[string]bool{
 	"kimi": true,
 }
 
+// dedicatedPlatformNames lists every platform ccrank ranks on its own. If
+// ccusage ever ships a native importer for one of these, its per-agent slices
+// would double-count unless the agent joins ccusageDedicatedAgents.
+var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, "opencode"}
+
+// unheldDedicatedAgent reports which dedicated platform an agent name looks
+// like when that agent is not held out of the combined bucket. An empty result
+// means the name is safe to fold into combined rows.
+func unheldDedicatedAgent(agent string) string {
+	name := strings.ToLower(strings.TrimSpace(agent))
+	if ccusageDedicatedAgents[name] {
+		return ""
+	}
+	for _, platform := range dedicatedPlatformNames {
+		if strings.HasPrefix(name, platform) {
+			return platform
+		}
+	}
+	return ""
+}
+
 // rebuildCombinedEntries drops the per-agent slices ccrank uploads separately.
 // Since every ccusage invocation requests --by-agent, accepting a row without
 // those slices could permanently double-count usage from dedicated platforms.
@@ -520,6 +543,12 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			name := strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"])))
 			if ccusageDedicatedAgents[name] {
 				continue
+			}
+			if owner := unheldDedicatedAgent(name); owner != "" {
+				// ccusage grew a native importer for a platform ccrank uploads
+				// separately. Folding the slice in here would double-count it on
+				// every combined row, so fail loudly instead.
+				return nil, fmt.Errorf("ccusage --by-agent row %s reports agent %q from the dedicated %q platform; add it to ccusageDedicatedAgents or upgrade ccrank so its usage is not double-counted", date, name, owner)
 			}
 			input += numberValue(agent["inputTokens"])
 			output += numberValue(agent["outputTokens"])
@@ -572,14 +601,25 @@ func extractModelNames(raw any) []string {
 	return names
 }
 
-func normalizeAndFilterUsageReport(report map[string]any, entries []map[string]any) (string, error) {
-	return normalizeAndFilterUsageReportFor(report, entries, "combined", "no higher combined usage rows found")
+// pendingUsageUpload pairs a serialized usage report with the commit that
+// records its rows in the monotonic maxima cache. Commit MUST run only after
+// the upload is confirmed (HTTP 2xx): the server max-merges and silently
+// discards rows that are not higher, so a cache written before confirmation
+// would mark unapplied rows as uploaded and they would never be re-offered.
+type pendingUsageUpload struct {
+	Report string
+	Commit func() error
 }
 
-func normalizeAndFilterUsageReportFor(report map[string]any, entries []map[string]any, cacheName, unchangedMessage string) (string, error) {
+// prepareUsageUpload filters entries down to the rows that beat the cached
+// maxima and serializes them for upload. Nothing touches disk here; the
+// returned commit persists the advanced maxima and the caller owes it an
+// upload-first ordering (beads z0m: writing before uploading let rows the
+// server never applied vanish from every future run).
+func prepareUsageUpload(report map[string]any, entries []map[string]any, cacheName, unchangedMessage string) (*pendingUsageUpload, error) {
 	maxima, err := loadUsageMaxima(cacheName)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	changed := []map[string]any{}
@@ -598,12 +638,8 @@ func normalizeAndFilterUsageReportFor(report map[string]any, entries []map[strin
 		}
 	}
 
-	if err := writeUsageMaxima(cacheName, maxima); err != nil {
-		return "", err
-	}
-
 	if len(changed) == 0 {
-		return "", errors.New(unchangedMessage)
+		return nil, errors.New(unchangedMessage)
 	}
 
 	filtered := map[string]any{
@@ -616,9 +652,12 @@ func normalizeAndFilterUsageReportFor(report map[string]any, entries []map[strin
 
 	normalized, err := json.Marshal(filtered)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return string(normalized), nil
+	return &pendingUsageUpload{
+		Report: string(normalized),
+		Commit: func() error { return writeUsageMaxima(cacheName, maxima) },
+	}, nil
 }
 
 func usageSnapshotForDate(entries []map[string]any, date string) *UsageSnapshot {
@@ -988,24 +1027,25 @@ const (
 	platformKimi     = "kimi"
 	platformGrok     = "grok"
 	platformGLM      = "glm"
+	platformOpenCode = "opencode"
 )
 
 func loadPiKimiUsageEntries() ([]map[string]any, error) {
 	return loadPiUsageEntriesFor(platformKimi)
 }
 
-func runPiUsage() (string, *UsageSnapshot, error) {
+func runPiUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadPiUsageEntriesFor(platformPi)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
 	if len(entries) == 0 {
-		return "", nil, errors.New("no Pi usage found")
+		return nil, nil, errors.New("no Pi usage found")
 	}
 	localToday := usageSnapshotForDate(entries, todayDate())
 	report := map[string]any{"type": "daily", "daily": entries}
-	normalized, err := normalizeAndFilterUsageReportFor(report, entries, platformPi, "no higher Pi usage rows found")
-	return normalized, localToday, err
+	pending, err := prepareUsageUpload(report, entries, platformPi, "no higher Pi usage rows found")
+	return pending, localToday, err
 }
 
 func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
@@ -1539,7 +1579,11 @@ func usageTotals(entries []map[string]any) map[string]any {
 }
 
 // usageMaximaVersion gates the monotonic upload cache. Bump it whenever a
-// change makes correct rows smaller than ones already uploaded.
+// change makes correct rows smaller than ones already uploaded. Zeroing Grok's
+// phantom list-price cost did not warrant a bump: resets only matter when
+// combined rows shrink, and the server max-merges every upload, so a downward
+// correction is impossible regardless — the smaller grok rows simply lose the
+// merge until their tokens genuinely grow again.
 const usageMaximaVersion = 3
 
 func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
@@ -1625,7 +1669,7 @@ func usageMaximaPath(cacheName string) (string, error) {
 		return "", err
 	}
 	switch cacheName {
-	case "combined", platformKimi, platformGrok, platformGLM, platformPi:
+	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode:
 	default:
 		return "", errors.New("invalid usage maxima cache name")
 	}
@@ -1641,6 +1685,7 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "  Kimi Code usage is imported automatically from ~/.kimi/sessions and ~/.kimi-code/sessions.")
 	fmt.Fprintln(os.Stderr, "  Grok CLI usage is imported automatically from ~/.grok/sessions.")
 	fmt.Fprintln(os.Stderr, "  GLM usage is imported automatically from ~/.zcode/cli/rollout.")
+	fmt.Fprintln(os.Stderr, "  OpenCode usage is imported automatically from ~/.local/share/opencode/opencode.db.")
 }
 
 // loadSupportedPlatforms asks the leaderboard which platforms it understands.
@@ -1737,16 +1782,34 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 	return nil
 }
 
-func uploadUsageReport(baseURL, token, report, machine, platform, cacheName string) error {
-	if err := uploadCcusage(baseURL, token, report, machine, platform); err != nil {
-		path, pathErr := usageMaximaPath(cacheName)
-		if pathErr != nil {
-			return fmt.Errorf("%w (could not resolve retry cache: %v)", err, pathErr)
-		}
-		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-			return fmt.Errorf("%w (could not reset retry cache: %v)", err, removeErr)
+// uploadUsageReport posts a prepared usage report and settles the monotonic
+// maxima cache accordingly: the cache advances only once the upload is
+// confirmed (HTTP 2xx), and any failure clears it so the offered rows come
+// back on the next run instead of being marked as uploaded forever.
+func uploadUsageReport(baseURL, token string, pending *pendingUsageUpload, machine, platform, cacheName string) error {
+	if err := uploadCcusage(baseURL, token, pending.Report, machine, platform); err != nil {
+		if resetErr := resetUsageMaxima(cacheName); resetErr != nil {
+			return fmt.Errorf("%w (could not reset retry cache: %v)", err, resetErr)
 		}
 		return err
+	}
+	if err := pending.Commit(); err != nil {
+		// The rows are on the server; re-offering them next run is harmless
+		// because the server max-merges.
+		return fmt.Errorf("uploaded, but could not record the retry cache: %w", err)
+	}
+	return nil
+}
+
+// resetUsageMaxima deletes a platform's maxima cache so rows prepared for a
+// failed upload are re-offered next run. A missing cache is already reset.
+func resetUsageMaxima(cacheName string) error {
+	path, pathErr := usageMaximaPath(cacheName)
+	if pathErr != nil {
+		return pathErr
+	}
+	if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+		return removeErr
 	}
 	return nil
 }
