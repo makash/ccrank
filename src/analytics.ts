@@ -204,3 +204,15 @@ export function analyticsPage(data: AnalyticsData, user: User | null = null): st
 
   return layout('Analytics | ccrank.dev', content, user);
 }
+
+export function sparklineBars(values: number[], color: string, titles?: string[]): string {
+  const maxVal = Math.max(...values, 1);
+  const bars = values
+    .map((v, i) => {
+      const height = Math.max(2, Math.round((v / maxVal) * 48));
+      const title = titles && titles[i] ? ` title="${escapeHtml(titles[i])}"` : '';
+      return `<div${title} style="height:${height}px;background:${color}" class="w-2 rounded-sm"></div>`;
+    })
+    .join('');
+  return `<div class="flex items-end gap-1 h-12">${bars}</div>`;
+}

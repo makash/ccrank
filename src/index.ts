@@ -604,6 +604,25 @@ app.get('/user/:slug', async (c) => {
      FROM daily_usage WHERE user_id = ? AND date >= date('now', '-365 days') GROUP BY date`
   ).bind((profileUser as any).id).all();
 
+  // 30-day trend series grouped by date and platform
+  const trendRows = await c.env.DB.prepare(
+    `SELECT date, COALESCE(platform, 'claude') as platform, SUM(total_tokens) as tokens
+     FROM daily_usage WHERE user_id = ? AND date >= date('now', '-29 days') AND total_tokens > 0
+     GROUP BY date, COALESCE(platform, 'claude') ORDER BY date`
+  ).bind((profileUser as any).id).all();
+  const trendData = (() => {
+    const dates = new Set<string>();
+    const totalByDate: Record<string, number> = {};
+    const byPlatformByDate: Record<string, Record<string, number>> = {};
+    for (const row of (trendRows.results || []) as any[]) {
+      dates.add(row.date);
+      totalByDate[row.date] = (totalByDate[row.date] || 0) + row.tokens;
+      if (!byPlatformByDate[row.date]) byPlatformByDate[row.date] = {};
+      byPlatformByDate[row.date][row.platform] = row.tokens;
+    }
+    return { dates: [...dates].sort(), totalByDate, byPlatformByDate };
+  })();
+
   const favTools: string[] = (() => {
     try { return JSON.parse((profileUser as any).fav_tools || '[]'); } catch { return []; }
   })();
@@ -752,7 +771,8 @@ app.get('/user/:slug', async (c) => {
     (heatmapRows.results || []).map((r: any) => ({ date: r.date, cost: r.cost, tokens: r.tokens, sessions: r.sessions })),
     gitData,
     isOwner,
-    viewer
+    viewer,
+    trendData
   ));
 });
 

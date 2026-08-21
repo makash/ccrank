@@ -18,6 +18,7 @@ import {
   escapeHtml,
 } from './utils';
 import { IMG_RAJAN_MESSAGE, IMG_CLAUDE_BUILDING, IMG_APP_SHARED, IMG_DOMAIN_PURCHASE } from './images';
+import { sparklineBars } from './analytics';
 
 const PLATFORM_META = [
   { key: 'claude', label: 'Claude Code', shortLabel: 'Claude', dot: 'bg-purple-400', text: 'text-purple-300' },
@@ -1782,7 +1783,8 @@ export function profilePage(
     series: { git: number[]; usage: number[] };
   } | null,
   isOwner: boolean,
-  viewer: User | null
+  viewer: User | null,
+  trendData?: { dates: string[]; totalByDate: Record<string, number>; byPlatformByDate: Record<string, Record<string, number>> } | null
 ): string {
   const title = getTitle(stats.total_tokens);
   const rankColor = stats.rank === 1 ? '#eab308' : stats.rank === 2 ? '#9ca3af' : stats.rank === 3 ? '#b45309' : '#7c3aed';
@@ -1952,13 +1954,45 @@ export function profilePage(
       </div>
     </div>` : ''}
 
+    <!-- 30-day Trend -->
+    ${(() => {
+      if (!trendData || trendData.dates.length < 2) return '';
+      const values = trendData.dates.map((d) => trendData.totalByDate[d] || 0);
+      const titles = trendData.dates.map((d) => `${d}: ${formatTokens(trendData.totalByDate[d] || 0)}`);
+      return `<div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8">
+        <h2 class="text-lg font-semibold mb-4">30-day trend</h2>
+        ${sparklineBars(values, '#c084fc', titles)}
+      </div>`;
+    })()}
+
     <!-- Platform Breakdown -->
     ${(() => {
       const pb = stats.platformBreakdown;
       if (!pb || Object.keys(pb).length <= 1) return '';
+      const DOT_HEX: Record<string, string> = {
+        'bg-purple-400': '#c084fc',
+        'bg-emerald-400': '#34d399',
+        'bg-sky-400': '#38bdf8',
+        'bg-rose-400': '#fb7185',
+        'bg-amber-400': '#fbbf24',
+        'bg-teal-400': '#2dd4bf',
+        'bg-orange-400': '#fb923c',
+      };
       const cards = PLATFORM_META.flatMap((platform) => {
         const usage = pb[platform.key];
         if (!usage) return [];
+        let sparkHtml = '';
+        if (trendData) {
+          const activeDays = trendData.dates.filter((d) => (trendData.byPlatformByDate[d]?.[platform.key] || 0) > 0);
+          if (activeDays.length >= 2) {
+            const vals = activeDays.map((d) => trendData.byPlatformByDate[d][platform.key]);
+            const titles = activeDays.map((d) => `${d}: ${formatTokens(trendData.byPlatformByDate[d][platform.key])}`);
+            sparkHtml = `<div class="mt-3 pt-3 border-t border-gray-700/50">
+              <div class="text-xs text-gray-500 mb-1">30-day trend</div>
+              ${sparklineBars(vals, DOT_HEX[platform.dot] || '#c084fc', titles)}
+            </div>`;
+          }
+        }
         return [`<div class="bg-gray-800/60 border border-gray-700 rounded-xl p-5">
           <div class="flex items-center gap-2 mb-3">
             <span class="w-2.5 h-2.5 rounded-full ${platform.dot}"></span>
@@ -1982,6 +2016,7 @@ export function profilePage(
               <div class="text-lg font-bold text-purple-400">${formatCost(usage.total_cost)}</div>
             </div>` : ''}
           </div>
+          ${sparkHtml}
         </div>`];
       }).join('');
       if (!cards) return '';
