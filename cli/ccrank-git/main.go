@@ -485,8 +485,9 @@ func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []ma
 // platform. Holding them out of the combined bucket keeps usage a dedicated
 // importer already reports from being counted twice.
 var ccusageDedicatedAgents = map[string]bool{
-	"pi":   true,
-	"kimi": true,
+	"pi":       true,
+	"kimi":     true,
+	"opencode": true,
 }
 
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If

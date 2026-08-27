@@ -793,7 +793,8 @@ func TestPiUsageIsHeldOutOfTheCombinedBucket(t *testing.T) {
 		"agents":[
 			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1,"modelsUsed":["claude-opus-5"]},
 			{"agent":"pi","inputTokens":150,"outputTokens":15,"cacheReadTokens":300,"totalTokens":465,"totalCost":1.5,"modelsUsed":["[pi] GLM-5.2-NVFP4"]},
-			{"agent":"kimi","inputTokens":50,"outputTokens":5,"cacheReadTokens":200,"totalTokens":255,"totalCost":0.5,"modelsUsed":["kimi-k2"]}
+			{"agent":"kimi","inputTokens":50,"outputTokens":5,"cacheReadTokens":200,"totalTokens":255,"totalCost":0.5,"modelsUsed":["kimi-k2"]},
+			{"agent":"opencode","inputTokens":75,"outputTokens":10,"cacheReadTokens":150,"totalTokens":235,"totalCost":0.75,"modelsUsed":["opencode/gpt-5"]}
 		]}]}`)
 
 	_, entries, err := parseCcusageReport(report)
@@ -833,23 +834,23 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		agent string
 		want  string
 	}{
-		{"pi", ""},               // already held out
-		{"kimi", ""},             // already held out
-		{"PI", ""},               // held out, case-insensitive
-		{"Kimi", ""},             // held out, case-insensitive
-		{"claude", ""},           // unrelated agent
-		{"codex", ""},            // unrelated agent
-		{"gemini", ""},           // unrelated agent
-		{"hermes", ""},           // unrelated agent
-		{"antigravity", ""},      // unrelated agent
-		{"", ""},                 // blank slice name
-		{"grok", "grok"},         // dedicated platform with no ccusage importer yet
-		{"Grok CLI", "grok"},     // prefixed variant
-		{"grokcli", "grok"},      // glued variant
-		{"glm", "glm"},           // dedicated platform
-		{"GLM-5.3", "glm"},       // prefixed variant
-		{"opencode", "opencode"}, // dedicated platform
-		{"OpenCode", "opencode"}, // case-insensitive
+		{"pi", ""},           // already held out
+		{"kimi", ""},         // already held out
+		{"opencode", ""},     // already held out
+		{"PI", ""},           // held out, case-insensitive
+		{"Kimi", ""},         // held out, case-insensitive
+		{"OpenCode", ""},     // held out, case-insensitive
+		{"claude", ""},       // unrelated agent
+		{"codex", ""},        // unrelated agent
+		{"gemini", ""},       // unrelated agent
+		{"hermes", ""},       // unrelated agent
+		{"antigravity", ""},  // unrelated agent
+		{"", ""},             // blank slice name
+		{"grok", "grok"},     // dedicated platform with no ccusage importer yet
+		{"Grok CLI", "grok"}, // prefixed variant
+		{"grokcli", "grok"},  // glued variant
+		{"glm", "glm"},       // dedicated platform
+		{"GLM-5.3", "glm"},   // prefixed variant
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
