@@ -794,7 +794,9 @@ func TestPiUsageIsHeldOutOfTheCombinedBucket(t *testing.T) {
 			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1,"modelsUsed":["claude-opus-5"]},
 			{"agent":"pi","inputTokens":150,"outputTokens":15,"cacheReadTokens":300,"totalTokens":465,"totalCost":1.5,"modelsUsed":["[pi] GLM-5.2-NVFP4"]},
 			{"agent":"kimi","inputTokens":50,"outputTokens":5,"cacheReadTokens":200,"totalTokens":255,"totalCost":0.5,"modelsUsed":["kimi-k2"]},
-			{"agent":"opencode","inputTokens":75,"outputTokens":10,"cacheReadTokens":150,"totalTokens":235,"totalCost":0.75,"modelsUsed":["opencode/gpt-5"]}
+			{"agent":"opencode","inputTokens":75,"outputTokens":10,"cacheReadTokens":150,"totalTokens":235,"totalCost":0.75,"modelsUsed":["opencode/gpt-5"]},
+			{"agent":"grok","inputTokens":75,"outputTokens":15,"cacheReadTokens":225,"totalTokens":315,"totalCost":0.75,"modelsUsed":["grok-4.6-build"]},
+			{"agent":"glm","inputTokens":50,"outputTokens":10,"cacheReadTokens":100,"totalTokens":160,"totalCost":0.5,"modelsUsed":["GLM-5.3"]}
 		]}]}`)
 
 	_, entries, err := parseCcusageReport(report)
@@ -834,23 +836,22 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		agent string
 		want  string
 	}{
-		{"pi", ""},           // already held out
-		{"kimi", ""},         // already held out
-		{"opencode", ""},     // already held out
-		{"PI", ""},           // held out, case-insensitive
-		{"Kimi", ""},         // held out, case-insensitive
-		{"OpenCode", ""},     // held out, case-insensitive
-		{"claude", ""},       // unrelated agent
-		{"codex", ""},        // unrelated agent
-		{"gemini", ""},       // unrelated agent
-		{"hermes", ""},       // unrelated agent
-		{"antigravity", ""},  // unrelated agent
-		{"", ""},             // blank slice name
-		{"grok", "grok"},     // dedicated platform with no ccusage importer yet
-		{"Grok CLI", "grok"}, // prefixed variant
-		{"grokcli", "grok"},  // glued variant
-		{"glm", "glm"},       // dedicated platform
-		{"GLM-5.3", "glm"},   // prefixed variant
+		{"pi", ""},          // already held out
+		{"kimi", ""},        // already held out
+		{"opencode", ""},    // already held out
+		{"grok", ""},        // already held out
+		{"glm", ""},         // already held out
+		{"PI", ""},          // held out, case-insensitive
+		{"Kimi", ""},        // held out, case-insensitive
+		{"OpenCode", ""},    // held out, case-insensitive
+		{"Grok", ""},        // held out, case-insensitive
+		{"GLM", ""},         // held out, case-insensitive
+		{"claude", ""},      // unrelated agent
+		{"codex", ""},       // unrelated agent
+		{"gemini", ""},      // unrelated agent
+		{"hermes", ""},      // unrelated agent
+		{"antigravity", ""}, // unrelated agent
+		{"", ""},            // blank slice name
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
@@ -859,7 +860,7 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 	}
 }
 
-func TestCombinedRebuildRejectsUnheldDedicatedAgents(t *testing.T) {
+func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
 		"agents":[
 			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
@@ -869,9 +870,12 @@ func TestCombinedRebuildRejectsUnheldDedicatedAgents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = rebuildCombinedEntries(entries)
-	if err == nil || !strings.Contains(err.Error(), `"grok"`) || !strings.Contains(err.Error(), "ccusageDedicatedAgents") {
-		t.Fatalf("expected a loud dedicated-agent seam error, got %v", err)
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatalf("dedicated Grok rows must be held out without blocking combined usage, got %v", err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
+		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
 	}
 
 	// The same row without the suspicious agent still rebuilds cleanly.
@@ -884,7 +888,7 @@ func TestCombinedRebuildRejectsUnheldDedicatedAgents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	combined, err := rebuildCombinedEntries(entries)
+	combined, err = rebuildCombinedEntries(entries)
 	if err != nil {
 		t.Fatalf("claude/codex rows must never trip the detector, got %v", err)
 	}

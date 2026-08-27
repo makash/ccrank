@@ -488,6 +488,8 @@ var ccusageDedicatedAgents = map[string]bool{
 	"pi":       true,
 	"kimi":     true,
 	"opencode": true,
+	"grok":     true,
+	"glm":      true,
 }
 
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If
