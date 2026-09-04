@@ -39,7 +39,7 @@ The usage upload combines `ccusage` output with local agent logs `ccusage` does 
 | `grok` | `~/.grok/sessions` and Grok models run through Pi |
 | `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi |
 | `opencode` | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`), read read-only |
-| `cursor` | Signed-in Cursor account (IDE Agent + CLI billed usage). Tab autocomplete is not counted. Uploaded under the fixed source `cursor-cloud` so two machines do not double-count |
+| `cursor` | Signed-in Cursor account (IDE Agent + CLI billed usage). Tab autocomplete is not counted. Uploaded under the fixed source `cursor-cloud` with UTC days so two machines do not double-count |
 
 `ccusage` imports Pi and Kimi natively, so ccrank holds those agents out of the combined `claude` bucket to keep them from being counted twice.
 

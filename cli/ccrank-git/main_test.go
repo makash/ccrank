@@ -836,24 +836,24 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		agent string
 		want  string
 	}{
-		{"pi", ""},                 // already held out
-		{"kimi", ""},               // already held out
-		{"opencode", ""},           // already held out
-		{"grok", ""},               // already held out
-		{"glm", ""},                // already held out
-		{"PI", ""},                 // held out, case-insensitive
-		{"Kimi", ""},               // held out, case-insensitive
-		{"OpenCode", ""},           // held out, case-insensitive
-		{"Grok", ""},               // held out, case-insensitive
-		{"GLM", ""},                // held out, case-insensitive
-		{"claude", ""},             // unrelated agent
-		{"codex", ""},              // unrelated agent
-		{"gemini", ""},             // unrelated agent
-		{"hermes", ""},             // unrelated agent
-		{"antigravity", ""},        // unrelated agent
-		{"", ""},                   // blank slice name
-		{"cursor", "cursor"},       // dedicated platform with no ccusage importer yet
-		{"Cursor Agent", "cursor"}, // prefixed variant
+		{"pi", ""},          // already held out
+		{"kimi", ""},        // already held out
+		{"opencode", ""},    // already held out
+		{"grok", ""},        // already held out
+		{"glm", ""},         // already held out
+		{"PI", ""},          // held out, case-insensitive
+		{"Kimi", ""},        // held out, case-insensitive
+		{"OpenCode", ""},    // held out, case-insensitive
+		{"Grok", ""},        // held out, case-insensitive
+		{"GLM", ""},         // held out, case-insensitive
+		{"claude", ""},      // unrelated agent
+		{"codex", ""},       // unrelated agent
+		{"gemini", ""},      // unrelated agent
+		{"hermes", ""},      // unrelated agent
+		{"antigravity", ""}, // unrelated agent
+		{"", ""},            // blank slice name
+		{"cursor", ""},      // already held out
+		{"CURSOR", ""},      // held out, case-insensitive
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
@@ -896,6 +896,25 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	}
 	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
 		t.Fatalf("combined entries = %#v", combined)
+	}
+}
+
+func TestCombinedRebuildHoldsOutCursorAgent(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-09-04","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
+		"agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
+			{"agent":"cursor","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"totalTokens":220,"totalCost":2}
+		]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatalf("Cursor rows must be held out without blocking combined usage, got %v", err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
+		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
 	}
 }
 

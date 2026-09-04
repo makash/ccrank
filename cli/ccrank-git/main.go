@@ -507,6 +507,7 @@ var ccusageDedicatedAgents = map[string]bool{
 	"opencode": true,
 	"grok":     true,
 	"glm":      true,
+	"cursor":   true,
 }
 
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -27,11 +28,15 @@ import (
 // state.vscdb, fetches usage events from cursor.com, and uploads aggregates.
 // The Cursor session token never leaves this process.
 const (
-	cursorUsageSource      = "cursor-cloud"
-	cursorUsagePageSize    = 200
-	cursorUsageMaxPages    = 100
+	cursorUsageSource = "cursor-cloud"
+	// ponytail: 500×500 = 250k events, enough for current dashboard histories.
+	// Signal: "exceeded the 500-page fetch limit". Next rung: page until the
+	// newest cached date instead of refetching the whole history every run.
+	cursorUsagePageSize    = 500
+	cursorUsageMaxPages    = 500
 	cursorUsageHTTPTimeout = 120 * time.Second
-	cursorUsageUserAgent   = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	// The dashboard 403s Go's default user-agent; tokscale uses the same browser UA.
+	cursorUsageUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
 // Tests replace this with an httptest server. Production talks to cursor.com.
@@ -54,8 +59,8 @@ type cursorUsageEvent struct {
 }
 
 type cursorUsageEventsResponse struct {
-	TotalUsageEventsCount int                `json:"totalUsageEventsCount"`
-	UsageEventsDisplay    []cursorUsageEvent `json:"usageEventsDisplay"`
+	TotalUsageEventsCount int             `json:"totalUsageEventsCount"`
+	UsageEventsDisplay    json.RawMessage `json:"usageEventsDisplay"`
 }
 
 type cursorDailyUsage struct {
@@ -86,7 +91,7 @@ func runCursorUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	if len(entries) == 0 {
 		return nil, nil, errors.New("no Cursor usage found")
 	}
-	localToday := usageSnapshotForDate(entries, todayDate())
+	localToday := usageSnapshotForDate(entries, time.Now().UTC().Format("2006-01-02"))
 	report := map[string]any{"type": "daily", "daily": entries}
 	pending, err := prepareUsageUpload(report, entries, platformCursor, "no higher Cursor usage rows found")
 	return pending, localToday, err
@@ -110,7 +115,7 @@ func loadCursorUsageEntries() ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return aggregateCursorUsageEvents(events, time.Local), nil
+	return aggregateCursorUsageEvents(events), nil
 }
 
 func readCursorAccessToken() (string, error) {
@@ -119,12 +124,9 @@ func readCursorAccessToken() (string, error) {
 		return "", err
 	}
 	dbPath := cursorStateDBPathForHome(home)
-	if token, err := readCursorAccessTokenFromDB(dbPath); err != nil {
-		if !os.IsNotExist(err) {
-			return "", err
-		}
-	} else if token != "" {
-		return token, nil
+	dbToken, dbErr := readCursorAccessTokenFromDB(dbPath)
+	if dbErr == nil && dbToken != "" {
+		return dbToken, nil
 	}
 	for _, path := range []string{
 		filepath.Join(home, ".config", "cursor", "auth.json"),
@@ -140,6 +142,9 @@ func readCursorAccessToken() (string, error) {
 		if token != "" {
 			return token, nil
 		}
+	}
+	if dbErr != nil && !os.IsNotExist(dbErr) {
+		return "", dbErr
 	}
 	return "", nil
 }
@@ -260,26 +265,49 @@ func cursorUserIDFromSub(sub string) string {
 }
 
 func fetchCursorUsageEvents(sessionCookie string) ([]cursorUsageEvent, error) {
-	client := &http.Client{Timeout: cursorUsageHTTPTimeout}
-	deadline := time.Now().Add(cursorUsageHTTPTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), cursorUsageHTTPTimeout)
+	defer cancel()
+
+	client := &http.Client{
+		Timeout: cursorUsageHTTPTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) == 0 {
+				return nil
+			}
+			from := via[0].URL
+			if req.URL.Scheme != from.Scheme || req.URL.Host != from.Host {
+				return fmt.Errorf("refusing Cursor usage redirect to %s", req.URL.Host)
+			}
+			return nil
+		},
+	}
+
 	var all []cursorUsageEvent
+	seen := map[string]bool{}
 	var totalCount int
 	gotTotal := false
 
 	for page := 1; page <= cursorUsageMaxPages; page++ {
-		if remaining := time.Until(deadline); remaining <= 0 {
+		if err := ctx.Err(); err != nil {
 			return nil, errors.New("Cursor usage fetch exceeded its time budget before the full history was collected")
 		}
-		pageEvents, advertisedTotal, err := fetchCursorUsageEventsPage(client, sessionCookie, page)
+		pageEvents, advertisedTotal, err := fetchCursorUsageEventsPage(ctx, client, sessionCookie, page)
 		if err != nil {
 			return nil, err
 		}
-		if !gotTotal && advertisedTotal > 0 {
+		if advertisedTotal > 0 {
 			totalCount = advertisedTotal
 			gotTotal = true
 		}
-		all = append(all, pageEvents...)
 		received := len(pageEvents)
+		for _, event := range pageEvents {
+			fp := cursorEventFingerprint(event)
+			if seen[fp] {
+				continue
+			}
+			seen[fp] = true
+			all = append(all, event)
+		}
 		if gotTotal {
 			if len(all) >= totalCount {
 				return all, nil
@@ -296,7 +324,7 @@ func fetchCursorUsageEvents(sessionCookie string) ([]cursorUsageEvent, error) {
 	return nil, fmt.Errorf("Cursor usage exceeded the %d-page fetch limit before the full history was collected", cursorUsageMaxPages)
 }
 
-func fetchCursorUsageEventsPage(client *http.Client, sessionCookie string, page int) ([]cursorUsageEvent, int, error) {
+func fetchCursorUsageEventsPage(ctx context.Context, client *http.Client, sessionCookie string, page int) ([]cursorUsageEvent, int, error) {
 	body, err := json.Marshal(map[string]any{
 		"teamId":   0,
 		"page":     page,
@@ -306,7 +334,7 @@ func fetchCursorUsageEventsPage(client *http.Client, sessionCookie string, page 
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequest("POST", strings.TrimRight(cursorUsageAPIBase, "/")+"/api/dashboard/get-filtered-usage-events", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(cursorUsageAPIBase, "/")+"/api/dashboard/get-filtered-usage-events", bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -329,6 +357,9 @@ func fetchCursorUsageEventsPage(client *http.Client, sessionCookie string, page 
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		msg := strings.TrimSpace(string(respBody))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
 		if msg == "" {
 			msg = res.Status
 		}
@@ -339,13 +370,17 @@ func fetchCursorUsageEventsPage(client *http.Client, sessionCookie string, page 
 	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return nil, 0, errors.New("Cursor usage API returned invalid JSON")
 	}
-	return payload.UsageEventsDisplay, payload.TotalUsageEventsCount, nil
+	if payload.UsageEventsDisplay == nil || string(payload.UsageEventsDisplay) == "null" {
+		return nil, 0, errors.New("Cursor usage API returned no usageEventsDisplay array")
+	}
+	var events []cursorUsageEvent
+	if err := json.Unmarshal(payload.UsageEventsDisplay, &events); err != nil {
+		return nil, 0, errors.New("Cursor usage API returned invalid usageEventsDisplay")
+	}
+	return events, payload.TotalUsageEventsCount, nil
 }
 
-func aggregateCursorUsageEvents(events []cursorUsageEvent, loc *time.Location) []map[string]any {
-	if loc == nil {
-		loc = time.Local
-	}
+func aggregateCursorUsageEvents(events []cursorUsageEvent) []map[string]any {
 	byDate := map[string]*cursorDailyUsage{}
 	seen := map[string]bool{}
 	for _, event := range events {
@@ -361,7 +396,7 @@ func aggregateCursorUsageEvents(events []cursorUsageEvent, loc *time.Location) [
 			continue
 		}
 
-		date := cursorEventDate(event, loc)
+		date := cursorEventDate(event)
 		if date == "" {
 			continue
 		}
@@ -458,13 +493,15 @@ func cursorEventTotals(event cursorUsageEvent) (input, output, cacheRead, cacheC
 		cacheCreation = event.TokenUsage.CacheWriteTokens
 		cost = event.TokenUsage.TotalCents / 100
 	}
+	// Prefer billed chargedCents when Cursor reports a real charge; otherwise
+	// keep the list-price totalCents so included-plan events still have a value.
 	if charged := jsonFlexibleFloat(event.ChargedCents); charged > 0 {
 		cost = charged / 100
 	}
 	return input, output, cacheRead, cacheCreation, cost
 }
 
-func cursorEventDate(event cursorUsageEvent, loc *time.Location) string {
+func cursorEventDate(event cursorUsageEvent) string {
 	ms := jsonFlexibleInt(event.Timestamp)
 	if ms <= 0 {
 		return ""
@@ -472,7 +509,7 @@ func cursorEventDate(event cursorUsageEvent, loc *time.Location) string {
 	if ms < 1_000_000_000_000 {
 		ms *= 1000
 	}
-	return time.UnixMilli(ms).In(loc).Format("2006-01-02")
+	return time.UnixMilli(ms).UTC().Format("2006-01-02")
 }
 
 func cursorEventFingerprint(event cursorUsageEvent) string {

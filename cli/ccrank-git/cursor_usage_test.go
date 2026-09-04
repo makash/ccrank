@@ -60,7 +60,7 @@ func TestCursorSessionCookieRejectsJWTWithoutUserID(t *testing.T) {
 	}
 }
 
-func TestCursorUsageAggregatesEventsByLocalDay(t *testing.T) {
+func TestCursorUsageAggregatesEventsByUTCDay(t *testing.T) {
 	events := []cursorUsageEvent{
 		{
 			Timestamp:      json.RawMessage(`"1717200000000"`), // 2024-06-01 00:00 UTC
@@ -88,7 +88,7 @@ func TestCursorUsageAggregatesEventsByLocalDay(t *testing.T) {
 		},
 	}
 
-	entries := aggregateCursorUsageEvents(events, time.UTC)
+	entries := aggregateCursorUsageEvents(events)
 	if len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
@@ -132,6 +132,22 @@ func TestCursorUsageAggregatesEventsByLocalDay(t *testing.T) {
 	}
 }
 
+func TestCursorUsageBucketsSharedSourceDaysInUTC(t *testing.T) {
+	// 2026-09-04 20:00 UTC is 2026-09-05 01:30 in IST and 2026-09-04 12:00 in PST.
+	// cursor-cloud is shared across machines, so the day must not depend on local TZ.
+	ms := time.Date(2026, 9, 4, 20, 0, 0, 0, time.UTC).UnixMilli()
+	event := cursorUsageEvent{
+		Timestamp:      json.RawMessage(fmt.Sprintf(`"%d"`, ms)),
+		Model:          "composer-2.5",
+		ConversationID: "conv",
+		TokenUsage:     &cursorTokenUsage{InputTokens: 10, OutputTokens: 5},
+	}
+	entries := aggregateCursorUsageEvents([]cursorUsageEvent{event})
+	if len(entries) != 1 || entries[0]["date"] != "2026-09-04" {
+		t.Fatalf("UTC day = %#v, want 2026-09-04", entries)
+	}
+}
+
 func TestCursorUsageDedupsOverlappingPagesAndSkipsEmptyEvents(t *testing.T) {
 	dup := cursorUsageEvent{
 		Timestamp:      json.RawMessage(`"1000"`),
@@ -145,7 +161,7 @@ func TestCursorUsageDedupsOverlappingPagesAndSkipsEmptyEvents(t *testing.T) {
 	}
 	events := []cursorUsageEvent{dup, dup, empty}
 
-	entries := aggregateCursorUsageEvents(events, time.UTC)
+	entries := aggregateCursorUsageEvents(events)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %#v", entries)
 	}
@@ -212,6 +228,58 @@ func TestFetchCursorUsageEventsPagesUntilAdvertisedTotal(t *testing.T) {
 	}
 	if len(events) != 3 {
 		t.Fatalf("events = %d, want 3", len(events))
+	}
+}
+
+func TestFetchCursorUsageEventsKeepsPagingWhenPagesOverlap(t *testing.T) {
+	orig := cursorUsageAPIBase
+	t.Cleanup(func() { cursorUsageAPIBase = orig })
+
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		w.Header().Set("Content-Type", "application/json")
+		if pages == 1 {
+			_, _ = w.Write([]byte(`{"totalUsageEventsCount":3,"usageEventsDisplay":[
+				{"timestamp":"1","model":"composer-2.5","conversationId":"a","tokenUsage":{"inputTokens":1,"outputTokens":1}},
+				{"timestamp":"2","model":"composer-2.5","conversationId":"b","tokenUsage":{"inputTokens":2,"outputTokens":2}}
+			]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"totalUsageEventsCount":3,"usageEventsDisplay":[
+			{"timestamp":"2","model":"composer-2.5","conversationId":"b","tokenUsage":{"inputTokens":2,"outputTokens":2}},
+			{"timestamp":"3","model":"composer-2.5","conversationId":"c","tokenUsage":{"inputTokens":3,"outputTokens":3}}
+		]}`))
+	}))
+	t.Cleanup(server.Close)
+	cursorUsageAPIBase = server.URL
+
+	events, err := fetchCursorUsageEvents("user_01TEST%3A%3Afake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages != 2 {
+		t.Fatalf("pages = %d, want 2", pages)
+	}
+	if len(events) != 3 {
+		t.Fatalf("unique events = %d, want 3 (overlap must not stop pagination early)", len(events))
+	}
+}
+
+func TestFetchCursorUsageEventsRejectsMissingDisplayArray(t *testing.T) {
+	orig := cursorUsageAPIBase
+	t.Cleanup(func() { cursorUsageAPIBase = orig })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+	cursorUsageAPIBase = server.URL
+
+	_, err := fetchCursorUsageEvents("user_01TEST%3A%3Afake")
+	if err == nil || !strings.Contains(err.Error(), "usageEventsDisplay") {
+		t.Fatalf("got %v", err)
 	}
 }
 
