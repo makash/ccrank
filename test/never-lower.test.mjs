@@ -11,7 +11,7 @@
 //
 // If this test fails, the change being merged can destroy user history.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -72,10 +72,11 @@ test('no numeric column is ever blindly replaced by the upload handler', () => {
 });
 
 test('the CLI never has a replace flag to send (LDP contract)', () => {
-  const cliSource = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), '..', 'cli', 'ccrank-git', 'main.go'),
-    'utf8',
-  );
+  const cliDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'cli', 'ccrank-git');
+  const cliSource = readdirSync(cliDir)
+    .filter((name) => name.endsWith('.go'))
+    .map((name) => readFileSync(join(cliDir, name), 'utf8'))
+    .join('\n');
   // Case-insensitive + struct-tag aware: a typed `Replace bool` with a
   // `json:"replace"` tag must be caught too, not just map literals.
   assert.ok(

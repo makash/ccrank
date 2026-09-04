@@ -179,7 +179,7 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 func TestUsageMaximaPathAcceptsEveryUploadedPlatform(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi} {
+	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor} {
 		if _, err := usageMaximaPath(cacheName); err != nil {
 			t.Fatalf("usageMaximaPath(%q) = %v", cacheName, err)
 		}
@@ -852,6 +852,8 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		{"hermes", ""},      // unrelated agent
 		{"antigravity", ""}, // unrelated agent
 		{"", ""},            // blank slice name
+		{"cursor", ""},      // already held out
+		{"CURSOR", ""},      // held out, case-insensitive
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
@@ -894,6 +896,25 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	}
 	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
 		t.Fatalf("combined entries = %#v", combined)
+	}
+}
+
+func TestCombinedRebuildHoldsOutCursorAgent(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-09-04","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
+		"agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
+			{"agent":"cursor","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"totalTokens":220,"totalCost":2}
+		]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatalf("Cursor rows must be held out without blocking combined usage, got %v", err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
+		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
 	}
 }
 

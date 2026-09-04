@@ -49,7 +49,7 @@ test('advertises every supported platform so the CLI can probe before uploading'
   // The CLI holds back any platform missing from this list, because an older
   // server would drop the explicit platform and refile the rows as `claude`,
   // letting a replacing upload overwrite the user's combined totals.
-  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode']);
+  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor']);
 });
 
 test('a zero-token day never counts as an active day', async () => {
@@ -84,12 +84,23 @@ test('a zero-token day never counts as an active day', async () => {
 });
 
 test('accepts every platform the CLI uploads and rejects anything else', () => {
-  for (const platform of ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi']) {
+  for (const platform of ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor']) {
     assert.equal(utils.isValidPlatform(platform), true, platform);
   }
   for (const platform of ['', 'gemini', 'PI', undefined, 'claude; DROP TABLE']) {
     assert.equal(utils.isValidPlatform(platform), false, String(platform));
   }
+});
+
+test('detects Cursor Agent and CLI models without refiling them as Claude or Codex', () => {
+  assert.equal(parser.detectPlatform(['composer-2.5']), 'cursor');
+  assert.equal(parser.detectPlatform(['composer']), 'cursor');
+  assert.equal(parser.detectPlatform(['cursor-grok-4.6-xhigh']), 'cursor');
+  assert.equal(parser.detectPlatform(['cursor/claude-4-opus']), 'cursor');
+  // Bare vendor names without a cursor-/composer- marker stay on their platforms.
+  assert.equal(parser.detectPlatform(['grok-4.6']), 'grok');
+  assert.equal(parser.detectPlatform(['claude-opus-5']), 'claude');
+  assert.equal(parser.detectPlatform(['gpt-5.5']), 'codex');
 });
 
 test('detects Grok and GLM models from their own CLIs', () => {
@@ -173,6 +184,27 @@ test('parses a GLM report into the GLM platform and keeps it token-only', () => 
   assert.equal(report.entries[0].costUsd, 0);
 });
 
+test('parses a Cursor report into the Cursor platform', () => {
+  const report = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [{
+      date: '2026-09-04',
+      inputTokens: 40505,
+      outputTokens: 11740,
+      cacheReadTokens: 37888,
+      cacheCreationTokens: 200,
+      totalTokens: 90333,
+      totalCost: 0.170394,
+      modelsUsed: ['cursor-grok-4.6-xhigh', 'composer-2.5'],
+    }],
+  }));
+
+  assert.equal(report.platform, 'cursor');
+  assert.equal(report.entries[0].platform, 'cursor');
+  assert.equal(report.entries[0].totalTokens, 90333);
+  assert.equal(report.entries[0].costUsd, 0.170394);
+});
+
 test('leaderboard offers a filter tab and legend swatch for every platform', () => {
   const page = html.leaderboardPage([{
     rank: 1,
@@ -187,10 +219,10 @@ test('leaderboard offers a filter tab and legend swatch for every platform', () 
     cache_rate: 0.9,
     output_ratio: 0.01,
     meets_efficiency_threshold: true,
-    platforms: ['grok', 'glm', 'pi', 'opencode'],
+    platforms: ['grok', 'glm', 'pi', 'opencode', 'cursor'],
   }]);
 
-  for (const [platform, label] of [['grok', 'Grok CLI'], ['glm', 'GLM (Z Code)'], ['pi', 'Pi'], ['opencode', 'OpenCode']]) {
+  for (const [platform, label] of [['grok', 'Grok CLI'], ['glm', 'GLM (Z Code)'], ['pi', 'Pi'], ['opencode', 'OpenCode'], ['cursor', 'Cursor']]) {
     assert.match(page, new RegExp(`platform=${platform}`), `${platform} filter tab`);
     assert.ok(page.includes(`title="${label}"`), `${platform} row dot`);
   }
@@ -223,10 +255,12 @@ test('profile platform breakdown names the new platforms', () => {
         grok: { total_cost: 293.67, total_tokens: 519_150_087, total_output_tokens: 5_700_000, days_active: 5 },
         glm: { total_cost: 0, total_tokens: 350_770, total_output_tokens: 4_941, days_active: 1 },
         pi: { total_cost: 0.13, total_tokens: 69_063_532, total_output_tokens: 385_877, days_active: 3 },
+        cursor: { total_cost: 12.5, total_tokens: 8_000_000, total_output_tokens: 400_000, days_active: 2 },
       },
     }
   );
 
   assert.match(dashboard, /Grok CLI/);
   assert.match(dashboard, /GLM \(Z Code\)/);
+  assert.match(dashboard, /Cursor/);
 });

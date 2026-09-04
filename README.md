@@ -12,7 +12,7 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind%20CSS-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-**Track, compare, and compete on Claude Code, Codex CLI, Kimi, Grok, GLM, and Pi token usage.**
+**Track, compare, and compete on Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, and Pi token usage.**
 Install the ccrank CLI (powered by [ccusage](https://github.com/ryoppippi/ccusage) plus native session importers). See the leaderboard. Earn titles. Talk trash.
 
 Deploy to Cloudflare Workers in under 10 minutes. Free tier. Zero cost.
@@ -148,7 +148,7 @@ Then upload git metadata:
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-Include local coding-agent usage from ccusage, Pi, Kimi Code, Grok CLI, GLM, and other supported sources:
+Include local coding-agent usage from ccusage, Pi, Kimi Code, Grok CLI, GLM, Cursor, and other supported sources:
 
 ```bash
 ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
@@ -164,10 +164,11 @@ Each agent is ranked on its own platform. `ccusage` supplies Claude Code, Codex,
 | `grok` | `~/.grok/sessions` and Grok models run through Pi | Zero for native sessions (credit-plan billing); from Pi's records for the Pi-fronted share |
 | `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi | Zero for native sessions; from Pi's records for the Pi-fronted share |
 | `opencode` | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`), read read-only | From opencode's own records (often zero for free models) |
+| `cursor` | Signed-in Cursor account (IDE Agent + CLI billed usage via the Cursor dashboard). Tab autocomplete is not counted. | From Cursor's billed usage events |
 
 `ccusage` imports Pi and Kimi natively too, so ccrank holds those two agents out of the combined `claude` bucket to keep them from being counted twice.
 
-Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` what the leaderboard accepts and holds back anything missing from that list, so a CLI that runs ahead of the deployment simply skips Grok, GLM, Pi, and OpenCode and says so, rather than having those uploads refiled into the combined bucket.
+Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` what the leaderboard accepts and holds back anything missing from that list, so a CLI that runs ahead of the deployment simply skips Grok, GLM, Pi, OpenCode, and Cursor and says so, rather than having those uploads refiled into the combined bucket.
 
 A model that Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, and retried Z Code requests. Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
 

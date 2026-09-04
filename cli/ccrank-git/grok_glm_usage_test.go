@@ -351,7 +351,7 @@ func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	supported := resolveSupportedPlatforms(server.URL, "test-token")
-	for _, platform := range []string{platformGrok, platformGLM, platformPi} {
+	for _, platform := range []string{platformGrok, platformGLM, platformPi, platformCursor} {
 		if supported[platform] {
 			t.Errorf("%q must be held back from a legacy server", platform)
 		}
@@ -364,7 +364,7 @@ func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 		}
 	}
 
-	for _, platform := range []string{platformGrok, platformGLM, platformPi} {
+	for _, platform := range []string{platformGrok, platformGLM, platformPi, platformCursor} {
 		today := uploadDedicatedPlatform(dedicatedPlatformUpload{
 			BaseURL: server.URL, Token: "test-token", Machine: "rig",
 			Platform: platform, Label: platform, Supported: supported,

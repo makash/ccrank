@@ -36,7 +36,7 @@ export interface LeaderboardEntry {
 
 export type SortKey = 'cost' | 'tokens' | 'output_per_dollar' | 'cache_rate' | 'output_ratio';
 
-export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode';
+export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode' | 'cursor';
 
 export type ViewType = 'daily' | 'weekly' | 'monthly';
 
@@ -117,6 +117,7 @@ export const PLATFORMS: readonly Platform[] = Object.freeze<Platform[]>([
   'glm',
   'pi',
   'opencode',
+  'cursor',
 ]);
 
 export function isValidPlatform(platform: string | undefined): platform is Platform {
