@@ -221,11 +221,23 @@ func main() {
 		Supported: supported, Run: runPiUsage,
 	})
 
+	// Cursor Agent and CLI billed usage lives on the Cursor dashboard, not in
+	// local transcripts. Upload it under a fixed account source so two machines
+	// signed into the same Cursor login do not double-count.
+	cursorToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Source:   cursorUsageSource,
+		Platform: platformCursor, Label: "Cursor",
+		Checking:  "Checking Cursor Agent and CLI usage from the signed-in Cursor account...",
+		Supported: supported, Run: runCursorUsage,
+	})
+
 	localToday = combineUsageSnapshots(localToday, kimiToday)
 	localToday = combineUsageSnapshots(localToday, grokToday)
 	localToday = combineUsageSnapshots(localToday, glmToday)
 	localToday = combineUsageSnapshots(localToday, opencodeToday)
 	localToday = combineUsageSnapshots(localToday, piToday)
+	localToday = combineUsageSnapshots(localToday, cursorToday)
 	if localToday != nil {
 		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
 			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
@@ -265,6 +277,7 @@ type dedicatedPlatformUpload struct {
 	BaseURL   string
 	Token     string
 	Machine   string
+	Source    string
 	Platform  string
 	Label     string
 	Checking  string
@@ -288,7 +301,11 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": skipped -", err.Error())
 		return nil
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, pending, job.Machine, job.Platform, job.Platform); err != nil {
+	source := job.Machine
+	if strings.TrimSpace(job.Source) != "" {
+		source = strings.TrimSpace(job.Source)
+	}
+	if err := uploadUsageReport(job.BaseURL, job.Token, pending, source, job.Platform, job.Platform); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
@@ -495,7 +512,7 @@ var ccusageDedicatedAgents = map[string]bool{
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If
 // ccusage ever ships a native importer for one of these, its per-agent slices
 // would double-count unless the agent joins ccusageDedicatedAgents.
-var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, "opencode"}
+var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, platformOpenCode, platformCursor}
 
 // unheldDedicatedAgent reports which dedicated platform an agent name looks
 // like when that agent is not held out of the combined bucket. An empty result
@@ -1031,6 +1048,7 @@ const (
 	platformGrok     = "grok"
 	platformGLM      = "glm"
 	platformOpenCode = "opencode"
+	platformCursor   = "cursor"
 )
 
 func loadPiKimiUsageEntries() ([]map[string]any, error) {
@@ -1672,7 +1690,7 @@ func usageMaximaPath(cacheName string) (string, error) {
 		return "", err
 	}
 	switch cacheName {
-	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode:
+	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor:
 	default:
 		return "", errors.New("invalid usage maxima cache name")
 	}
@@ -1689,6 +1707,7 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "  Grok CLI usage is imported automatically from ~/.grok/sessions.")
 	fmt.Fprintln(os.Stderr, "  GLM usage is imported automatically from ~/.zcode/cli/rollout.")
 	fmt.Fprintln(os.Stderr, "  OpenCode usage is imported automatically from ~/.local/share/opencode/opencode.db.")
+	fmt.Fprintln(os.Stderr, "  Cursor Agent and CLI usage is imported from the signed-in Cursor account.")
 }
 
 // loadSupportedPlatforms asks the leaderboard which platforms it understands.
@@ -2459,5 +2478,5 @@ func printOnboardingMessage() {
 	fmt.Println("  ccrank-git --add-repo")
 	fmt.Println("It will scan recursively and add the 30 most recently active repos.")
 	fmt.Println("")
-	fmt.Println("Git metadata uploads by default. Use --upload-usage to include Claude Code, Codex, Kimi, Pi, Hermes, and other supported usage.")
+	fmt.Println("Git metadata uploads by default. Use --upload-usage to include Claude Code, Codex, Cursor, Kimi, Pi, Hermes, and other supported usage.")
 }

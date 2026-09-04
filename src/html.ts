@@ -27,6 +27,7 @@ const PLATFORM_META = [
   { key: 'glm', label: 'GLM (Z Code)', shortLabel: 'GLM', dot: 'bg-amber-400', text: 'text-amber-300' },
   { key: 'pi', label: 'Pi', shortLabel: 'Pi', dot: 'bg-teal-400', text: 'text-teal-300' },
   { key: 'opencode', label: 'OpenCode', shortLabel: 'OpenCode', dot: 'bg-orange-400', text: 'text-orange-300' },
+  { key: 'cursor', label: 'Cursor', shortLabel: 'Cursor', dot: 'bg-indigo-400', text: 'text-indigo-300' },
 ] as const;
 
 export function layout(title: string, content: string, user: User | null = null, ogOverrides?: { image?: string; description?: string }): string {
@@ -123,9 +124,9 @@ export function layout(title: string, content: string, user: User | null = null,
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)} | ccrank.dev</title>
   <meta name="author" content="Akash Mahajan">
-  <meta name="description" content="Install the ccrank CLI to track Claude Code, Codex CLI, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.">
+  <meta name="description" content="Install the ccrank CLI to track Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.">
   <meta property="og:title" content="${escapeHtml(title)} | ccrank.dev">
-  <meta property="og:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.'}">
+  <meta property="og:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.'}">
   <meta property="og:type" content="website">
   <meta property="og:image" content="${ogOverrides?.image || 'https://imgs.kloudle.com/kloudle-customer-logos/ccrank-dev/ccrank-open-graph-image.webp'}">
   <meta property="og:image:width" content="1200">
@@ -133,7 +134,7 @@ export function layout(title: string, content: string, user: User | null = null,
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:creator" content="@makash">
   <meta name="twitter:title" content="${escapeHtml(title)} | ccrank.dev">
-  <meta name="twitter:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.'}">
+  <meta name="twitter:description" content="${ogOverrides?.description ? escapeHtml(ogOverrides.description) : 'Install the ccrank CLI to track Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.'}">
   <meta name="twitter:image" content="${ogOverrides?.image || 'https://imgs.kloudle.com/kloudle-customer-logos/ccrank-dev/ccrank-open-graph-image.webp'}">
   <meta property="og:site_name" content="ccrank.dev">
   <meta property="og:url" content="https://ccrank.dev/">
@@ -144,7 +145,7 @@ export function layout(title: string, content: string, user: User | null = null,
     "@context": "https://schema.org",
     "@type": "WebApplication",
     "name": "AI Coding Token Leaderboard",
-    "description": "Install the ccrank CLI to track Claude Code, Codex CLI, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.",
+    "description": "Install the ccrank CLI to track Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, Pi, and OpenCode token usage and see where you rank.",
     "url": "https://ccrank.dev/",
     "applicationCategory": "DeveloperApplication",
     "creator": {
@@ -297,7 +298,7 @@ export function landingPage(topEntries: LeaderboardEntry[]): string {
           ccrank.dev
         </h1>
         <p class="text-xl text-gray-400 max-w-lg mx-auto leading-relaxed">
-          Track Claude, Codex, Kimi, Grok, GLM, Pi & OpenCode tokens. Benchmark your leverage.
+          Track Claude, Codex, Cursor, Kimi, Grok, GLM, Pi & OpenCode tokens. Benchmark your leverage.
         </p>
         <p class="text-xs text-gray-500 mt-2">by <a href="https://x.com/makash?utm_source=ccrank&utm_medium=web&utm_campaign=hero" target="_blank" rel="noopener" class="text-gray-400 hover:text-gray-300 transition">@makash</a></p>
       </div>
@@ -706,14 +707,15 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
       </div>
 
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
-        <h2 class="text-sm font-semibold text-gray-200 mb-2">Using Kimi Code, Grok CLI, GLM, Pi or OpenCode?</h2>
-        <p class="text-sm text-gray-400">ccusage does not read Grok, GLM, or OpenCode, so the CLI imports those natively when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded">--upload-usage</code>:</p>
+        <h2 class="text-sm font-semibold text-gray-200 mb-2">Using Kimi Code, Grok CLI, GLM, Pi, OpenCode or Cursor?</h2>
+        <p class="text-sm text-gray-400">ccusage does not read Grok, GLM, OpenCode, or Cursor, so the CLI imports those natively when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded">--upload-usage</code>:</p>
         <ul class="text-sm text-gray-400 mt-2 space-y-1">
           <li>&bull; <strong class="text-gray-300">Kimi Code</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi/sessions</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi-code/sessions</code>, with migrated duplicates counted once</li>
           <li>&bull; <strong class="text-gray-300">Grok CLI</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.grok/sessions</code>, counting each completed turn once even after a rewind</li>
           <li>&bull; <strong class="text-gray-300">GLM (Z Code)</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.zcode/cli/rollout</code>, with retries of a request counted once</li>
           <li>&bull; <strong class="text-gray-300">Pi</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.pi/agent/sessions</code>, ranked on its own platform</li>
           <li>&bull; <strong class="text-gray-300">OpenCode</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.local/share/opencode/opencode.db</code>, read read-only from its session database</li>
+          <li>&bull; <strong class="text-gray-300">Cursor</strong> &mdash; billed Agent and CLI usage from the signed-in Cursor account (not Tab autocomplete). Uploaded once per account so two machines do not double-count</li>
         </ul>
         <p class="text-sm text-gray-400 mt-3">A model Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Only aggregated usage is uploaded&mdash;never raw prompts or responses.</p>
       </div>
@@ -948,7 +950,7 @@ export function aboutPage(user: User | null = null): string {
       <p class="text-gray-400 mb-10">How a WhatsApp message became a live leaderboard in minutes.</p>
 
       <p class="text-gray-400 mb-8 text-lg leading-relaxed">
-        ccrank.dev is an open-source developer ranking platform for Claude Code, Codex CLI, Kimi, Grok, GLM, Pi, and OpenCode token usage.
+        ccrank.dev is an open-source developer ranking platform for Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, Pi, and OpenCode token usage.
         Track, compare, and compete on your team's AI-assisted development metrics.
       </p>
 
@@ -998,7 +1000,7 @@ export function aboutPage(user: User | null = null): string {
         <ul class="text-gray-300 space-y-2">
           <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Track AI coding token usage across days, weeks, tools, and machines</li>
           <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Friendly competition &mdash; who&rsquo;s getting the most AI coding leverage?</li>
-          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Compare Claude Code, Codex CLI, Kimi, Grok, GLM, and Pi on one profile</li>
+          <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Compare Claude Code, Codex CLI, Cursor, Kimi, Grok, GLM, and Pi on one profile</li>
           <li class="flex items-start gap-2"><span class="text-purple-400 mt-1">&#x2022;</span> Fun titles &mdash; from Apprentice to Token Maximalist</li>
         </ul>
       </section>
@@ -1030,7 +1032,7 @@ export function aboutPage(user: User | null = null): string {
             <div class="text-sm font-semibold text-white mb-1">Powered by ccusage</div>
             <p class="text-sm text-gray-400">
               <a href="https://github.com/ryoppippi/ccusage?utm_source=claude-leaderboard&utm_medium=web&utm_campaign=about" target="_blank" rel="noopener" class="text-purple-400 hover:text-purple-300 transition">ccusage</a>
-              by <strong class="text-gray-300">ryoppippi</strong> powers Claude Code, Codex, and the other agents it detects; ccrank&rsquo;s native importers add Kimi Code, Grok CLI, GLM, and Pi.
+              by <strong class="text-gray-300">ryoppippi</strong> powers Claude Code, Codex, and the other agents it detects; ccrank&rsquo;s native importers add Kimi Code, Grok CLI, GLM, Pi, OpenCode, and Cursor.
               Without it, there&rsquo;d be no data to leaderboard.
             </p>
           </div>

@@ -11,7 +11,7 @@
  * versions where daily rows use `period` instead of `date`.
  */
 
-export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode';
+export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode' | 'cursor';
 
 export interface DailyEntry {
   date: string;
@@ -90,6 +90,12 @@ export function detectPlatform(models: string[]): Platform {
   const piPrefixes = ['pi-', '[pi] '];
   for (const model of models) {
     const lower = model.toLowerCase();
+    // Cursor Agent/CLI run composer, cursor-*, and vendor models under one
+    // client. Check Cursor before kimi/grok/glm/codex so a Cursor-hosted
+    // grok/claude/gpt model is not refiled into those platforms. Bare vendor
+    // names without a cursor-/composer- marker stay on their own platforms.
+    if (lower.startsWith('cursor-') || lower.startsWith('cursor/')) return 'cursor';
+    if (lower === 'composer' || lower.startsWith('composer-')) return 'cursor';
     if (kimiContains.some((part) => lower.includes(part))) return 'kimi';
     if (grokContains.some((part) => lower.includes(part))) return 'grok';
     if (glmContains.some((part) => lower.includes(part))) return 'glm';

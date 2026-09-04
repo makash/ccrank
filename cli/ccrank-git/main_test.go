@@ -179,7 +179,7 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 func TestUsageMaximaPathAcceptsEveryUploadedPlatform(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi} {
+	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor} {
 		if _, err := usageMaximaPath(cacheName); err != nil {
 			t.Fatalf("usageMaximaPath(%q) = %v", cacheName, err)
 		}
@@ -836,22 +836,24 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		agent string
 		want  string
 	}{
-		{"pi", ""},          // already held out
-		{"kimi", ""},        // already held out
-		{"opencode", ""},    // already held out
-		{"grok", ""},        // already held out
-		{"glm", ""},         // already held out
-		{"PI", ""},          // held out, case-insensitive
-		{"Kimi", ""},        // held out, case-insensitive
-		{"OpenCode", ""},    // held out, case-insensitive
-		{"Grok", ""},        // held out, case-insensitive
-		{"GLM", ""},         // held out, case-insensitive
-		{"claude", ""},      // unrelated agent
-		{"codex", ""},       // unrelated agent
-		{"gemini", ""},      // unrelated agent
-		{"hermes", ""},      // unrelated agent
-		{"antigravity", ""}, // unrelated agent
-		{"", ""},            // blank slice name
+		{"pi", ""},                 // already held out
+		{"kimi", ""},               // already held out
+		{"opencode", ""},           // already held out
+		{"grok", ""},               // already held out
+		{"glm", ""},                // already held out
+		{"PI", ""},                 // held out, case-insensitive
+		{"Kimi", ""},               // held out, case-insensitive
+		{"OpenCode", ""},           // held out, case-insensitive
+		{"Grok", ""},               // held out, case-insensitive
+		{"GLM", ""},                // held out, case-insensitive
+		{"claude", ""},             // unrelated agent
+		{"codex", ""},              // unrelated agent
+		{"gemini", ""},             // unrelated agent
+		{"hermes", ""},             // unrelated agent
+		{"antigravity", ""},        // unrelated agent
+		{"", ""},                   // blank slice name
+		{"cursor", "cursor"},       // dedicated platform with no ccusage importer yet
+		{"Cursor Agent", "cursor"}, // prefixed variant
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
