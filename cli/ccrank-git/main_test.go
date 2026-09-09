@@ -142,6 +142,7 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 	for _, legacy := range []string{
 		`{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 		`{"version":2,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
+		`{"version":3,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 	} {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -179,7 +180,7 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 func TestUsageMaximaPathAcceptsEveryUploadedPlatform(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor} {
+	for _, cacheName := range []string{"combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor, platformCodex} {
 		if _, err := usageMaximaPath(cacheName); err != nil {
 			t.Fatalf("usageMaximaPath(%q) = %v", cacheName, err)
 		}
@@ -739,6 +740,102 @@ func TestPiUsageIsRoutedToThePlatformThatOwnsEachModel(t *testing.T) {
 	}
 }
 
+func TestPiSubagentTranscriptsCountTowardOwningPlatform(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeJSONL := func(path string, records []map[string]any) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var data []byte
+		for _, record := range records {
+			encoded, err := json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data = append(data, encoded...)
+			data = append(data, '\n')
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tsMillis := float64(day.UnixMilli())
+
+	// Main session shape: model carried by model_change state.
+	writeJSONL(filepath.Join(home, ".pi", "agent", "sessions", "main.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "zai", "modelId": "glm-5.3"},
+		{
+			"type":      "message",
+			"timestamp": "2026-09-09T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 1000, "output": 100, "cacheRead": 5000, "cacheWrite": 0,
+				"totalTokens": 6100, "cost": map[string]any{"total": 1.5},
+			}},
+		},
+	})
+
+	// Subagent transcript shape: recordType instead of type, per-record model,
+	// epoch-millis timestamps, no model_change lines, plus non-message noise.
+	writeJSONL(filepath.Join(home, ".pi", "agent", "sessions", "sess", "subagent-artifacts", "w_transcript.jsonl"), []map[string]any{
+		{
+			"recordType": "message", "ts": tsMillis,
+			"timestamp": "2026-09-09T12:00:00Z", "model": "glm-5.3-flash",
+			"message": map[string]any{
+				"provider": "zai", "model": "glm-5.3-flash", "timestamp": tsMillis,
+				"usage": map[string]any{
+					"input": 2000, "output": 200, "cacheRead": 7000, "cacheWrite": 0,
+					"totalTokens": 9200, "cost": map[string]any{"total": 2.5},
+				},
+			},
+		},
+		{"recordType": "stderr", "ts": tsMillis, "text": "noise"},
+		{"recordType": "tool_start", "ts": tsMillis},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformGLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 glm daily entry, got %d", len(entries))
+	}
+	entry := entries[0]
+	if got := numberValue(entry["totalTokens"]); got != 15300 {
+		t.Fatalf("totalTokens = %v, want 15300 (main 6100 + subagent 9200)", got)
+	}
+	if got := numberValue(entry["inputTokens"]); got != 3000 {
+		t.Fatalf("inputTokens = %v, want 3000", got)
+	}
+	if got := usageCostValue(entry); got != 4.0 {
+		t.Fatalf("cost = %v, want 4.0", got)
+	}
+	models, ok := entry["modelsUsed"].([]string)
+	if !ok || len(models) != 2 || models[0] != "pi-zai-glm-5-3" || models[1] != "pi-zai-glm-5-3-flash" {
+		t.Fatalf("modelsUsed = %#v", entry["modelsUsed"])
+	}
+
+	// The same lines must not also rank under Pi: only the excluded zero row.
+	piEntries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(piEntries) != 1 {
+		t.Fatalf("expected 1 pi daily entry, got %d", len(piEntries))
+	}
+	if got := numberValue(piEntries[0]["totalTokens"]); got != 0 {
+		t.Fatalf("pi totalTokens = %v, want excluded zero row", got)
+	}
+}
+
 func TestLoadPiUsageEntriesSkipsUnreadableSessions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -836,24 +933,26 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		agent string
 		want  string
 	}{
-		{"pi", ""},          // already held out
-		{"kimi", ""},        // already held out
-		{"opencode", ""},    // already held out
-		{"grok", ""},        // already held out
-		{"glm", ""},         // already held out
-		{"PI", ""},          // held out, case-insensitive
-		{"Kimi", ""},        // held out, case-insensitive
-		{"OpenCode", ""},    // held out, case-insensitive
-		{"Grok", ""},        // held out, case-insensitive
-		{"GLM", ""},         // held out, case-insensitive
-		{"claude", ""},      // unrelated agent
-		{"codex", ""},       // unrelated agent
-		{"gemini", ""},      // unrelated agent
-		{"hermes", ""},      // unrelated agent
-		{"antigravity", ""}, // unrelated agent
-		{"", ""},            // blank slice name
-		{"cursor", ""},      // already held out
-		{"CURSOR", ""},      // held out, case-insensitive
+		{"pi", ""},                       // already held out
+		{"kimi", ""},                     // already held out
+		{"opencode", ""},                 // already held out
+		{"grok", ""},                     // already held out
+		{"glm", ""},                      // already held out
+		{"PI", ""},                       // held out, case-insensitive
+		{"Kimi", ""},                     // held out, case-insensitive
+		{"OpenCode", ""},                 // held out, case-insensitive
+		{"Grok", ""},                     // held out, case-insensitive
+		{"GLM", ""},                      // held out, case-insensitive
+		{"claude", ""},                   // unrelated agent
+		{"codex", ""},                    // already held out
+		{"Codex", ""},                    // held out, case-insensitive
+		{"codex-nightly", platformCodex}, // future codex-* names must fail loud
+		{"gemini", ""},                   // unrelated agent
+		{"hermes", ""},                   // unrelated agent
+		{"antigravity", ""},              // unrelated agent
+		{"", ""},                         // blank slice name
+		{"cursor", ""},                   // already held out
+		{"CURSOR", ""},                   // held out, case-insensitive
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
@@ -880,7 +979,7 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
 	}
 
-	// The same row without the suspicious agent still rebuilds cleanly.
+	// Codex rows are held out the same way now that Codex uploads separately.
 	report = []byte(`{"daily":[{"period":"2026-08-14","inputTokens":100,"outputTokens":10,"totalTokens":110,"totalCost":1,
 		"agents":[
 			{"agent":"claude","inputTokens":60,"outputTokens":6,"totalTokens":66,"totalCost":0.6},
@@ -892,10 +991,10 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	}
 	combined, err = rebuildCombinedEntries(entries)
 	if err != nil {
-		t.Fatalf("claude/codex rows must never trip the detector, got %v", err)
+		t.Fatalf("codex rows must be held out without blocking combined usage, got %v", err)
 	}
-	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
-		t.Fatalf("combined entries = %#v", combined)
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 66 {
+		t.Fatalf("combined entries = %#v, want only Claude's 66 tokens", combined)
 	}
 }
 
@@ -915,6 +1014,120 @@ func TestCombinedRebuildHoldsOutCursorAgent(t *testing.T) {
 	}
 	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
 		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
+	}
+}
+
+func TestCodexUsageSplitReconcilesWithCombined(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// "Codex" is mixed-case on purpose: agent matching is case-insensitive.
+	report := []byte(`{"type":"daily","daily":[
+		{"period":"2026-09-01","inputTokens":300,"outputTokens":30,"cacheCreationTokens":10,"cacheReadTokens":700,"totalTokens":1040,"totalCost":3,
+		"agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheCreationTokens":4,"cacheReadTokens":400,"totalTokens":514,"totalCost":1,"modelsUsed":["claude-opus-5"]},
+			{"agent":"Codex","inputTokens":200,"outputTokens":20,"cacheCreationTokens":6,"cacheReadTokens":300,"totalTokens":526,"totalCost":2,"modelsUsed":["gpt-5.5"]}
+		]},
+		{"period":"2026-09-02","inputTokens":50,"outputTokens":5,"cacheCreationTokens":1,"cacheReadTokens":40,"totalTokens":96,"totalCost":0.5,
+		"agents":[
+			{"agent":"claude","inputTokens":50,"outputTokens":5,"cacheCreationTokens":1,"cacheReadTokens":40,"totalTokens":96,"totalCost":0.5,"modelsUsed":["claude-opus-5"]}
+		]}
+	]}`)
+
+	_, raw, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rows without an agents[] split (like the npx-failed fallback path) must
+	// be skipped silently by the Codex builder, never an error.
+	raw = append(raw, map[string]any{"date": "2026-09-03", "totalTokens": 8.0, "totalCost": 0.1})
+
+	combined, err := rebuildCombinedEntries(raw[:2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined) != 2 {
+		t.Fatalf("combined entries = %#v, want 2 rows", combined)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 514 {
+		t.Fatalf("combined 2026-09-01 totalTokens = %v, want only Claude's 514", got)
+	}
+	if got := numberValue(combined[1]["totalTokens"]); got != 96 {
+		t.Fatalf("combined 2026-09-02 totalTokens = %v, want 96", got)
+	}
+
+	pending, _, err := runCodexUsageFromEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending == nil {
+		t.Fatal("expected a Codex upload to be prepared")
+	}
+	var prepared struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &prepared); err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Daily) != 1 {
+		t.Fatalf("codex rows = %#v, want only the 2026-09-01 row", prepared.Daily)
+	}
+	codex := prepared.Daily[0]
+	if got := usageDate(codex); got != "2026-09-01" {
+		t.Fatalf("codex date = %q, want 2026-09-01", got)
+	}
+	for key, want := range map[string]float64{
+		"inputTokens": 200, "outputTokens": 20, "cacheCreationTokens": 6,
+		"cacheReadTokens": 300, "totalTokens": 526, "totalCost": 2,
+	} {
+		if got := numberValue(codex[key]); got != want {
+			t.Errorf("codex %s = %v, want %v", key, got, want)
+		}
+	}
+	// Per-date reconciliation: combined (codex held out) + codex == original
+	// ccusage totals, so the split loses and double-counts nothing.
+	for key, want := range map[string]float64{
+		"inputTokens": 300, "outputTokens": 30, "cacheCreationTokens": 10,
+		"cacheReadTokens": 700, "totalTokens": 1040, "totalCost": 3,
+	} {
+		combinedVal, codexVal := numberValue(combined[0][key]), numberValue(codex[key])
+		if key == "totalCost" {
+			combinedVal, codexVal = usageCostValue(combined[0]), usageCostValue(codex)
+		}
+		if combinedVal+codexVal != want {
+			t.Errorf("combined + codex %s = %v + %v, want original %v", key, combinedVal, codexVal, want)
+		}
+	}
+
+	// The maxima gate uses a per-platform cache that resolves and commits.
+	if err := pending.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := os.ReadFile(filepath.Join(home, ".ccrank", "usage-maxima-codex.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cache), fmt.Sprintf(`"version": %d`, usageMaximaVersion)) {
+		t.Fatalf("expected version %d codex cache, got %s", usageMaximaVersion, cache)
+	}
+	if _, _, err := runCodexUsageFromEntries(raw); err == nil || !strings.Contains(err.Error(), "no higher Codex usage rows found") {
+		t.Fatalf("expected unchanged second upload to be skipped, got %v", err)
+	}
+
+	// Legacy servers predate the probe but have always known "codex", so the
+	// fallback must keep permitting it.
+	if !legacyPlatforms[platformCodex] {
+		t.Fatal("codex must remain uploadable to legacy servers")
+	}
+
+	// No codex slices anywhere is a clean skip, not an error about row shape.
+	for _, empty := range [][]map[string]any{
+		nil,
+		{{"date": "2026-09-03", "totalTokens": 8.0}},
+	} {
+		if _, _, err := runCodexUsageFromEntries(empty); err == nil || err.Error() != "no Codex usage found" {
+			t.Fatalf("expected no Codex usage found, got %v", err)
+		}
 	}
 }
 
@@ -949,7 +1162,7 @@ func TestCombinedRebuildMergesMatchingModelBreakdowns(t *testing.T) {
 			{"modelName":"zeta","inputTokens":1,"outputTokens":1,"cacheCreationTokens":1,"cacheReadTokens":1,"totalTokens":4,"cost":0.1},
 			{"modelName":"alpha","inputTokens":9,"outputTokens":1,"cacheCreationTokens":2,"cacheReadTokens":3,"totalTokens":15,"cost":0.4}
 		 ]},
-		{"agent":"codex","inputTokens":5,"outputTokens":6,"cacheCreationTokens":7,"cacheReadTokens":8,"totalTokens":26,"totalCost":0.6,
+		{"agent":"hermes","inputTokens":5,"outputTokens":6,"cacheCreationTokens":7,"cacheReadTokens":8,"totalTokens":26,"totalCost":0.6,
 		 "modelBreakdowns":[
 			{"modelName":"alpha","inputTokens":5,"outputTokens":6,"cacheCreationTokens":7,"cacheReadTokens":8,"totalTokens":26,"cost":0.6}
 		 ]}

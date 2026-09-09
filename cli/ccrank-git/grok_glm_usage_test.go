@@ -314,7 +314,7 @@ func TestLoadSupportedPlatformsReadsTheProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, platform := range []string{platformCombined, platformKimi, platformGrok, platformGLM, platformPi} {
+	for _, platform := range []string{platformCombined, platformCodex, platformKimi, platformGrok, platformGLM, platformPi} {
 		if !supported[platform] {
 			t.Errorf("%q should be supported", platform)
 		}
@@ -357,8 +357,8 @@ func TestLegacyServersNeverReceiveANewPlatform(t *testing.T) {
 		}
 	}
 	// The long-standing platforms must keep uploading, or the probe would
-	// regress Kimi tracking on every server that has not updated yet.
-	for _, platform := range []string{platformCombined, platformKimi} {
+	// regress Kimi and Codex tracking on every server that has not updated yet.
+	for _, platform := range []string{platformCombined, platformCodex, platformKimi} {
 		if !supported[platform] {
 			t.Errorf("%q must still upload to a legacy server", platform)
 		}
