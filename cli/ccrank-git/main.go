@@ -144,11 +144,11 @@ func main() {
 		return
 	}
 
-	// Upload combined coding-agent usage from ccusage (Claude Code + Codex + Hermes + other agents).
+	// Upload combined coding-agent usage from ccusage (Claude Code + Hermes + other agents).
 	// ccrank production currently treats this as the legacy Claude bucket, so keep
 	// the payload combined to avoid replacing old all-agent rows with narrower data.
-	fmt.Println("Checking combined Claude Code + Codex + Hermes + Antigravity usage...")
-	pending, localToday, err := runCcusage()
+	fmt.Println("Checking combined Claude Code + Hermes + Antigravity usage...")
+	pending, localToday, ccusageRaw, err := runCcusage()
 	usageErr := err
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "  Combined usage: skipped -", err.Error())
@@ -165,7 +165,6 @@ func main() {
 		}
 	}
 
-	fmt.Println("  Codex CLI: included in combined usage upload")
 	fmt.Println("  Gemini Antigravity: included from local transcripts when present")
 
 	if usageErr != nil && shouldPrintCcusageHelp(usageErr) {
@@ -173,6 +172,21 @@ func main() {
 	}
 
 	supported := resolveSupportedPlatforms(*urlFlag, *tokenFlag)
+
+	// Codex CLI reports its own per-agent slices in ccusage --by-agent output,
+	// so it uploads under a dedicated platform instead of staying folded into
+	// the combined bucket. The slices come from the ccusage run above, and the
+	// upload keeps the standard upload-first commit ordering via
+	// uploadDedicatedPlatform, so old rows are never lowered.
+	codexToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformCodex, Label: "Codex CLI",
+		Checking:  "Checking Codex CLI usage from ccusage...",
+		Supported: supported,
+		Run: func() (*pendingUsageUpload, *UsageSnapshot, error) {
+			return runCodexUsageFromEntries(ccusageRaw)
+		},
+	})
 
 	// Kimi Code exposes exact token counts in its native wire logs. Keep native
 	// and Pi-hosted Kimi usage in a separate platform so zero-cost usage is
@@ -232,6 +246,7 @@ func main() {
 		Supported: supported, Run: runCursorUsage,
 	})
 
+	localToday = combineUsageSnapshots(localToday, codexToday)
 	localToday = combineUsageSnapshots(localToday, kimiToday)
 	localToday = combineUsageSnapshots(localToday, grokToday)
 	localToday = combineUsageSnapshots(localToday, glmToday)
@@ -252,7 +267,7 @@ func main() {
 // so they remain safe to upload when we cannot ask what it supports.
 var legacyPlatforms = map[string]bool{
 	platformCombined: true,
-	"codex":          true,
+	platformCodex:    true,
 	platformKimi:     true,
 }
 
@@ -431,34 +446,123 @@ func uploadPayload(baseURL, token string, payload Payload) error {
 	return nil
 }
 
-func runCcusage() (*pendingUsageUpload, *UsageSnapshot, error) {
+func runCcusage() (*pendingUsageUpload, *UsageSnapshot, []map[string]any, error) {
 	// --by-agent splits each daily row per source CLI so agents ccrank uploads
-	// under their own platform can be held out of the combined bucket.
+	// under their own platform can be held out of the combined bucket. The raw
+	// pre-rebuild rows go back to the caller for the dedicated Codex upload,
+	// which has its own maxima cache and may have new rows even when combined
+	// does not (or vice versa), so raw is returned even alongside an error.
 	cmd := exec.Command("npx", "ccusage@latest", "daily", "--json", "--by-agent")
 	out, err := cmd.Output()
 	if err != nil {
 		report := map[string]any{"daily": []map[string]any{}}
 		entries := loadLocalUsageEntries(nil, report)
 		if len(entries) == 0 {
-			return nil, nil, errors.New("no combined usage data found (is Node installed?)")
+			return nil, nil, nil, errors.New("no combined usage data found (is Node installed?)")
 		}
 		localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 		pending, err := prepareUsageUpload(report, entries, "combined", "no higher combined usage rows found")
 		if err != nil {
-			return nil, localToday, err
+			return nil, localToday, nil, err
 		}
-		return pending, localToday, nil
+		return pending, localToday, nil, nil
 	}
-	report, entries, err := parseCcusageReportWithLocalExtras(out)
-	if err != nil {
-		return nil, nil, err
+	report, raw, parseErr := parseCcusageReport(out)
+	entries := raw
+	if parseErr != nil {
+		report = map[string]any{"daily": []map[string]any{}}
+		entries = nil
+	} else {
+		var rebuildErr error
+		entries, rebuildErr = rebuildCombinedEntries(entries)
+		if rebuildErr != nil {
+			return nil, nil, nil, rebuildErr
+		}
+		setReportEntries(report, entries)
+	}
+	entries = loadLocalUsageEntries(entries, report)
+	if len(entries) == 0 && parseErr != nil {
+		return nil, nil, nil, parseErr
 	}
 	localToday := usageSnapshotForDate(entries, time.Now().Format("2006-01-02"))
 	pending, err := prepareUsageUpload(report, entries, "combined", "no higher combined usage rows found")
 	if err != nil {
-		return nil, localToday, err
+		return nil, localToday, raw, err
 	}
-	return pending, localToday, nil
+	return pending, localToday, raw, nil
+}
+
+// runCodexUsageFromEntries builds the dedicated Codex CLI upload from the raw
+// pre-rebuild ccusage --by-agent rows, summing each date's slices whose agent
+// is codex. Rows without an agents[] array (such as the npx-failed fallback
+// path) carry no per-agent split and are skipped silently, never an error.
+func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *UsageSnapshot, error) {
+	rows := make([]map[string]any, 0, len(raw))
+	for _, entry := range raw {
+		agents, ok := entry["agents"].([]any)
+		if !ok {
+			continue
+		}
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+		var input, output, cacheCreation, cacheRead, total, cost float64
+		modelNames := []string{}
+		modelBreakdowns := []any{}
+		found := false
+		for _, item := range agents {
+			agent, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"]))) != platformCodex {
+				continue
+			}
+			found = true
+			input += numberValue(agent["inputTokens"])
+			output += numberValue(agent["outputTokens"])
+			cacheCreation += numberValue(agent["cacheCreationTokens"])
+			cacheRead += numberValue(agent["cacheReadTokens"])
+			total += numberValue(agent["totalTokens"])
+			cost += usageCostValue(agent)
+			for _, model := range extractModelNames(agent["modelsUsed"]) {
+				modelNames = append(modelNames, model)
+			}
+			if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
+				modelBreakdowns = append(modelBreakdowns, breakdowns...)
+			}
+		}
+		if !found {
+			continue
+		}
+		sort.Strings(modelNames)
+		rows = append(rows, map[string]any{
+			"date":                     date,
+			"inputTokens":              input,
+			"outputTokens":             output,
+			"cacheCreationTokens":      cacheCreation,
+			"cacheReadTokens":          cacheRead,
+			"totalInputTokens":         input,
+			"totalOutputTokens":        output,
+			"totalCacheCreationTokens": cacheCreation,
+			"totalCacheReadTokens":     cacheRead,
+			"totalTokens":              total,
+			"totalCost":                cost,
+			"totalCostUSD":             cost,
+			"costUSD":                  cost,
+			"modelsUsed":               modelNames,
+			"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
+		})
+	}
+	if len(rows) == 0 {
+		return nil, nil, errors.New("no Codex usage found")
+	}
+	entries := mergeUsageEntries(rows, nil)
+	localToday := usageSnapshotForDate(entries, todayDate())
+	report := map[string]any{"type": "daily", "daily": entries}
+	pending, err := prepareUsageUpload(report, entries, platformCodex, "no higher Codex usage rows found")
+	return pending, localToday, err
 }
 
 func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
@@ -508,12 +612,13 @@ var ccusageDedicatedAgents = map[string]bool{
 	"grok":     true,
 	"glm":      true,
 	"cursor":   true,
+	"codex":    true,
 }
 
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If
 // ccusage ever ships a native importer for one of these, its per-agent slices
 // would double-count unless the agent joins ccusageDedicatedAgents.
-var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, platformOpenCode, platformCursor}
+var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, platformOpenCode, platformCursor, platformCodex}
 
 // unheldDedicatedAgent reports which dedicated platform an agent name looks
 // like when that agent is not held out of the combined bucket. An empty result
@@ -993,16 +1098,30 @@ func usageCostValue(entry map[string]any) float64 {
 }
 
 type piSessionLine struct {
-	Type      string     `json:"type"`
-	Timestamp any        `json:"timestamp"`
-	Provider  string     `json:"provider"`
-	ModelID   string     `json:"modelId"`
-	Message   *piMessage `json:"message"`
+	Type       string     `json:"type"`
+	RecordType string     `json:"recordType"`
+	Timestamp  any        `json:"timestamp"`
+	Ts         any        `json:"ts"`
+	Provider   string     `json:"provider"`
+	ModelID    string     `json:"modelId"`
+	Model      string     `json:"model"`
+	Message    *piMessage `json:"message"`
 }
 
 type piMessage struct {
 	Timestamp any      `json:"timestamp"`
+	Provider  string   `json:"provider"`
+	Model     string   `json:"model"`
 	Usage     *piUsage `json:"usage"`
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type piUsage struct {
@@ -1050,6 +1169,7 @@ const (
 	platformGLM      = "glm"
 	platformOpenCode = "opencode"
 	platformCursor   = "cursor"
+	platformCodex    = "codex"
 )
 
 func loadPiKimiUsageEntries() ([]map[string]any, error) {
@@ -1186,13 +1306,32 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, platform string
 			modelName = piModelName(entry.Provider, entry.ModelID)
 			continue
 		}
-		if entry.Type != "message" || entry.Message == nil || entry.Message.Usage == nil {
+		// Subagent transcripts use recordType instead of type and carry no
+		// model_change lines; every message record names its own model.
+		msgType := entry.Type
+		if msgType == "" {
+			msgType = entry.RecordType
+		}
+		if msgType != "message" || entry.Message == nil || entry.Message.Usage == nil {
 			continue
+		}
+		// Prefer the model on the record itself. Main sessions repeat the
+		// model_change value here, so they are unaffected; subagent
+		// transcripts only carry it per record, and without this their usage
+		// would land in pi-unknown instead of the owning platform.
+		if recModel := piModelName(
+			firstNonEmpty(entry.Message.Provider, entry.Provider),
+			firstNonEmpty(entry.Message.Model, entry.Model, entry.ModelID),
+		); recModel != "pi-unknown" {
+			modelName = recModel
 		}
 
 		date := piUsageDate(entry.Timestamp)
 		if date == "" {
 			date = piUsageDate(entry.Message.Timestamp)
+		}
+		if date == "" {
+			date = piUsageDate(entry.Ts)
 		}
 		if date == "" {
 			continue
@@ -1605,8 +1744,10 @@ func usageTotals(entries []map[string]any) map[string]any {
 // phantom list-price cost did not warrant a bump: resets only matter when
 // combined rows shrink, and the server max-merges every upload, so a downward
 // correction is impossible regardless — the smaller grok rows simply lose the
-// merge until their tokens genuinely grow again.
-const usageMaximaVersion = 3
+// merge until their tokens genuinely grow again. Version 4 splits Codex out
+// of the combined bucket, shrinking those rows the way Kimi (v2) and Pi (v3)
+// did.
+const usageMaximaVersion = 4
 
 func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	path, err := usageMaximaPath(cacheName)
@@ -1630,8 +1771,10 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	if cacheName == "combined" && numberValue(report["version"]) != usageMaximaVersion {
 		// Version 2 split Kimi out of the legacy combined platform; version 3
 		// splits out Pi, which ccusage began importing natively and ccrank was
-		// merging on top of. Both shrink the combined bucket, so treat older
-		// maxima as empty once and let the lower corrected rows overwrite it.
+		// merging on top of; version 4 splits out Codex, whose --by-agent
+		// slices ccrank used to fold into combined. Each split shrinks the
+		// combined bucket, so treat older maxima as empty once and let the
+		// lower corrected rows overwrite it.
 		return maxima, nil
 	}
 
@@ -1691,7 +1834,7 @@ func usageMaximaPath(cacheName string) (string, error) {
 		return "", err
 	}
 	switch cacheName {
-	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor:
+	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor, platformCodex:
 	default:
 		return "", errors.New("invalid usage maxima cache name")
 	}
