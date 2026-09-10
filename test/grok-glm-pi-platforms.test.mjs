@@ -49,7 +49,7 @@ test('advertises every supported platform so the CLI can probe before uploading'
   // The CLI holds back any platform missing from this list, because an older
   // server would drop the explicit platform and refile the rows as `claude`,
   // letting a replacing upload overwrite the user's combined totals.
-  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor']);
+  assert.deepEqual(body.platforms, ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor', 'muse']);
 });
 
 test('a zero-token day never counts as an active day', async () => {
@@ -84,7 +84,7 @@ test('a zero-token day never counts as an active day', async () => {
 });
 
 test('accepts every platform the CLI uploads and rejects anything else', () => {
-  for (const platform of ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor']) {
+  for (const platform of ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor', 'muse']) {
     assert.equal(utils.isValidPlatform(platform), true, platform);
   }
   for (const platform of ['', 'gemini', 'PI', undefined, 'claude; DROP TABLE']) {

@@ -246,6 +246,15 @@ func main() {
 		Supported: supported, Run: runCursorUsage,
 	})
 
+	// Muse Code records per-call token counts in local session.jsonl logs.
+	// Contributor-plan logs carry no pricing, so usage is token-only.
+	museToday := uploadDedicatedPlatform(dedicatedPlatformUpload{
+		BaseURL: *urlFlag, Token: *tokenFlag, Machine: machine,
+		Platform: platformMuse, Label: "Muse Code",
+		Checking:  "Checking Muse Code usage from local Muse sessions...",
+		Supported: supported, Run: runMuseUsage,
+	})
+
 	localToday = combineUsageSnapshots(localToday, codexToday)
 	localToday = combineUsageSnapshots(localToday, kimiToday)
 	localToday = combineUsageSnapshots(localToday, grokToday)
@@ -253,6 +262,7 @@ func main() {
 	localToday = combineUsageSnapshots(localToday, opencodeToday)
 	localToday = combineUsageSnapshots(localToday, piToday)
 	localToday = combineUsageSnapshots(localToday, cursorToday)
+	localToday = combineUsageSnapshots(localToday, museToday)
 	if localToday != nil {
 		if err := printDailyUsageComparison(*urlFlag, *tokenFlag, *localToday); err != nil {
 			fmt.Fprintln(os.Stderr, "  Daily leaderboard check: skipped -", err.Error())
@@ -613,12 +623,13 @@ var ccusageDedicatedAgents = map[string]bool{
 	"glm":      true,
 	"cursor":   true,
 	"codex":    true,
+	"muse":     true,
 }
 
 // dedicatedPlatformNames lists every platform ccrank ranks on its own. If
 // ccusage ever ships a native importer for one of these, its per-agent slices
 // would double-count unless the agent joins ccusageDedicatedAgents.
-var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, platformOpenCode, platformCursor, platformCodex}
+var dedicatedPlatformNames = []string{platformPi, platformKimi, platformGrok, platformGLM, platformOpenCode, platformCursor, platformCodex, platformMuse}
 
 // unheldDedicatedAgent reports which dedicated platform an agent name looks
 // like when that agent is not held out of the combined bucket. An empty result
@@ -1170,6 +1181,7 @@ const (
 	platformOpenCode = "opencode"
 	platformCursor   = "cursor"
 	platformCodex    = "codex"
+	platformMuse     = "muse"
 )
 
 func loadPiKimiUsageEntries() ([]map[string]any, error) {
@@ -1422,12 +1434,21 @@ func isKimiModelName(modelName string) bool {
 	return strings.Contains(lower, "kimi") || strings.Contains(lower, "moonshot")
 }
 
+func isMuseModelName(modelName string) bool {
+	return strings.Contains(strings.ToLower(modelName), "muse")
+}
+
 // piPlatformForModel routes a Pi session model to the platform that owns it. Pi
 // fronts models from several vendors, and every vendor ccrank imports natively
 // is ranked under its own platform rather than under Pi.
 func piPlatformForModel(modelName string) string {
 	lower := strings.ToLower(modelName)
 	switch {
+	// Muse is checked before kimi/grok/glm, matching detectPlatform in
+	// src/parser.ts, so hybrid names resolve the same on both sides. No
+	// real model name contains both markers, so this only pins hybrids.
+	case isMuseModelName(modelName):
+		return platformMuse
 	case isKimiModelName(modelName):
 		return platformKimi
 	case strings.Contains(lower, "grok"), strings.Contains(lower, "xai"):
@@ -1834,7 +1855,7 @@ func usageMaximaPath(cacheName string) (string, error) {
 		return "", err
 	}
 	switch cacheName {
-	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor, platformCodex:
+	case "combined", platformKimi, platformGrok, platformGLM, platformPi, platformOpenCode, platformCursor, platformCodex, platformMuse:
 	default:
 		return "", errors.New("invalid usage maxima cache name")
 	}
@@ -1852,6 +1873,7 @@ func printCcusageHelp() {
 	fmt.Fprintln(os.Stderr, "  GLM usage is imported automatically from ~/.zcode/cli/rollout.")
 	fmt.Fprintln(os.Stderr, "  OpenCode usage is imported automatically from ~/.local/share/opencode/opencode.db.")
 	fmt.Fprintln(os.Stderr, "  Cursor Agent and CLI usage is imported from the signed-in Cursor account.")
+	fmt.Fprintln(os.Stderr, "  Muse Code usage is imported automatically from ~/.local/share/muse/sessions.")
 }
 
 // loadSupportedPlatforms asks the leaderboard which platforms it understands.

@@ -11,7 +11,7 @@
  * versions where daily rows use `period` instead of `date`.
  */
 
-export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode' | 'cursor';
+export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode' | 'cursor' | 'muse';
 
 export interface DailyEntry {
   date: string;
@@ -96,6 +96,10 @@ export function detectPlatform(models: string[]): Platform {
     // names without a cursor-/composer- marker stay on their own platforms.
     if (lower.startsWith('cursor-') || lower.startsWith('cursor/')) return 'cursor';
     if (lower === 'composer' || lower.startsWith('composer-')) return 'cursor';
+    // Muse Code serves muse-spark models (e.g. "muse-spark-1.3-contributor").
+    // Check before the vendor checks so a Pi-fronted "pi-meta-muse-spark-…"
+    // name still resolves to the vendor that owns it.
+    if (lower.includes('muse')) return 'muse';
     if (kimiContains.some((part) => lower.includes(part))) return 'kimi';
     if (grokContains.some((part) => lower.includes(part))) return 'grok';
     if (glmContains.some((part) => lower.includes(part))) return 'glm';

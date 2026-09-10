@@ -1,7 +1,7 @@
 import { escapeHtml, formatCost, formatTokens, type User } from './utils';
 import { layout } from './html';
 
-const PLATFORM_ORDER = ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor'];
+const PLATFORM_ORDER = ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor', 'muse'];
 
 const PLATFORM_COLORS: Record<string, { hex: string; label: string }> = {
   claude: { hex: '#c084fc', label: 'Claude Code' },
@@ -12,6 +12,7 @@ const PLATFORM_COLORS: Record<string, { hex: string; label: string }> = {
   pi: { hex: '#2dd4bf', label: 'Pi' },
   opencode: { hex: '#fb923c', label: 'OpenCode' },
   cursor: { hex: '#818cf8', label: 'Cursor' },
+  muse: { hex: '#e879f9', label: 'Muse Code' },
 };
 
 const LINE_COLORS = ['#a78bfa', '#34d399', '#38bdf8', '#fbbf24'];

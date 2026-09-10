@@ -28,6 +28,7 @@ const PLATFORM_META = [
   { key: 'pi', label: 'Pi', shortLabel: 'Pi', dot: 'bg-teal-400', text: 'text-teal-300' },
   { key: 'opencode', label: 'OpenCode', shortLabel: 'OpenCode', dot: 'bg-orange-400', text: 'text-orange-300' },
   { key: 'cursor', label: 'Cursor', shortLabel: 'Cursor', dot: 'bg-indigo-400', text: 'text-indigo-300' },
+  { key: 'muse', label: 'Muse Code', shortLabel: 'Muse', dot: 'bg-fuchsia-400', text: 'text-fuchsia-300' },
 ] as const;
 
 export function layout(title: string, content: string, user: User | null = null, ogOverrides?: { image?: string; description?: string }): string {
@@ -707,8 +708,8 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
       </div>
 
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
-        <h2 class="text-sm font-semibold text-gray-200 mb-2">Using Kimi Code, Grok CLI, GLM, Pi, OpenCode or Cursor?</h2>
-        <p class="text-sm text-gray-400">ccusage does not read Grok, GLM, OpenCode, or Cursor, so the CLI imports those natively when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded">--upload-usage</code>:</p>
+        <h2 class="text-sm font-semibold text-gray-200 mb-2">Using Kimi Code, Grok CLI, GLM, Pi, OpenCode, Muse or Cursor?</h2>
+        <p class="text-sm text-gray-400">ccusage does not read Grok, GLM, OpenCode, Muse, or Cursor, so the CLI imports those natively when you use <code class="bg-gray-800 px-1.5 py-0.5 rounded">--upload-usage</code>:</p>
         <ul class="text-sm text-gray-400 mt-2 space-y-1">
           <li>&bull; <strong class="text-gray-300">Kimi Code</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi/sessions</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.kimi-code/sessions</code>, with migrated duplicates counted once</li>
           <li>&bull; <strong class="text-gray-300">Grok CLI</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.grok/sessions</code>, counting each completed turn once even after a rewind</li>
@@ -716,6 +717,7 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
           <li>&bull; <strong class="text-gray-300">Pi</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.pi/agent/sessions</code>, ranked on its own platform</li>
           <li>&bull; <strong class="text-gray-300">OpenCode</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.local/share/opencode/opencode.db</code>, read read-only from its session database</li>
           <li>&bull; <strong class="text-gray-300">Cursor</strong> &mdash; billed Agent and CLI usage from the signed-in Cursor account (not Tab autocomplete). Uploaded once per account so two machines do not double-count</li>
+          <li>&bull; <strong class="text-gray-300">Muse Code</strong> &mdash; <code class="bg-gray-800 px-1.5 py-0.5 rounded">~/.local/share/muse/sessions</code>, counting each completed model call once by its record id</li>
         </ul>
         <p class="text-sm text-gray-400 mt-3">A model Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Only aggregated usage is uploaded&mdash;never raw prompts or responses.</p>
       </div>

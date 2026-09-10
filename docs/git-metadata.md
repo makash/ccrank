@@ -23,7 +23,7 @@ Run:
 ./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN
 ```
 
-Usage upload is opt-in. Node.js is needed for the `ccusage` sources, but the native Kimi, Grok, and GLM imports do not require it:
+Usage upload is opt-in. Node.js is needed for the `ccusage` sources, but the native Kimi, Grok, GLM, and Muse imports do not require it:
 
 ```bash
 ./ccrank-git_darwin_arm64 --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
@@ -40,10 +40,11 @@ The usage upload combines `ccusage` output with local agent logs `ccusage` does 
 | `glm` | `~/.zcode/cli/rollout` (or `~/.zcode/rollout`) and GLM models run through Pi |
 | `opencode` | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode/opencode.db`), read read-only |
 | `cursor` | Signed-in Cursor account (IDE Agent + CLI billed usage). Tab autocomplete is not counted. Uploaded under the fixed source `cursor-cloud` with UTC days so two machines do not double-count |
+| `muse` | `~/.local/share/muse/sessions` (or `$XDG_DATA_HOME/muse/sessions`), main sessions plus nested subagent transcripts, each completed model call counted once by its record id |
 
 `ccusage` imports Pi and Kimi natively, so ccrank holds those agents out of the combined `claude` bucket to keep them from being counted twice.
 
-Before uploading, the CLI asks `GET /api/platforms` which platforms the leaderboard accepts and skips any it does not list. A leaderboard that predates a platform would otherwise reject the name, refile the rows as `claude` from their model names, and let the replacing upload overwrite your real combined totals — so deploy the Worker before rolling out the CLI. A model Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, and retried Z Code requests. Cursor usage is read from the Cursor dashboard using the local desktop login; the Cursor session token is never sent to ccrank. If Node is missing, install `mise` and verify:
+Before uploading, the CLI asks `GET /api/platforms` which platforms the leaderboard accepts and skips any it does not list. A leaderboard that predates a platform would otherwise reject the name, refile the rows as `claude` from their model names, and let the replacing upload overwrite your real combined totals — so deploy the Worker before rolling out the CLI. A model Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, retried Z Code requests, and re-read Muse session files (keyed by record id). Cursor usage is read from the Cursor dashboard using the local desktop login; the Cursor session token is never sent to ccrank. If Node is missing, install `mise` and verify:
 
 ```bash
 npx ccusage@latest daily --json --by-agent
@@ -129,6 +130,7 @@ Usage data with `--upload-usage`:
 - Daily Kimi Code token totals from `~/.kimi/sessions` and `~/.kimi-code/sessions` (native cost is recorded as unknown/zero)
 - Daily Grok token totals from `~/.grok/sessions` (Grok bills through a weekly credit plan, so native cost is recorded as zero)
 - Daily GLM token totals from `~/.zcode/cli/rollout` (Z Code logs carry no pricing, so cost is recorded as zero)
+- Daily Muse Code token totals from `~/.local/share/muse/sessions` (contributor-plan logs carry no pricing, so cost is recorded as zero)
 - Kimi, Grok, and GLM models run through Pi, added to those platforms and carrying the cost Pi recorded for them
 - Model breakdowns where available
 

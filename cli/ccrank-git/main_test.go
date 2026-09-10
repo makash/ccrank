@@ -953,6 +953,9 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 		{"", ""},                         // blank slice name
 		{"cursor", ""},                   // already held out
 		{"CURSOR", ""},                   // held out, case-insensitive
+		{"muse", ""},                     // already held out
+		{"Muse", ""},                     // held out, case-insensitive
+		{"muse-spark", platformMuse},     // future muse-* names must fail loud
 	}
 	for _, tc := range cases {
 		if got := unheldDedicatedAgent(tc.agent); got != tc.want {
