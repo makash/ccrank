@@ -7,3 +7,4 @@ dist/
 cli/ccrank-git/ccrank-git
 .DS_Store
 .claude/
+.wt/
