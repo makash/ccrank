@@ -651,10 +651,8 @@ func unheldDedicatedAgent(agent string) string {
 // Since every ccusage invocation requests --by-agent, accepting a row without
 // those slices could permanently double-count usage from dedicated platforms.
 // A date whose usage came entirely from those agents collapses to a zero row
-// rather than disappearing, so the date stays represented in the local
-// report. The server max-merges, so the zero row cannot lower an inflated
-// row written by an earlier ccrank version; that row keeps its historical
-// peak (see test/never-lower.test.mjs).
+// rather than disappearing, so an inflated row written by an earlier ccrank
+// version is overwritten instead of left ranked.
 func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) {
 	rebuilt := make([]map[string]any, 0, len(entries))
 	for index, entry := range entries {
@@ -1217,7 +1215,6 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	}
 
 	byDate := map[string]*piDailyUsage{}
-	seenRecords := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Pi can lock live session files; skip what we cannot read instead
@@ -1230,7 +1227,7 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		return readPiSession(path, byDate, seenRecords, platform)
+		return readPiSession(path, byDate, platform)
 	})
 	if err != nil {
 		return nil, err
@@ -1294,7 +1291,7 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	return entries, nil
 }
 
-func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map[string]bool, platform string) error {
+func readPiSession(path string, byDate map[string]*piDailyUsage, platform string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsPermission(err) {
@@ -1379,14 +1376,6 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map
 			continue
 		}
 
-		// A duplicated .jsonl file or a re-read record carries the same
-		// content twice; count it once.
-		fingerprint := piRecordFingerprint(date, modelName, &entry, usage, totalTokens)
-		if seenRecords[fingerprint] {
-			continue
-		}
-		seenRecords[fingerprint] = true
-
 		day := byDate[date]
 		if day == nil {
 			day = &piDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*piModelUsage{}}
@@ -1414,25 +1403,6 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map
 		modelUsage.Cost += usage.Cost.Total
 	}
 	return scanner.Err()
-}
-
-// piRecordFingerprint identifies a Pi usage record. Pi stamps session lines
-// with no stable record id (see piSessionLine), so fold on the normalized
-// content instead: the resolved date, the model the record counts toward,
-// every timestamp flavor the two session shapes carry, and the usage
-// buckets. That counts a duplicated .jsonl file or a re-read record once
-// for both main-session and subagent-transcript shapes. A path+offset key
-// (cf. grokEventFingerprint's fallback) cannot dedup here: every line owns
-// a unique offset within a single walk, so content is the only shared key.
-func piRecordFingerprint(date, modelName string, entry *piSessionLine, usage *piUsage, totalTokens float64) string {
-	var msgTs any
-	if entry.Message != nil {
-		msgTs = entry.Message.Timestamp
-	}
-	return fmt.Sprintf("%s|%s|%v|%v|%v|%g|%g|%g|%g|%g|%g",
-		date, modelName, entry.Timestamp, entry.Ts, msgTs,
-		usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite,
-		totalTokens, usage.Cost.Total)
 }
 
 func piSessionsPath() (string, error) {
@@ -1824,10 +1794,8 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 		// splits out Pi, which ccusage began importing natively and ccrank was
 		// merging on top of; version 4 splits out Codex, whose --by-agent
 		// slices ccrank used to fold into combined. Each split shrinks the
-		// combined bucket, so treat older maxima as empty once and re-offer
-		// every current row; rows higher than the server peak apply, and the
-		// lower corrected rows are silently discarded by the server's
-		// max-merge, which can never lower history (see test/never-lower.test.mjs).
+		// combined bucket, so treat older maxima as empty once and let the
+		// lower corrected rows overwrite it.
 		return maxima, nil
 	}
 

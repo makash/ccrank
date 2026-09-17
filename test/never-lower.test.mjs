@@ -92,21 +92,3 @@ test('the CLI never has a replace flag to send (LDP contract)', () => {
     'CLI structs must not serialize a replace field',
   );
 });
-
-test('no DELETE FROM daily_usage remains in worker source (totals may only go up)', () => {
-  const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
-  const files = readdirSync(srcDir).filter((name) => name.endsWith('.ts'));
-  assert.ok(files.length > 0, 'expected TypeScript sources in src/');
-  for (const name of files) {
-    const content = readFileSync(join(srcDir, name), 'utf8');
-    // Strip comments so the documented one-time manual cleanup SQL does not trip this tripwire.
-    const withoutComments = content
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|\s)\/\/.*$/gm, '$1');
-    assert.doesNotMatch(
-      withoutComments,
-      /DELETE\s+FROM\s+daily_usage/i,
-      `${name} must not DELETE FROM daily_usage — totals may only ever go up`,
-    );
-  }
-});

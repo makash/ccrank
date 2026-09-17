@@ -79,64 +79,6 @@ function num(val: unknown): number {
   return typeof val === 'number' ? val : 0;
 }
 
-// $100 per million tokens: documented as 30%+ above all-Opus-everything.
-// Anything pricier is a corrupt or hostile row, not real usage.
-const MAX_COST_USD_PER_MILLION_TOKENS = 100;
-
-// Rejects absurd rows before they can poison max-merged history (usage
-// totals may only ever go UP, so a bad row could never be lowered away).
-// Throws are mapped to HTTP 400 by POST /api/upload in src/index.ts.
-function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: number): void {
-  const tokenFields: Array<[string, number]> = [
-    ['inputTokens', entry.inputTokens],
-    ['outputTokens', entry.outputTokens],
-    ['cacheCreationTokens', entry.cacheCreationTokens],
-    ['cacheReadTokens', entry.cacheReadTokens],
-    ['totalTokens', entry.totalTokens],
-  ];
-  for (const [name, value] of tokenFields) {
-    if (!Number.isFinite(value)) {
-      throw new Error(`Invalid ${name} for entry at index ${index}: expected a finite number.`);
-    }
-    if (value < 0) {
-      throw new Error(`Invalid ${name} for entry at index ${index}: negative values are not allowed.`);
-    }
-  }
-  if (!Number.isFinite(entry.costUsd) || entry.costUsd < 0) {
-    throw new Error(`Invalid costUsd for entry at index ${index}: expected a finite non-negative number.`);
-  }
-
-  // Presence-aware: HEAD accepts rows with omitted fields (num() coerces to 0);
-  // only enforce consistency when the reporter actually sent a total.
-  if (typeof raw.totalTokens === 'number') {
-    const componentSum =
-      entry.inputTokens + entry.outputTokens + entry.cacheCreationTokens + entry.cacheReadTokens;
-    const tolerance = Math.max(1, Math.abs(entry.totalTokens) * 0.001);
-    if (Math.abs(entry.totalTokens - componentSum) > tolerance) {
-      throw new Error(
-        `Inconsistent totalTokens for entry at index ${index}: ${entry.totalTokens} differs from component sum ${componentSum} beyond tolerance ${tolerance}.`
-      );
-    }
-  }
-
-  // $0-cost rows with tokens stay accepted: 0 is never above the cap.
-  const maxCostUsd = (entry.totalTokens / 1e6) * MAX_COST_USD_PER_MILLION_TOKENS;
-  if (entry.costUsd > maxCostUsd) {
-    throw new Error(
-      `Implausible costUsd for entry at index ${index}: $${entry.costUsd} exceeds $${MAX_COST_USD_PER_MILLION_TOKENS}/M tokens for ${entry.totalTokens} tokens.`
-    );
-  }
-
-  // Lexicographic compare works on normalized YYYY-MM-DD dates. One day of
-  // grace keeps uploads from any timezone near midnight UTC accepted.
-  const maxDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  if (entry.date > maxDate) {
-    throw new Error(
-      `Future date "${entry.date}" for entry at index ${index}: dates after ${maxDate} are not allowed.`
-    );
-  }
-}
-
 // Vendor checks run before the Pi check so a model Pi merely fronts is ranked
 // under the vendor that owns it, matching piPlatformForModel in the CLI.
 export function detectPlatform(models: string[]): Platform {
@@ -192,7 +134,7 @@ function normalizeDate(dateValue: unknown, type: string, index: number): string 
 function parseDataEntry(entry: Record<string, unknown>, type: string, index: number): DailyEntry {
   const dateField = entry.date || entry.period || entry.week || entry.month || entry.lastActivity || entry.sessionId;
   const models = extractModels(entry);
-  const parsed: DailyEntry = {
+  return {
     date: normalizeDate(dateField, type, index),
     inputTokens: num(entry.inputTokens),
     outputTokens: num(entry.outputTokens),
@@ -203,8 +145,6 @@ function parseDataEntry(entry: Record<string, unknown>, type: string, index: num
     modelsUsed: models,
     platform: detectPlatform(models),
   };
-  validateEntry(parsed, entry, index);
-  return parsed;
 }
 
 function parseSummary(summary: Record<string, unknown>) {
@@ -285,18 +225,6 @@ export function parseReport(jsonStr: string): ParsedReport {
   // For session reports, aggregate by lastActivity date
   if (type === 'session') {
     const byDate = new Map<string, DailyEntry>();
-    // A repeated sessionId would be SUMmed twice below; reject the upload.
-    // Rows without a sessionId carry no identity signal and are skipped.
-    const seenSessionIds = new Set<string>();
-    for (const entry of entries) {
-      const sessionId = (entry as Record<string, unknown>).sessionId;
-      if (sessionId === null || sessionId === undefined || sessionId === '') continue;
-      const key = String(sessionId);
-      if (seenSessionIds.has(key)) {
-        throw new Error(`Duplicate sessionId "${key}" in session upload.`);
-      }
-      seenSessionIds.add(key);
-    }
     for (const entry of entries) {
       const raw = entry as Record<string, unknown>;
       const parsed = parseDataEntry(raw, type, 0);

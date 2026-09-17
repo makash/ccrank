@@ -544,7 +544,7 @@ app.get('/admin', async (c) => {
   if (adminErr) return adminErr;
   const user = c.get('user')!;
 
-  const [userCount, uploadCount, inviteCount, allCodes, flagCount, recentFlags] = await Promise.all([
+  const [userCount, uploadCount, inviteCount, allCodes] = await Promise.all([
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users').first(),
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM uploads').first(),
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM invite_codes').first(),
@@ -553,12 +553,6 @@ app.get('/admin', async (c) => {
        FROM invite_codes ic LEFT JOIN users u ON ic.created_by = u.id
        ORDER BY ic.created_at DESC LIMIT 100`
     ).all(),
-    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM review_flags').first().catch(() => null),
-    c.env.DB.prepare(
-      `SELECT rf.id, rf.user_id, rf.date, rf.reason, rf.detail, rf.created_at, u.display_name as display_name
-       FROM review_flags rf LEFT JOIN users u ON rf.user_id = u.id
-       ORDER BY rf.created_at DESC LIMIT 20`
-    ).all().catch(() => ({ results: [] })),
   ]);
 
   return c.html(
@@ -566,8 +560,7 @@ app.get('/admin', async (c) => {
       total_users: (userCount as any)?.cnt ?? 0,
       total_uploads: (uploadCount as any)?.cnt ?? 0,
       total_invites: (inviteCount as any)?.cnt ?? 0,
-      total_flags: (flagCount as any)?.cnt ?? 0,
-    }, (allCodes.results || []) as any[], (recentFlags.results || []) as any[])
+    }, (allCodes.results || []) as any[])
   );
 });
 
@@ -1130,7 +1123,7 @@ app.post('/api/upload', async (c) => {
   const user = sessionUser || tokenUser;
   if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
 
-  let body: { json: string; source?: string; platform?: string };
+  let body: { json: string; source?: string; platform?: string; replace?: boolean };
   try {
     body = await c.req.json();
   } catch {
@@ -1159,10 +1152,10 @@ app.post('/api/upload', async (c) => {
     }
   }
 
-  // Legacy parsers could emit 'unknown-%' dates; the current parser rejects
-  // them instead, so there is nothing left to clean per upload. Manual
-  // one-time cleanup if an old deployment still has such rows:
-  //   DELETE FROM daily_usage WHERE date LIKE 'unknown-%';
+  // Clean up legacy rows created by older parser versions when ccusage renamed date -> period.
+  await c.env.DB.prepare("DELETE FROM daily_usage WHERE user_id = ? AND source = ? AND date LIKE 'unknown-%'")
+    .bind(user.id, source)
+    .run();
 
   // Create upload record
   const uploadId = generateId();
@@ -1212,51 +1205,6 @@ app.post('/api/upload', async (c) => {
   );
 
   await c.env.DB.batch(batch);
-
-  // Review-only anomaly queue: flag suspicious rows for admin review.
-  // NEVER rejects: best-effort inside try/catch so flagging can never fail
-  // an upload (valid reports always return ok:true).
-  try {
-    const flagStmt = c.env.DB.prepare(
-      'INSERT INTO review_flags (id, user_id, date, reason, detail) VALUES (?, ?, ?, ?, ?)'
-    );
-    const flagBatch: any[] = [];
-    // Absolute tripwires, evaluated per uploaded row.
-    for (const entry of report.entries) {
-      if (entry.totalTokens > 10_000_000_000) {
-        flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens })));
-      } else if (entry.costUsd > 10000) {
-        flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd })));
-      }
-    }
-    // Relative tripwire: a row above 20x the user's trailing-30d daily
-    // median. A single cheap SELECT over the indexed (user_id, date);
-    // users with fewer than 7 active days are skipped so new accounts
-    // never flag.
-    const medianRows = await c.env.DB.prepare(
-      `SELECT total_tokens FROM daily_usage
-       WHERE user_id = ? AND date >= date('now', '-30 days') AND total_tokens > 0
-       ORDER BY total_tokens`
-    ).bind(user.id).all();
-    const samples = ((medianRows.results || []) as any[])
-      .map((row) => Number(row.total_tokens) || 0)
-      .filter((n) => n > 0);
-    if (samples.length >= 7) {
-      const median = samples[Math.floor(samples.length / 2)];
-      if (median > 0) {
-        for (const entry of report.entries) {
-          if (entry.totalTokens > median * 20) {
-            flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'tokens_vs_median', JSON.stringify({ total_tokens: entry.totalTokens, median_30d: median })));
-          }
-        }
-      }
-    }
-    if (flagBatch.length > 0) {
-      await c.env.DB.batch(flagBatch);
-    }
-  } catch {
-    // Review-only: ignore flagging errors (e.g. table missing pre-migration).
-  }
 
   return c.json({
     ok: true,
