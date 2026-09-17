@@ -128,3 +128,24 @@ test('0010_daily_usage_audit.sql exists and is wired into db:migrate', () => {
     );
   }
 });
+
+test('every referenced migration file exists on disk with no repeats per chain', () => {
+  // Reverse direction of the wiring test above: a --file= reference to a
+  // missing migration breaks the chain, and a repeated reference would
+  // apply one migration twice on fresh DBs.
+  const onDisk = new Set(migrationFiles);
+  const allRefs = referencedMigrations([...migrateKeys, ...seedKeys]);
+  for (const [key, files] of allRefs) {
+    for (const file of files) {
+      assert.ok(
+        onDisk.has(file),
+        `scripts["${key}"] references ${file} but it does not exist in migrations/`,
+      );
+    }
+    assert.deepStrictEqual(
+      [...new Set(files)],
+      files,
+      `scripts["${key}"] references a migration more than once`,
+    );
+  }
+});

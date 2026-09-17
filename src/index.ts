@@ -544,6 +544,32 @@ app.get('/admin', async (c) => {
   if (adminErr) return adminErr;
   const user = c.get('user')!;
 
+  // Pre-migration cover must be sync-throw-safe: a synchronously throwing
+  // prepare() (missing review_flags table) would blow up the Promise.all
+  // input array before .catch ever attaches. These wrappers convert sync
+  // throws into the same null/empty fallbacks as async rejections.
+  // ORDER BY id tiebreak: created_at is second-resolution; id is random
+  // text, so same-second rows get a stable-but-arbitrary order.
+  const safeFlagCount = (async () => {
+    try {
+      return await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM review_flags WHERE COALESCE(status, 'open') = 'open'").first();
+    } catch {
+      return null;
+    }
+  })();
+  const safeRecentFlags = (async () => {
+    try {
+      return await c.env.DB.prepare(
+        `SELECT rf.id, rf.user_id, rf.date, rf.reason, rf.detail, rf.created_at, u.display_name as display_name
+         FROM review_flags rf LEFT JOIN users u ON rf.user_id = u.id
+         WHERE COALESCE(rf.status, 'open') = 'open'
+         ORDER BY rf.created_at DESC, rf.id LIMIT 20`
+      ).all();
+    } catch {
+      return { results: [] };
+    }
+  })();
+
   const [userCount, uploadCount, inviteCount, allCodes, flagCount, recentFlags] = await Promise.all([
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users').first(),
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM uploads').first(),
@@ -553,12 +579,8 @@ app.get('/admin', async (c) => {
        FROM invite_codes ic LEFT JOIN users u ON ic.created_by = u.id
        ORDER BY ic.created_at DESC LIMIT 100`
     ).all(),
-    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM review_flags').first().catch(() => null),
-    c.env.DB.prepare(
-      `SELECT rf.id, rf.user_id, rf.date, rf.reason, rf.detail, rf.created_at, u.display_name as display_name
-       FROM review_flags rf LEFT JOIN users u ON rf.user_id = u.id
-       ORDER BY rf.created_at DESC LIMIT 20`
-    ).all().catch(() => ({ results: [] })),
+    safeFlagCount,
+    safeRecentFlags,
   ]);
 
   return c.html(
@@ -1228,14 +1250,23 @@ app.post('/api/upload', async (c) => {
   let preUpsertMedian: number | null = null;
   try {
     const medianRows = await c.env.DB.prepare(
-      `SELECT total_tokens FROM daily_usage
+      `SELECT date, total_tokens FROM daily_usage
        WHERE user_id = ? AND date >= date('now', '-30 days') AND total_tokens > 0
        ORDER BY total_tokens`
     ).bind(user.id).all();
-    const samples = ((medianRows.results || []) as any[])
+    const medianHistory = ((medianRows.results || []) as any[]);
+    const samples = medianHistory
       .map((row) => Number(row.total_tokens) || 0)
       .filter((n) => n > 0);
-    if (samples.length >= 7) {
+    // Gate on distinct active days, not rows: one date can hold several rows
+    // (source x platform). Rows without a date each count as their own day
+    // (defensive; production rows always carry a date).
+    const distinctDays = new Set(
+      medianHistory
+        .filter((row) => (Number(row.total_tokens) || 0) > 0)
+        .map((row, i) => (typeof row.date === 'string' && row.date ? row.date : `\0row${i}`))
+    ).size;
+    if (distinctDays >= 7) {
       const median = samples[Math.floor(samples.length / 2)];
       if (median > 0) {
         preUpsertMedian = median;
@@ -1269,11 +1300,13 @@ app.post('/api/upload', async (c) => {
       seenFlags.add(key);
       flagBatch.push(flagStmt.bind(generateId(), user.id, date, reason, detail));
     };
-    // Absolute tripwires, evaluated per uploaded row.
+    // Absolute tripwires, evaluated per uploaded row. Independent ifs: one
+    // row can trip both, yielding one flag per reason.
     for (const entry of report.entries) {
       if (entry.totalTokens > 10_000_000_000) {
         queueFlag(entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens }));
-      } else if (entry.costUsd > 10000) {
+      }
+      if (entry.costUsd > 10000) {
         queueFlag(entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd }));
       }
     }
@@ -1678,6 +1711,26 @@ app.post('/api/admin/invites', async (c) => {
 
   await c.env.DB.batch(stmts);
   return c.json({ ok: true, codes });
+});
+
+app.post('/api/admin/flags/:id/dismiss', async (c) => {
+  const user = c.get('user');
+  if (!user || !user.is_admin) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT id FROM review_flags WHERE id = ?').bind(id).first();
+  if (!row) return c.json({ ok: false, error: 'Not found' }, 404);
+
+  // Dismiss is mute-forever per (date, reason): the upload flag insert is
+  // INSERT OR IGNORE on UNIQUE(user_id, date, reason), so a later upload
+  // re-tripping the same (date, reason) inserts nothing — the flag stays
+  // 'dismissed' with its ORIGINAL detail and never re-opens. Pinned by the
+  // mute-forever test in test/flag-dismiss.test.mjs. Re-open-on-retrip
+  // (an upsert clause resetting status to 'open') is a deliberate future
+  // product decision, not a silent follow-up.
+  // Review-only: dismiss flips the flag status and never touches daily_usage.
+  await c.env.DB.prepare("UPDATE review_flags SET status = 'dismissed' WHERE id = ?").bind(id).run();
+  return c.json({ ok: true });
 });
 
 // ─── 404 ────────────────────────────────────────────────────────────────────────

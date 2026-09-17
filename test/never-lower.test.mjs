@@ -13,7 +13,7 @@
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -93,20 +93,60 @@ test('the CLI never has a replace flag to send (LDP contract)', () => {
   );
 });
 
+// Shared DELETE tripwire matcher. Scoped to src/ ONLY:
+// migrations/0012_unknown_date_cleanup.sql legitimately contains a one-time
+// DELETE FROM daily_usage, so extending this matcher to migrations/*.sql
+// as-is would false-positive on a sanctioned cleanup.
+const DELETE_FROM_DAILY_USAGE = /DELETE\s+FROM\s+daily_usage/i;
+
+function stripComments(content) {
+  // Strip comments so documented one-time manual cleanup SQL does not trip
+  // this tripwire; only live statements are matched.
+  return content
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|\s)\/\/.*$/gm, '$1');
+}
+
+// Recursive walk so a DELETE hiding in a future src/ subdirectory cannot
+// dodge the tripwire that a flat readdirSync would miss.
+function collectTsFiles(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...collectTsFiles(full));
+    else if (entry.isFile() && entry.name.endsWith('.ts')) out.push(full);
+  }
+  return out;
+}
+
 test('no DELETE FROM daily_usage remains in worker source (totals may only go up)', () => {
   const srcDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src');
-  const files = readdirSync(srcDir).filter((name) => name.endsWith('.ts'));
+  const files = collectTsFiles(srcDir);
   assert.ok(files.length > 0, 'expected TypeScript sources in src/');
-  for (const name of files) {
-    const content = readFileSync(join(srcDir, name), 'utf8');
-    // Strip comments so the documented one-time manual cleanup SQL does not trip this tripwire.
-    const withoutComments = content
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|\s)\/\/.*$/gm, '$1');
+  for (const file of files) {
+    const content = readFileSync(file, 'utf8');
     assert.doesNotMatch(
-      withoutComments,
-      /DELETE\s+FROM\s+daily_usage/i,
-      `${name} must not DELETE FROM daily_usage — totals may only ever go up`,
+      stripComments(content),
+      DELETE_FROM_DAILY_USAGE,
+      `${relative(srcDir, file)} must not DELETE FROM daily_usage — totals may only ever go up`,
     );
   }
+});
+
+test('positive control: the DELETE matcher fires on a planted snippet', () => {
+  assert.match(
+    stripComments("await env.DB.prepare('DELETE FROM daily_usage WHERE date = ?').run()"),
+    DELETE_FROM_DAILY_USAGE,
+    'matcher must fire on a live DELETE FROM daily_usage statement',
+  );
+  assert.match(
+    stripComments('delete  from\ndaily_usage'),
+    DELETE_FROM_DAILY_USAGE,
+    'matcher must fire regardless of case and whitespace',
+  );
+  assert.doesNotMatch(
+    stripComments("// one-time manual cleanup:\n// DELETE FROM daily_usage WHERE date LIKE 'unknown-%';"),
+    DELETE_FROM_DAILY_USAGE,
+    'matcher must ignore DELETEs inside comments',
+  );
 });

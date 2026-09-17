@@ -1217,6 +1217,10 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	}
 
 	byDate := map[string]*piDailyUsage{}
+	// ponytail: seenRecords is an unbounded in-memory fingerprint set
+	// (~150-200B/key). Fine at current session counts. Signal: multi-GB
+	// RSS or 1M+ sessions. Next rung: an mtime-window bound or [16]byte
+	// hash keys.
 	seenRecords := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -1419,20 +1423,29 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map
 // piRecordFingerprint identifies a Pi usage record. Pi stamps session lines
 // with no stable record id (see piSessionLine), so fold on the normalized
 // content instead: the resolved date, the model the record counts toward,
-// every timestamp flavor the two session shapes carry, and the usage
-// buckets. That counts a duplicated .jsonl file or a re-read record once
-// for both main-session and subagent-transcript shapes. A path+offset key
-// (cf. grokEventFingerprint's fallback) cannot dedup here: every line owns
-// a unique offset within a single walk, so content is the only shared key.
+// the raw record-shape fields, every timestamp flavor the two session
+// shapes carry, and the usage buckets. That counts a duplicated .jsonl file
+// or a re-read record once for both main-session and subagent-transcript
+// shapes. A path+offset key (cf. grokEventFingerprint's fallback in
+// grok_usage.go) cannot dedup here: every line owns a unique offset within
+// a single walk, so content is the only shared key.
 func piRecordFingerprint(date, modelName string, entry *piSessionLine, usage *piUsage, totalTokens float64) string {
 	var msgTs any
 	if entry.Message != nil {
 		msgTs = entry.Message.Timestamp
 	}
-	return fmt.Sprintf("%s|%s|%v|%v|%v|%g|%g|%g|%g|%g|%g",
-		date, modelName, entry.Timestamp, entry.Ts, msgTs,
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%g|%g|%g|%g|%g|%g",
+		date, modelName, entry.Type, entry.RecordType, entry.Provider, entry.Model, entry.ModelID,
+		piFingerprintTs(entry.Timestamp), piFingerprintTs(entry.Ts), piFingerprintTs(msgTs),
 		usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite,
 		totalTokens, usage.Cost.Total)
+}
+
+// piFingerprintTs formats an untyped timestamp for the fingerprint. The %T
+// prefix keeps distinct representations (string vs numeric vs nil) from
+// collapsing to the same text, while identical values stay deterministic.
+func piFingerprintTs(raw any) string {
+	return fmt.Sprintf("%T:%v", raw, raw)
 }
 
 func piSessionsPath() (string, error) {

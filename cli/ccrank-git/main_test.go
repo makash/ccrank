@@ -1429,3 +1429,194 @@ func TestPiDedupKeepsDistinctRecords(t *testing.T) {
 		t.Fatalf("messages = %v, want 2", got)
 	}
 }
+
+func TestPiSameSecondIdenticalUsageCountsTwice(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Same second, same usage, differing only in the numeric ts flavor:
+	// two distinct records, so both count (safe direction: totals only
+	// ever go up).
+	day := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	tsBase := float64(day.UnixMilli())
+	usage := func() map[string]any {
+		return map[string]any{
+			"input": 50, "output": 5, "totalTokens": 55,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z", "ts": tsBase,
+			"message": map[string]any{"usage": usage()},
+		},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z", "ts": tsBase + 500,
+			"message": map[string]any{"usage": usage()},
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 110 {
+		t.Fatalf("totalTokens = %v, want 110 (same-second records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiFixedTimestampsOneBucketDifferentCountsTwice(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Identical timestamps in every flavor, one usage bucket different:
+	// distinct records, so both count.
+	usage := func(input float64) map[string]any {
+		return map[string]any{
+			"input": input, "output": 5, "totalTokens": input + 5,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": usage(50)},
+		},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": usage(60)},
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 120 {
+		t.Fatalf("totalTokens = %v, want 120 (one-bucket-different records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiDedupDistinguishesRawRecordShape(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Same date, model, timestamps, and usage, differing only in the raw
+	// record-shape field (type vs recordType): distinct lines, both count.
+	usage := func() map[string]any {
+		return map[string]any{
+			"input": 50, "output": 5, "totalTokens": 55,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	message := func() map[string]any {
+		return map[string]any{
+			"provider": "anthropic", "model": "claude-sonnet",
+			"timestamp": "2026-08-12T10:00:00Z", "usage": usage(),
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": message(),
+		},
+		{
+			"recordType": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": message(),
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 110 {
+		t.Fatalf("totalTokens = %v, want 110 (raw-shape-different records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiRecordFingerprintCoversRawFieldsAndTimestampReps(t *testing.T) {
+	newEntry := func() (*piSessionLine, *piUsage) {
+		usage := &piUsage{Input: 50, Output: 5, TotalTokens: 55, Cost: piUsageCost{Total: 0.1}}
+		entry := &piSessionLine{
+			Type: "message", Timestamp: "2026-08-12T10:00:00Z",
+			Provider: "anthropic", ModelID: "claude-sonnet",
+			Message: &piMessage{
+				Timestamp: "2026-08-12T10:00:00Z",
+				Provider:  "anthropic", Model: "claude-sonnet", Usage: usage,
+			},
+		}
+		return entry, usage
+	}
+	entry, usage := newEntry()
+	base := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", entry, usage, 55)
+
+	// Identical values stay deterministic.
+	again, againUsage := newEntry()
+	if got := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", again, againUsage, 55); got != base {
+		t.Fatal("identical records must produce identical fingerprints")
+	}
+
+	// Every raw record-shape field participates in the fingerprint.
+	mutations := []struct {
+		name   string
+		mutate func(*piSessionLine)
+	}{
+		{"Type", func(e *piSessionLine) { e.Type = "message2" }},
+		{"RecordType", func(e *piSessionLine) { e.RecordType = "message" }},
+		{"Provider", func(e *piSessionLine) { e.Provider = "other" }},
+		{"Model", func(e *piSessionLine) { e.Model = "other" }},
+		{"ModelID", func(e *piSessionLine) { e.ModelID = "other" }},
+	}
+	for _, m := range mutations {
+		mutated, mutatedUsage := newEntry()
+		m.mutate(mutated)
+		if got := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", mutated, mutatedUsage, 55); got == base {
+			t.Fatalf("mutating %s must change the fingerprint", m.name)
+		}
+	}
+
+	// Same instant in different Go representations must not collapse to
+	// the same text: %v alone formats string "5" and float64 5 identically.
+	str, strUsage := newEntry()
+	str.Ts = "5"
+	num, numUsage := newEntry()
+	num.Ts = float64(5)
+	if piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", str, strUsage, 55) ==
+		piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", num, numUsage, 55) {
+		t.Fatal("string and numeric timestamp reps must produce distinct fingerprints")
+	}
+}

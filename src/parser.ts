@@ -81,12 +81,14 @@ function num(val: unknown): number {
 
 // $100 per million tokens: documented as 30%+ above all-Opus-everything.
 // Anything pricier is a corrupt or hostile row, not real usage.
+// ponytail: ceiling $100/M tokens. Signal this cap is wrong = legit costUsd
+// 400s on real vendor bills. Next rung if it fires = per-platform caps.
 const MAX_COST_USD_PER_MILLION_TOKENS = 100;
 
 // Rejects absurd rows before they can poison max-merged history (usage
 // totals may only ever go UP, so a bad row could never be lowered away).
 // Throws are mapped to HTTP 400 by POST /api/upload in src/index.ts.
-function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: number): void {
+function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: number, maxDate: string): void {
   const tokenFields: Array<[string, number]> = [
     ['inputTokens', entry.inputTokens],
     ['outputTokens', entry.outputTokens],
@@ -108,6 +110,11 @@ function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: n
 
   // Presence-aware: HEAD accepts rows with omitted fields (num() coerces to 0);
   // only enforce consistency when the reporter actually sent a total.
+  // Total-only rows (total present, components omitted) intentionally still
+  // 400 here: an uncorroborated total cannot ground max-merged history, and
+  // skipping the check on omitted components would let any hostile row dodge
+  // it by omission. A reject is recoverable (re-upload full rows); a poisoned
+  // total under never-lower is not. Pinned by the S2 test.
   if (typeof raw.totalTokens === 'number') {
     const componentSum =
       entry.inputTokens + entry.outputTokens + entry.cacheCreationTokens + entry.cacheReadTokens;
@@ -129,7 +136,7 @@ function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: n
 
   // Lexicographic compare works on normalized YYYY-MM-DD dates. One day of
   // grace keeps uploads from any timezone near midnight UTC accepted.
-  const maxDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  // maxDate is computed once per parseReport call and threaded through.
   if (entry.date > maxDate) {
     throw new Error(
       `Future date "${entry.date}" for entry at index ${index}: dates after ${maxDate} are not allowed.`
@@ -189,7 +196,7 @@ function normalizeDate(dateValue: unknown, type: string, index: number): string 
   throw new Error(`Invalid date/period "${dateStr}" for ${type} entry at index ${index}.`);
 }
 
-function parseDataEntry(entry: Record<string, unknown>, type: string, index: number): DailyEntry {
+function parseDataEntry(entry: Record<string, unknown>, type: string, index: number, maxDate: string): DailyEntry {
   const dateField = entry.date || entry.period || entry.week || entry.month || entry.lastActivity || entry.sessionId;
   const models = extractModels(entry);
   const parsed: DailyEntry = {
@@ -203,7 +210,7 @@ function parseDataEntry(entry: Record<string, unknown>, type: string, index: num
     modelsUsed: models,
     platform: detectPlatform(models),
   };
-  validateEntry(parsed, entry, index);
+  validateEntry(parsed, entry, index, maxDate);
   return parsed;
 }
 
@@ -264,7 +271,10 @@ export function parseReport(jsonStr: string): ParsedReport {
   }
 
   // Parse each entry
-  const parsedEntries = entries.map((entry, i) => parseDataEntry(entry, type, i));
+  // Future-date ceiling (today+1d UTC grace), computed once per upload so
+  // every row is judged against the same cutoff.
+  const maxDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const parsedEntries = entries.map((entry, i) => parseDataEntry(entry, type, i, maxDate));
 
   // Parse summary if present, otherwise compute from entries
   let summary: ParsedReport['summary'];
@@ -287,10 +297,12 @@ export function parseReport(jsonStr: string): ParsedReport {
     const byDate = new Map<string, DailyEntry>();
     // A repeated sessionId would be SUMmed twice below; reject the upload.
     // Rows without a sessionId carry no identity signal and are skipped.
+    // Anon (null/empty) sessionId skip is an honest-client guard, not an abuse boundary.
     const seenSessionIds = new Set<string>();
     for (const entry of entries) {
       const sessionId = (entry as Record<string, unknown>).sessionId;
       if (sessionId === null || sessionId === undefined || sessionId === '') continue;
+      // String() folds 1/'1' to one key; the collision errs toward duplicate-reject (fail-closed), never double-SUM.
       const key = String(sessionId);
       if (seenSessionIds.has(key)) {
         throw new Error(`Duplicate sessionId "${key}" in session upload.`);
@@ -298,12 +310,14 @@ export function parseReport(jsonStr: string): ParsedReport {
       seenSessionIds.add(key);
     }
     // H1: lastActivity overwrites the validated date below, so it must pass
-    // the same future-date rule (lexicographic YYYY-MM-DD, one-day grace).
-    const maxDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    for (const entry of entries) {
-      const raw = entry as Record<string, unknown>;
-      const parsed = parseDataEntry(raw, type, 0);
-      const lastActivity = raw.lastActivity ? normalizeDate(raw.lastActivity, type, 0) : parsed.date;
+    // the same future-date rule (lexicographic YYYY-MM-DD, one-day grace),
+    // reusing the per-upload maxDate computed above.
+    // Single validation pass: reuse parsedEntries[i] (already validated with
+    // the real index above) instead of re-parsing every row at index 0.
+    for (let i = 0; i < entries.length; i++) {
+      const raw = entries[i] as Record<string, unknown>;
+      const parsed = parsedEntries[i];
+      const lastActivity = raw.lastActivity ? normalizeDate(raw.lastActivity, type, i) : parsed.date;
       if (lastActivity > maxDate) {
         throw new Error(`Future date "${lastActivity}" in session upload: dates after ${maxDate} are not allowed.`);
       }

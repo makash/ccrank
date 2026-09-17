@@ -293,7 +293,7 @@ test('exactly 7 active days runs the median check', async () => {
   assert.equal(flags[0].bindings[3], 'tokens_vs_median');
 });
 
-test('a row hitting both absolute tripwires yields one tokens_absolute flag', async () => {
+test('a row hitting both absolute tripwires yields both flags', async () => {
   const { db, batches } = createUploadDatabase();
   const res = await upload(db, dailyReport([{ totalTokens: 11_000_000_000, totalCost: 15000 }]));
   const body = await res.json();
@@ -302,8 +302,12 @@ test('a row hitting both absolute tripwires yields one tokens_absolute flag', as
   assert.equal(body.ok, true);
   const flags = flagBatch(batches);
   assert.ok(flags, 'expected a review_flags batch');
-  assert.equal(flags.length, 1);
-  assert.equal(flags[0].bindings[3], 'tokens_absolute');
+  assert.equal(flags.length, 2);
+  const reasons = flags.map((f) => f.bindings[3]).sort();
+  assert.deepEqual(reasons, ['cost_absolute', 'tokens_absolute']);
+  const byReason = Object.fromEntries(flags.map((f) => [f.bindings[3], f.bindings[4]]));
+  assert.match(byReason.tokens_absolute, /11000000000/);
+  assert.match(byReason.cost_absolute, /15000/);
 });
 
 test('adminPage surfaces flag count and recent rows', () => {
@@ -882,4 +886,106 @@ test('H7: flagging failure warns observably but still returns 200', async () => 
   } finally {
     console.warn = origWarn;
   }
+});
+
+// S1: the median gate counts distinct active days, not rows. 8 history rows
+// spread over only 2 dates must NOT arm the 20x tripwire, even for a 25x row.
+test('median gate needs 7 distinct days: 8 rows over 2 dates do not flag', async () => {
+  const datedMedianRows = [
+    ...Array.from({ length: 4 }, () => ({ date: '2026-08-01', total_tokens: 1_000_000 })),
+    ...Array.from({ length: 4 }, () => ({ date: '2026-08-02', total_tokens: 1_000_000 })),
+  ];
+  const batches = [];
+  const db = {
+    prepare(sql) {
+      const exec = {
+        async first() {
+          if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+          if (/FROM users/.test(sql)) return normalUser;
+          return null;
+        },
+        async all() {
+          if (/ORDER BY total_tokens/.test(sql)) return { results: datedMedianRows };
+          return { results: [] };
+        },
+        async run() {
+          return { success: true };
+        },
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        ...exec,
+        bind(...bindings) {
+          return { sql, bindings, ...exec };
+        },
+      };
+      return statement;
+    },
+    async batch(batch) {
+      batches.push(batch);
+      return batch.map(() => ({ success: true }));
+    },
+  };
+  // 25M is 25x the 1M row-median: it would flag if the gate counted rows.
+  const res = await upload(db, dailyReport([{ totalTokens: 25_000_000, totalCost: 50 }]));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(flagBatch(batches), null);
+  assert.equal(batches.length, 1);
+});
+
+// S18: pre-migration cover must survive a SYNCHRONOUSLY throwing prepare()
+// (missing review_flags table), not just async rejections.
+test('GET /admin survives a synchronously throwing review_flags prepare', async () => {
+  const token = await auth.createSessionToken(
+    { userId: 'admin-1', email: 'admin@example.com' },
+    SESSION_SECRET
+  );
+  const adminUser = {
+    ...normalUser,
+    id: 'admin-1',
+    email: 'admin@example.com',
+    display_name: 'Admin',
+    is_admin: 1,
+  };
+  const db = {
+    prepare(sql) {
+      if (/review_flags/.test(sql)) throw new Error('no such table: review_flags');
+      const exec = {
+        async first() {
+          if (/COUNT\(\*\)/.test(sql)) return { cnt: 7 };
+          if (/FROM users/.test(sql)) return adminUser;
+          return null;
+        },
+        async all() {
+          return { results: [] };
+        },
+        async run() {
+          return { success: true };
+        },
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        ...exec,
+        bind(...bindings) {
+          return { sql, bindings, ...exec };
+        },
+      };
+      return statement;
+    },
+  };
+
+  const res = await app.default.request(
+    'https://ccrank.dev/admin',
+    { headers: { Cookie: `session=${token}` } },
+    { DB: db, SESSION_SECRET }
+  );
+
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.match(page, /No anomalies flagged/);
 });

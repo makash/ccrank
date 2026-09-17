@@ -393,3 +393,226 @@ test('H1: session lastActivity in the future is rejected', () => {
   }));
   assert.equal(ok.entries[0].date, '2026-08-11');
 });
+
+test('S5a: session validation errors report the real entry index', () => {
+  // Negative tokens in the SECOND row must cite index 1, not index 0.
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'session',
+      sessions: [
+        sessionEntry({ sessionId: 'ok-1', lastActivity: '2026-08-12' }),
+        sessionEntry({ sessionId: 'bad-1', lastActivity: '2026-08-12', inputTokens: -5 }),
+      ],
+    })),
+    /index 1/,
+  );
+  // A bad lastActivity overwrite on the THIRD row must cite index 2 (the
+  // session branch used to re-validate every row at index 0).
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'session',
+      sessions: [
+        sessionEntry({ sessionId: 'ok-1', lastActivity: '2026-08-12' }),
+        sessionEntry({ sessionId: 'ok-2', lastActivity: '2026-08-12' }),
+        sessionEntry({ sessionId: 'bad-2', date: '2026-08-12', lastActivity: 'not-a-date' }),
+      ],
+    })),
+    /index 2/,
+  );
+});
+
+test('S5b: session single pass preserves summary fallback and platform detection', () => {
+  // No summary key: the fallback sums the single-pass rows, same-date rows
+  // still aggregate, and platform still derives from the merged models.
+  const report = parser.parseReport(JSON.stringify({
+    type: 'session',
+    sessions: [
+      sessionEntry({
+        sessionId: 's1', lastActivity: '2026-08-12',
+        inputTokens: 100, outputTokens: 20, cacheCreationTokens: 10,
+        cacheReadTokens: 300, totalTokens: 430, totalCost: 0.01,
+        modelsUsed: ['gpt-4o'],
+      }),
+      sessionEntry({
+        sessionId: 's2', lastActivity: '2026-08-12',
+        inputTokens: 200, outputTokens: 40, cacheCreationTokens: 20,
+        cacheReadTokens: 600, totalTokens: 860, totalCost: 0.02,
+        modelsUsed: ['claude-opus-4-6'],
+      }),
+    ],
+  }));
+  assert.equal(report.entries.length, 1);
+  assert.equal(report.entries[0].date, '2026-08-12');
+  assert.equal(report.entries[0].totalTokens, 1290);
+  assert.equal(report.summary.totalTokens, 1290);
+  assert.equal(report.summary.totalInputTokens, 300);
+  // gpt-4o sorts first, so the merged row (and report) detect as codex.
+  assert.equal(report.entries[0].platform, 'codex');
+  assert.equal(report.platform, 'codex');
+  assert.deepEqual([...report.entries[0].modelsUsed].sort(), ['claude-opus-4-6', 'gpt-4o']);
+  // An explicit summary still wins over the computed fallback.
+  const withSummary = parser.parseReport(JSON.stringify({
+    type: 'session',
+    summary: {
+      totalInputTokens: 1, totalOutputTokens: 2, totalCacheCreationTokens: 3,
+      totalCacheReadTokens: 4, totalTokens: 10, totalCost: 0.5,
+    },
+    sessions: [sessionEntry({ sessionId: 's1', lastActivity: '2026-08-12' })],
+  }));
+  assert.equal(withSummary.summary.totalTokens, 10);
+});
+
+test('S17 pin: mixed valid+invalid session upload fails closed with zero daily_usage writes', async () => {
+  // PIN of current fail-closed behavior: one bad row rejects the WHOLE
+  // upload (400) and no daily_usage statement may execute. Do NOT implement
+  // skip-and-200 here; that is a separate product decision.
+  const user = {
+    id: 'user-1',
+    google_id: 'google-1',
+    email: 'parsetest@example.com',
+    display_name: 'Parse Test',
+    avatar_url: null,
+    is_admin: 0,
+    invites_remaining: 0,
+    sharing_enabled: 1,
+    git_sharing_enabled: 1,
+    share_slug: 'parse-test',
+    fav_tools: '[]',
+  };
+  const seenSql = [];
+  let batchCalls = 0;
+  const db = {
+    prepare(sql) {
+      seenSql.push(sql);
+      const statement = {
+        sql,
+        bindings: [],
+        bind(...bindings) {
+          this.bindings = bindings;
+          return this;
+        },
+        async first() {
+          if (sql.includes('FROM api_tokens')) return { id: 'token-1', user_id: user.id };
+          if (sql.includes('FROM users')) return user;
+          return null;
+        },
+        async run() {
+          return { success: true };
+        },
+        async all() {
+          return { results: [] };
+        },
+      };
+      return statement;
+    },
+    async batch(statements) {
+      batchCalls += 1;
+      return statements.map(() => ({ success: true }));
+    },
+  };
+
+  const res = await app.default.request(
+    'https://ccrank.dev/api/upload',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer [REDACTED]' },
+      body: JSON.stringify({
+        json: JSON.stringify({
+          type: 'session',
+          sessions: [
+            sessionEntry({ sessionId: 'good', lastActivity: '2026-08-12' }),
+            sessionEntry({ sessionId: 'bad', lastActivity: '2026-08-12', inputTokens: -5 }),
+          ],
+        }),
+        source: 'secrig',
+      }),
+    },
+    { DB: db },
+  );
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).ok, false);
+  assert.equal(seenSql.filter((sql) => sql.includes('daily_usage')).length, 0);
+  assert.equal(batchCalls, 0);
+});
+
+test('S2: total-only rows 400 against the zeroed component sum (pinned)', () => {
+  // Documented choice: a total no components corroborate cannot ground
+  // max-merged history, and skipping the check on omitted components would
+  // let any row dodge it by omission. Re-upload with full rows recovers.
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'daily',
+      daily: [{ date: '2026-08-12', totalTokens: 430, totalCost: 0.01 }],
+    })),
+    /totalTokens/,
+  );
+  // The $0 variant 400s too: it is the consistency check rejecting, not the cost cap.
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'daily',
+      daily: [{ date: '2026-08-12', totalTokens: 430, totalCost: 0 }],
+    })),
+    /totalTokens/,
+  );
+});
+
+test('S3: omitted total with nonzero cost 400s via the zero-token cap (pinned)', () => {
+  // A missing total coerces to 0 tokens, so any nonzero cost exceeds the cap.
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'daily',
+      daily: [dailyEntry({ totalTokens: undefined, totalCost: 0.01 })],
+    })),
+    /for 0 tokens/,
+  );
+});
+
+test('S3: omitted total with $0 cost persists total 0 (pinned, not defaulted)', () => {
+  // Defaulting a missing total to the component sum would break the
+  // 'accepts rows omitting totalTokens' pin (total 0); pin as-is instead.
+  const report = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [dailyEntry({
+      inputTokens: 500_000,
+      outputTokens: 500_000,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalTokens: undefined,
+      totalCost: 0,
+    })],
+  }));
+  assert.equal(report.entries[0].totalTokens, 0);
+  assert.equal(report.entries[0].inputTokens, 500_000);
+  assert.equal(report.entries[0].outputTokens, 500_000);
+});
+
+test('S4: $0.01 tiny-row edge — 100 tokens accepted, 99 rejected (pinned)', () => {
+  // Cap is tokens/1e6*$100 with strictly-above rejection: $0.01 equals the
+  // cap at exactly 100 tokens (accepted) and exceeds it at 99 (rejected).
+  const atCap = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [dailyEntry({
+      inputTokens: 100,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalTokens: 100,
+      totalCost: 0.01,
+    })],
+  }));
+  assert.equal(atCap.entries[0].costUsd, 0.01);
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'daily',
+      daily: [dailyEntry({
+        inputTokens: 99,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        totalTokens: 99,
+        totalCost: 0.01,
+      })],
+    })),
+    /costUsd/,
+  );
+});

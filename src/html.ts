@@ -863,7 +863,7 @@ export function adminPage(
   user: User,
   stats: { total_users: number; total_uploads: number; total_invites: number; total_flags?: number },
   codes: { code: string; use_count: number; max_uses: number; created_by_name: string | null }[],
-  flags: { id: string; user_id: string; date: string; reason: string; detail: string | null; created_at: string; display_name: string | null }[] = []
+  flags: { id: string; user_id: string; date: string; reason: string; detail: string | null; created_at: string; display_name: string | null; status?: string | null }[] = []
 ): string {
   const rows = codes
     .map(
@@ -883,6 +883,7 @@ export function adminPage(
         <td class="py-2 px-4 font-mono text-xs">${escapeHtml(f.date)}</td>
         <td class="py-2 px-4"><span class="text-xs bg-red-900/40 text-red-300 border border-red-800/50 rounded px-2 py-0.5">${escapeHtml(f.reason)}</span></td>
         <td class="py-2 px-4 font-mono text-xs text-gray-500">${f.detail ? escapeHtml(f.detail) : ''}</td>
+        <td class="py-2 px-4"><form method="POST" action="/api/admin/flags/${escapeHtml(f.id)}/dismiss"><button type="submit" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 rounded px-2 py-1 transition">Dismiss</button></form></td>
       </tr>`
     )
     .join('');
@@ -953,6 +954,7 @@ export function adminPage(
                     <th class="py-2 px-4 text-left">Date</th>
                     <th class="py-2 px-4 text-left">Reason</th>
                     <th class="py-2 px-4 text-left">Detail</th>
+                    <th class="py-2 px-4 text-left">Action</th>
                   </tr>
                 </thead>
                 <tbody>${flagRows}</tbody>
