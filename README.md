@@ -98,6 +98,16 @@ npm run db:migrate
 npm run db:seed
 ```
 
+Already-migrated databases: `db:migrate` is a fresh-DB chain and is not
+re-runnable (old `ALTER TABLE` steps abort on migrated DBs). Apply only the
+new files, in numeric order:
+
+```bash
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0011_review_flags.sql
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0012_unknown_date_cleanup.sql
+# local twin: add --local to each command above
+```
+
 ### 4. Configure Google OAuth
 
 1. Create an **OAuth 2.0 Client ID** at [Google Cloud Console > Credentials](https://console.cloud.google.com/apis/credentials)

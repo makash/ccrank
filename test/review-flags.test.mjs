@@ -130,7 +130,7 @@ async function upload(db, reportJson) {
 
 function flagBatch(batches) {
   return (
-    batches.find((batch) => batch.length > 0 && /INSERT INTO review_flags/.test(batch[0].sql)) ||
+    batches.find((batch) => batch.length > 0 && /INSERT (OR IGNORE )?INTO review_flags/.test(batch[0].sql)) ||
     null
   );
 }
@@ -419,4 +419,467 @@ test('GET /admin shows the review queue to admins', async () => {
   assert.match(page, /tokens_vs_median/);
   assert.match(page, /Test User/);
   assert.match(page, /Review Queue/);
+});
+
+// H3 dedup: UNIQUE(user_id, date, reason) + INSERT OR IGNORE keeps CLI
+// re-uploads from burying the review queue with duplicate rows.
+function createDedupDatabase() {
+  const statements = [];
+  const batches = [];
+  const batchErrors = [];
+  const flagRows = new Map(); // key: user_id|date|reason -> bindings
+  const db = {
+    prepare(sql) {
+      const exec = {
+        async first() {
+          if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+          if (/FROM users/.test(sql)) return normalUser;
+          return null;
+        },
+        async all() {
+          return { results: [] };
+        },
+        async run() {
+          return { success: true };
+        },
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        ...exec,
+        bind(...bindings) {
+          const bound = { sql, bindings, ...exec };
+          statements.push(bound);
+          return bound;
+        },
+      };
+      statements.push(statement);
+      return statement;
+    },
+    async batch(batch) {
+      batches.push(batch);
+      // Simulate the UNIQUE(user_id, date, reason) constraint from 0011:
+      // duplicates are silently ignored with OR IGNORE, and raise (as real
+      // D1 would) on a plain INSERT.
+      if (batch.length > 0 && /review_flags/.test(batch[0].sql)) {
+        const orIgnore = /INSERT OR IGNORE INTO review_flags/.test(batch[0].sql);
+        const results = [];
+        for (const stmt of batch) {
+          const key = [stmt.bindings[1], stmt.bindings[2], stmt.bindings[3]].join('|');
+          if (flagRows.has(key)) {
+            if (orIgnore) {
+              results.push({ success: true });
+              continue;
+            }
+            const err = new Error(
+              'UNIQUE constraint failed: review_flags.user_id, review_flags.date, review_flags.reason'
+            );
+            batchErrors.push(err);
+            throw err;
+          }
+          flagRows.set(key, stmt.bindings);
+          results.push({ success: true });
+        }
+        return results;
+      }
+      return batch.map(() => ({ success: true }));
+    },
+  };
+  return { db, statements, batches, batchErrors, flagRows };
+}
+
+function datedReport(rows) {
+  return JSON.stringify({
+    type: 'daily',
+    daily: rows.map((r) => ({
+      date: r.date,
+      inputTokens: r.totalTokens - 100,
+      outputTokens: 100,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens: r.totalTokens,
+      totalCost: r.totalCost ?? 1,
+      modelsUsed: ['claude-sonnet-4-5'],
+    })),
+  });
+}
+
+test('h3: re-uploading the same anomalous report does not duplicate flags', async () => {
+  const { db, statements, batchErrors, flagRows } = createDedupDatabase();
+  const report = dailyReport([{ totalTokens: 11_000_000_000, totalCost: 5 }]);
+
+  const res1 = await upload(db, report);
+  assert.equal(res1.status, 200);
+  assert.equal((await res1.json()).ok, true);
+  const res2 = await upload(db, report);
+  assert.equal(res2.status, 200);
+  assert.equal((await res2.json()).ok, true);
+
+  assert.equal(flagRows.size, 1);
+  assert.equal(batchErrors.length, 0);
+  const flagStmt = statements.find(
+    ({ sql }) => /INSERT/.test(sql) && /review_flags/.test(sql)
+  );
+  assert.ok(flagStmt, 'expected a review_flags insert statement');
+  assert.match(flagStmt.sql, /INSERT OR IGNORE INTO review_flags/);
+});
+
+test('h3: distinct dates and reasons still insert separately', async () => {
+  const { db, batchErrors, flagRows } = createDedupDatabase();
+  const res = await upload(
+    db,
+    datedReport([
+      { date: '2026-09-10', totalTokens: 11_000_000_000, totalCost: 5 },
+      { date: '2026-09-11', totalTokens: 150_000_000, totalCost: 15000 },
+    ])
+  );
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(batchErrors.length, 0);
+  assert.equal(flagRows.size, 2);
+  assert.ok(flagRows.has('user-1|2026-09-10|tokens_absolute'));
+  assert.ok(flagRows.has('user-1|2026-09-11|cost_absolute'));
+});
+
+test('h3: same date with different reasons still inserts separately', async () => {
+  const { db, batchErrors, flagRows } = createDedupDatabase();
+  const res = await upload(db, dailyReport([
+    { totalTokens: 11_000_000_000, totalCost: 5 },
+    { totalTokens: 150_000_000, totalCost: 15000 },
+  ]));
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(batchErrors.length, 0);
+  assert.equal(flagRows.size, 2);
+  assert.ok(flagRows.has('user-1|2026-09-10|tokens_absolute'));
+  assert.ok(flagRows.has('user-1|2026-09-10|cost_absolute'));
+});
+
+// H2: the median tripwire must sample history BEFORE the upsert commits,
+// otherwise a stuffed upload sets its own median and the 20x check never
+// fires. Stateful mock: the median SELECT reads the live usage store, and
+// the daily_usage batch max-merges into it (D1-faithful ordering probe).
+function createStatefulUploadDatabase({ historyTokens = [] } = {}) {
+  const statements = [];
+  const batches = [];
+  const events = [];
+  const usageByDate = new Map();
+  historyTokens.forEach((total_tokens, i) => {
+    usageByDate.set(`2026-07-${String(i + 1).padStart(2, '0')}`, total_tokens);
+  });
+  const db = {
+    prepare(sql) {
+      const exec = {
+        async first() {
+          if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+          if (/FROM users/.test(sql)) return normalUser;
+          return null;
+        },
+        async all() {
+          if (/ORDER BY total_tokens/.test(sql)) {
+            events.push('median-select');
+            const rows = [...usageByDate.values()]
+              .filter((n) => n > 0)
+              .sort((a, b) => a - b)
+              .map((total_tokens) => ({ total_tokens }));
+            return { results: rows };
+          }
+          return { results: [] };
+        },
+        async run() {
+          return { success: true };
+        },
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        ...exec,
+        bind(...bindings) {
+          const bound = { sql, bindings, ...exec };
+          statements.push(bound);
+          return bound;
+        },
+      };
+      statements.push(statement);
+      return statement;
+    },
+    async batch(batch) {
+      batches.push(batch);
+      if (batch.length > 0 && /INSERT INTO daily_usage/.test(batch[0].sql)) {
+        events.push('usage-batch');
+        for (const bound of batch) {
+          const date = bound.bindings[3];
+          const total = Number(bound.bindings[10]) || 0;
+          usageByDate.set(date, Math.max(usageByDate.get(date) || 0, total));
+        }
+      } else if (batch.length > 0 && /INSERT (OR IGNORE )?INTO review_flags/.test(batch[0].sql)) {
+        events.push('flag-batch');
+      }
+      return batch.map(() => ({ success: true }));
+    },
+  };
+  return { db, statements, batches, events, usageByDate };
+}
+
+function datedDailyReport(entries) {
+  return JSON.stringify({
+    type: 'daily',
+    daily: entries.map((e, i) => ({
+      date: e.date ?? `2026-09-${String(i + 1).padStart(2, '0')}`,
+      inputTokens: e.inputTokens ?? (e.totalTokens - 100),
+      outputTokens: e.outputTokens ?? 100,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      totalTokens: e.totalTokens,
+      totalCost: e.totalCost ?? 1,
+      modelsUsed: ['claude-sonnet-4-5'],
+    })),
+  });
+}
+
+test('H2: median tripwire samples history before the upsert commits', async () => {
+  const { db, batches, events } = createStatefulUploadDatabase({
+    historyTokens: Array(7).fill(100_000),
+  });
+  const entries = Array.from({ length: 10 }, (_, i) => ({
+    date: `2026-09-${String(i + 1).padStart(2, '0')}`,
+    totalTokens: 9_000_000_000,
+    totalCost: 9000,
+  }));
+  const res = await upload(db, datedDailyReport(entries));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  // Median SELECT must run before the daily_usage batch commits.
+  assert.deepEqual(
+    events.filter((e) => e !== 'flag-batch'),
+    ['median-select', 'usage-batch']
+  );
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  // 9B tokens / $9k sit below both absolute tripwires, so every flag is median-relative.
+  assert.ok(flags.length > 0);
+  assert.ok(flags.every((f) => f.bindings[3] === 'tokens_vs_median'));
+  const detail = JSON.parse(flags[0].bindings[4]);
+  assert.equal(detail.median_30d, 100000);
+});
+
+test('H2: many high rows in one upload cannot stuff their own median', async () => {
+  const { db, batches } = createStatefulUploadDatabase({
+    historyTokens: Array(7).fill(100_000),
+  });
+  const entries = Array.from({ length: 20 }, (_, i) => ({
+    date: `2026-08-${String(i + 1).padStart(2, '0')}`,
+    totalTokens: 100_000_000,
+    totalCost: 100,
+  }));
+  const res = await upload(db, datedDailyReport(entries));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch despite the stuffed-median attempt');
+  assert.equal(flags.length, 20);
+  assert.ok(flags.every((f) => f.bindings[3] === 'tokens_vs_median'));
+  const detail = JSON.parse(flags[0].bindings[4]);
+  assert.equal(detail.median_30d, 100000);
+});
+
+// H4 caps: a hostile report must not fan out into an unbounded daily_usage
+// batch or flood the review queue. Helpers build multi-row reports with
+// distinct past dates (past so the parser's today+1 future-date rejection
+// never fires).
+
+function h4PastDate(offsetDays) {
+  return new Date(Date.UTC(2016, 0, 1) + offsetDays * 86400000).toISOString().slice(0, 10);
+}
+
+function h4DailyReport(count, { totalTokens = 430, totalCost = 0.01 } = {}) {
+  return JSON.stringify({
+    type: 'daily',
+    daily: Array.from({ length: count }, (_, i) => ({
+      date: h4PastDate(i),
+      inputTokens: totalTokens - 100,
+      outputTokens: 100,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens,
+      totalCost,
+      modelsUsed: ['claude-sonnet-4-5'],
+    })),
+  });
+}
+
+test('h4: 3661-row report is rejected with 400', async () => {
+  const { db, batches } = createUploadDatabase();
+  const res = await upload(db, h4DailyReport(3661));
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /Too many entries/);
+  assert.equal(batches.length, 0); // rejected before any D1 batch ran
+});
+
+test('h4: exactly 3660 rows are accepted', async () => {
+  const { db } = createUploadDatabase();
+  const res = await upload(db, h4DailyReport(3660));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.entries, 3660);
+});
+
+test('h4: many-anomaly report yields a bounded flag batch', async () => {
+  const { db, batches } = createUploadDatabase();
+  // 100 distinct-date rows, each tripping tokens_absolute. $5 stays far
+  // below the parser's $100/M cap at 11B tokens, so every row is valid.
+  const res = await upload(db, h4DailyReport(100, { totalTokens: 11_000_000_000, totalCost: 5 }));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 20);
+});
+
+test('h4: repeated (date, reason) flags dedupe to one row', async () => {
+  const { db, batches } = createUploadDatabase();
+  // dailyReport() reuses one date for every row: 5 identical anomalous rows
+  // collapse to a single (date, reason) flag.
+  const rows = Array.from({ length: 5 }, () => ({ totalTokens: 11_000_000_000, totalCost: 5 }));
+  const res = await upload(db, dailyReport(rows));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'tokens_absolute');
+});
+
+// H5: a failing median SELECT must not discard queued absolute flags.
+function createMedianFailingDatabase() {
+  const statements = [];
+  const batches = [];
+  const db = {
+    prepare(sql) {
+      const exec = {
+        async first() {
+          if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+          if (/FROM users/.test(sql)) return normalUser;
+          return null;
+        },
+        async all() {
+          if (/ORDER BY total_tokens/.test(sql)) throw new Error('median unavailable');
+          return { results: [] };
+        },
+        async run() {
+          return { success: true };
+        },
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        ...exec,
+        bind(...bindings) {
+          const bound = { sql, bindings, ...exec };
+          statements.push(bound);
+          return bound;
+        },
+      };
+      statements.push(statement);
+      return statement;
+    },
+    async batch(batch) {
+      batches.push(batch);
+      return batch.map(() => ({ success: true }));
+    },
+  };
+  return { db, statements, batches };
+}
+
+test('median SELECT failure still inserts the absolute flag', async () => {
+  const { db, batches } = createMedianFailingDatabase();
+  const res = await upload(db, dailyReport([{ totalTokens: 11_000_000_000, totalCost: 5 }]));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch despite median failure');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'tokens_absolute');
+  assert.match(flags[0].bindings[4], /11000000000/);
+});
+
+test('median SELECT failure with normal rows inserts no flags', async () => {
+  const { db, batches } = createMedianFailingDatabase();
+  const res = await upload(db, dailyReport([{ totalTokens: 2_000_000, totalCost: 50 }]));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(flagBatch(batches), null);
+  assert.equal(batches.length, 1);
+});
+
+// H7: a dead flag queue must be observable, not silent.
+test('H7: flagging failure warns observably but still returns 200', async () => {
+  const batches = [];
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...args) => { warns.push(args.map(String).join(' ')); };
+  try {
+    const db = {
+      prepare(sql) {
+        if (/review_flags/.test(sql)) throw new Error('no such table: review_flags');
+        const exec = {
+          async first() {
+            if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+            if (/FROM users/.test(sql)) return normalUser;
+            return null;
+          },
+          async all() {
+            return { results: [] };
+          },
+          async run() {
+            return { success: true };
+          },
+        };
+        const statement = {
+          sql,
+          bindings: [],
+          ...exec,
+          bind(...bindings) {
+            return { sql, bindings, ...exec };
+          },
+        };
+        return statement;
+      },
+      async batch(batch) {
+        batches.push(batch);
+        return batch.map(() => ({ success: true }));
+      },
+    };
+    const res = await upload(db, dailyReport([{ totalTokens: 11_000_000_000, totalCost: 5 }]));
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(batches.length, 1); // only the daily_usage upsert ran
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /review-flags/);
+    assert.match(warns[0], /non-fatal/);
+  } finally {
+    console.warn = origWarn;
+  }
 });

@@ -375,3 +375,21 @@ test('upload endpoint maps validation failures to HTTP 400', async () => {
   assert.equal(good.status, 200);
   assert.equal((await good.json()).ok, true);
 });
+
+test('H1: session lastActivity in the future is rejected', () => {
+  // lastActivity overwrites the validated date at aggregation time, so it
+  // must pass the same future-date rule as daily rows.
+  assert.throws(
+    () => parser.parseReport(JSON.stringify({
+      type: 'session',
+      sessions: [sessionEntry({ date: '2026-08-12', lastActivity: utcDate(30) })],
+    })),
+    /Future date/,
+  );
+  // Past lastActivity still aggregates under its own date.
+  const ok = parser.parseReport(JSON.stringify({
+    type: 'session',
+    sessions: [sessionEntry({ date: '2026-08-12', lastActivity: '2026-08-11' })],
+  }));
+  assert.equal(ok.entries[0].date, '2026-08-11');
+});

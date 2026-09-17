@@ -297,10 +297,16 @@ export function parseReport(jsonStr: string): ParsedReport {
       }
       seenSessionIds.add(key);
     }
+    // H1: lastActivity overwrites the validated date below, so it must pass
+    // the same future-date rule (lexicographic YYYY-MM-DD, one-day grace).
+    const maxDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     for (const entry of entries) {
       const raw = entry as Record<string, unknown>;
       const parsed = parseDataEntry(raw, type, 0);
       const lastActivity = raw.lastActivity ? normalizeDate(raw.lastActivity, type, 0) : parsed.date;
+      if (lastActivity > maxDate) {
+        throw new Error(`Future date "${lastActivity}" in session upload: dates after ${maxDate} are not allowed.`);
+      }
       const existing = byDate.get(lastActivity);
       parsed.date = lastActivity;
 

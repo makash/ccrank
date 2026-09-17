@@ -40,10 +40,10 @@ function referencedMigrations(keys) {
       typeof script === 'string' && script.length > 0,
       `package.json must define a non-empty scripts["${key}"]`,
     );
-    const files = new Set();
+    const files = [];
     for (const segment of script.split('&&')) {
       const match = segment.match(/--file=(migrations\/\d{4}_[\w-]+\.sql)/);
-      if (match) files.add(match[1].split('/')[1]);
+      if (match) files.push(match[1].split('/')[1]);
     }
     refs.set(key, files);
   }
@@ -92,14 +92,24 @@ test('every migration file is referenced by the db:migrate / db:seed scripts', (
       `${file} exists in migrations/ but is not referenced by any db:migrate/db:seed script — it would never apply`,
     );
   }
-  // :local variants must apply exactly the same set as their remote twin.
+  // Order is load-bearing (0009's UNIQUE INDEX needs 0003's source
+  // column), so assert per-chain numeric order plus order-identical twins —
+  // set-equality alone would pass a swapped chain that breaks fresh DBs.
   for (const refs of [migrateRefs, seedRefs]) {
+    for (const [key, files] of refs) {
+      const numbers = files.map((f) => Number(f.slice(0, 4)));
+      assert.deepStrictEqual(
+        [...numbers].sort((a, b) => a - b),
+        numbers,
+        `scripts["${key}"] must apply migrations in numeric order`,
+      );
+    }
     const [first, ...rest] = [...refs.values()];
     for (const other of rest) {
       assert.deepStrictEqual(
-        [...other].sort(),
-        [...first].sort(),
-        'db script :local variant applies a different migration set than its remote twin',
+        other,
+        first,
+        'db script :local variant applies a different migration ORDER than its remote twin',
       );
     }
   }
@@ -113,7 +123,7 @@ test('0010_daily_usage_audit.sql exists and is wired into db:migrate', () => {
   const migrateRefs = referencedMigrations(migrateKeys);
   for (const [key, files] of migrateRefs) {
     assert.ok(
-      files.has('0010_daily_usage_audit.sql'),
+      files.includes('0010_daily_usage_audit.sql'),
       `0010_daily_usage_audit.sql must be referenced by scripts["${key}"]`,
     );
   }

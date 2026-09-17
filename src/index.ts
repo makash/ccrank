@@ -1150,6 +1150,15 @@ app.post('/api/upload', async (c) => {
     return c.json({ ok: false, error: err.message }, 400);
   }
 
+  // Uploads are bounded by distinct dates in history: a continuous user
+  // since Feb 2025 holds ~570 daily rows by Sept 2026. 3660 (~10 years of
+  // daily rows) stops hostile fan-out without touching honest reports
+  // (full-history pastes included). Rejected before any D1 batch runs.
+  const MAX_UPLOAD_ENTRIES = 3660;
+  if (report.entries.length > MAX_UPLOAD_ENTRIES) {
+    return c.json({ ok: false, error: `Too many entries: ${report.entries.length} exceeds the maximum of ${MAX_UPLOAD_ENTRIES}` }, 400);
+  }
+
   // Allow explicit platform override from CLI (e.g., ccrank-git sends platform)
   const platformOverride = isValidPlatform(body.platform) ? body.platform : null;
   if (platformOverride) {
@@ -1211,28 +1220,13 @@ app.post('/api/upload', async (c) => {
     )
   );
 
-  await c.env.DB.batch(batch);
-
-  // Review-only anomaly queue: flag suspicious rows for admin review.
-  // NEVER rejects: best-effort inside try/catch so flagging can never fail
-  // an upload (valid reports always return ok:true).
+  // Review-only anomaly queue: sample the trailing-30d median BEFORE the
+  // upsert batch commits. Sampling after the commit lets a stuffed upload
+  // set its own median so the 20x tripwire never fires. Best-effort: any
+  // failure falls through to null (median check skipped) and never fails
+  // the upload.
+  let preUpsertMedian: number | null = null;
   try {
-    const flagStmt = c.env.DB.prepare(
-      'INSERT INTO review_flags (id, user_id, date, reason, detail) VALUES (?, ?, ?, ?, ?)'
-    );
-    const flagBatch: any[] = [];
-    // Absolute tripwires, evaluated per uploaded row.
-    for (const entry of report.entries) {
-      if (entry.totalTokens > 10_000_000_000) {
-        flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens })));
-      } else if (entry.costUsd > 10000) {
-        flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd })));
-      }
-    }
-    // Relative tripwire: a row above 20x the user's trailing-30d daily
-    // median. A single cheap SELECT over the indexed (user_id, date);
-    // users with fewer than 7 active days are skipped so new accounts
-    // never flag.
     const medianRows = await c.env.DB.prepare(
       `SELECT total_tokens FROM daily_usage
        WHERE user_id = ? AND date >= date('now', '-30 days') AND total_tokens > 0
@@ -1244,18 +1238,63 @@ app.post('/api/upload', async (c) => {
     if (samples.length >= 7) {
       const median = samples[Math.floor(samples.length / 2)];
       if (median > 0) {
-        for (const entry of report.entries) {
-          if (entry.totalTokens > median * 20) {
-            flagBatch.push(flagStmt.bind(generateId(), user.id, entry.date, 'tokens_vs_median', JSON.stringify({ total_tokens: entry.totalTokens, median_30d: median })));
-          }
+        preUpsertMedian = median;
+      }
+    }
+  } catch {
+    preUpsertMedian = null;
+  }
+
+  await c.env.DB.batch(batch);
+
+  // Review-only anomaly queue: flag suspicious rows for admin review.
+  // NEVER rejects: best-effort inside try/catch so flagging can never fail
+  // an upload (valid reports always return ok:true).
+  try {
+    const flagStmt = c.env.DB.prepare(
+      'INSERT OR IGNORE INTO review_flags (id, user_id, date, reason, detail) VALUES (?, ?, ?, ?, ?)'
+    );
+    const flagBatch: any[] = [];
+    // One upload must not flood the review queue: dedupe by (date, reason)
+    // (tripwires can fire on the same row, and a hostile report can repeat a
+    // date) and hard-cap the batch. The cap is 20 because GET /admin renders
+    // exactly the 20 most recent flags (LIMIT 20), so one upload can fill —
+    // but never overflow — the queue.
+    const MAX_FLAGS_PER_UPLOAD = 20;
+    const seenFlags = new Set<string>();
+    const queueFlag = (date: string, reason: string, detail: string) => {
+      if (flagBatch.length >= MAX_FLAGS_PER_UPLOAD) return;
+      const key = `${date}\0${reason}`;
+      if (seenFlags.has(key)) return;
+      seenFlags.add(key);
+      flagBatch.push(flagStmt.bind(generateId(), user.id, date, reason, detail));
+    };
+    // Absolute tripwires, evaluated per uploaded row.
+    for (const entry of report.entries) {
+      if (entry.totalTokens > 10_000_000_000) {
+        queueFlag(entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens }));
+      } else if (entry.costUsd > 10000) {
+        queueFlag(entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd }));
+      }
+    }
+    // Relative tripwire: a row above 20x the pre-upsert trailing-30d
+    // daily median (sampled above, before this upload committed, so a
+    // stuffed upload cannot set its own median).
+    if (preUpsertMedian !== null) {
+      for (const entry of report.entries) {
+        if (entry.totalTokens > preUpsertMedian * 20) {
+          queueFlag(entry.date, 'tokens_vs_median', JSON.stringify({ total_tokens: entry.totalTokens, median_30d: preUpsertMedian }));
         }
       }
     }
     if (flagBatch.length > 0) {
       await c.env.DB.batch(flagBatch);
     }
-  } catch {
-    // Review-only: ignore flagging errors (e.g. table missing pre-migration).
+  } catch (err) {
+    // Review-only: flagging errors (e.g. table missing pre-migration) must
+    // never fail the upload — but warn observably so a dead queue is not
+    // mistaken for "no anomalies".
+    console.warn('[review-flags] flagging failed (non-fatal):', err instanceof Error ? err.message : err);
   }
 
   return c.json({

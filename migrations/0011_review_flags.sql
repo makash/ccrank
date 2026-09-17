@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS review_flags (
   reason TEXT NOT NULL,
   detail TEXT,
   created_at TEXT DEFAULT (datetime('now')),
-  FOREIGN KEY (user_id) REFERENCES users(id)
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  UNIQUE(user_id, date, reason)
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_flags_user_date ON review_flags(user_id, date);
