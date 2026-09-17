@@ -153,7 +153,7 @@ test('parses a Grok report into the Grok platform with its reported cost', () =>
       cacheReadTokens: 700,
       cacheCreationTokens: 0,
       totalTokens: 1200,
-      totalCost: 1.5,
+      totalCost: 0.0015,
       modelsUsed: ['grok-4.6-build'],
     }],
   }));
@@ -161,7 +161,7 @@ test('parses a Grok report into the Grok platform with its reported cost', () =>
   assert.equal(report.platform, 'grok');
   assert.equal(report.entries[0].platform, 'grok');
   assert.equal(report.entries[0].totalTokens, 1200);
-  assert.equal(report.entries[0].costUsd, 1.5);
+  assert.equal(report.entries[0].costUsd, 0.0015);
 });
 
 test('parses a GLM report into the GLM platform and keeps it token-only', () => {
