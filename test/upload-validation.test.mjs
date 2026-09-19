@@ -571,6 +571,17 @@ test('S3: omitted total with $0 cost persists total 0 (pinned, not defaulted)', 
   assert.equal(report.entries[0].outputTokens, 500_000);
 });
 
+test('cachedInputTokens legacy alias falls through on explicit zero', () => {
+  // Matches usageTotals in the CLI: an explicit cacheReadTokens: 0 falls
+  // through to the legacy alias instead of shorting the component sum.
+  const report = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [dailyEntry({ cacheReadTokens: 0, cachedInputTokens: 300 })],
+  }));
+  assert.equal(report.entries[0].cacheReadTokens, 300);
+  assert.equal(report.entries[0].totalTokens, 430);
+});
+
 test('S4: $0.01 tiny rows accepted at any token count (no ratio reject)', () => {
   // $0.01 on 100 tokens ($100/M) and on 99 tokens ($101/M) are both
   // accepted: per-request billing makes any ratio cap unsound as a reject.

@@ -265,7 +265,8 @@ test('exact boundaries do not flag (strict >)', async () => {
     assert.equal(res.status, 200);
     assert.equal(flagBatch(batches), null);
   }
-  // Exactly $10000 at exactly $100/M (validation-valid) with median skipped.
+  // Exactly $10000 at exactly $100/M with median skipped: no flag
+  // (strictly-above) and no reject (ratios never reject).
   {
     const { db, batches } = createUploadDatabase();
     const res = await upload(db, dailyReport([{ totalTokens: 100_000_000, totalCost: 10000 }]));
@@ -743,7 +744,7 @@ test('h4: exactly 3660 rows are accepted', async () => {
 test('h4: many-anomaly report yields a bounded flag batch', async () => {
   const { db, batches } = createUploadDatabase();
   // 100 distinct-date rows, each tripping tokens_absolute. $5 stays far
-  // below the parser's $100/M cap at 11B tokens, so every row is valid.
+  // below the cost_implausible flag line at 11B tokens, so only that fires.
   const res = await upload(db, h4DailyReport(100, { totalTokens: 11_000_000_000, totalCost: 5 }));
   const body = await res.json();
 
@@ -918,6 +919,26 @@ test('cost_implausible does not fire at sane ratios', async () => {
   assert.ok(flags);
   const reasons = flags.map((f) => f.bindings[3]).sort();
   assert.deepEqual(reasons, ['cost_absolute', 'tokens_absolute']);
+});
+
+test('cost_implausible flags zero-token rows only above $100', async () => {
+  // Cursor cents on zero tokens are real (accepted, unflagged); $100+ on
+  // zero tokens is not a real per-request shape.
+  const { db, batches } = createUploadDatabase();
+  const small = await upload(db, datedReport([
+    { date: '2026-09-10', totalTokens: 0, totalCost: 0.04, inputTokens: 0, outputTokens: 0 },
+  ]));
+  assert.equal(small.status, 200);
+  assert.equal(flagBatch(batches), null);
+
+  const big = await upload(db, datedReport([
+    { date: '2026-09-11', totalTokens: 0, totalCost: 9999, inputTokens: 0, outputTokens: 0 },
+  ]));
+  assert.equal(big.status, 200);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'cost_implausible');
 });
 
 // S1: the median gate counts distinct active days, not rows. 8 history rows

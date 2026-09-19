@@ -1317,6 +1317,11 @@ app.post('/api/upload', async (c) => {
       if (entry.totalTokens > 0 && entry.costUsd > (entry.totalTokens / 1e6) * 100) {
         queueFlag(entry.date, 'cost_implausible', JSON.stringify({ cost_usd: entry.costUsd, total_tokens: entry.totalTokens }));
       }
+      // Zero-token rows with significant cost: per-request billing is real
+      // (Cursor cents), but $100+ on zero tokens is not a real shape.
+      if (entry.totalTokens === 0 && entry.costUsd > 100) {
+        queueFlag(entry.date, 'cost_implausible', JSON.stringify({ cost_usd: entry.costUsd, total_tokens: 0 }));
+      }
     }
     // Relative tripwire: a row above 20x the pre-upsert trailing-30d
     // daily median (sampled above, before this upload committed, so a
