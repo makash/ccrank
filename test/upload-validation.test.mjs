@@ -152,7 +152,7 @@ test('tolerance edge: diff of exactly 1000 accepted, 1001 rejected at 1M total',
   );
 });
 
-test('zero-token rows: $0 accepted, nonzero cost rejected', () => {
+test('zero-token rows with nonzero cost are accepted (per-request billing)', () => {
   const free = parser.parseReport(JSON.stringify({
     type: 'daily',
     daily: [dailyEntry({
@@ -165,26 +165,26 @@ test('zero-token rows: $0 accepted, nonzero cost rejected', () => {
     })],
   }));
   assert.equal(free.entries[0].totalTokens, 0);
-  assert.throws(
-    () => parser.parseReport(JSON.stringify({
-      type: 'daily',
-      daily: [dailyEntry({
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        totalTokens: 0,
-        totalCost: 0.01,
-      })],
-    })),
-    /costUsd/,
-  );
+  // Cursor bills per request: zero-token/nonzero-cost day rows are a
+  // supported shape (cursor_usage.go keeps them), so the parser accepts
+  // them; implausible $/M is a review_flags signal, never a reject.
+  const billed = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [dailyEntry({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalTokens: 0,
+      totalCost: 0.01,
+    })],
+  }));
+  assert.equal(billed.entries[0].costUsd, 0.01);
 });
 
 test('accepts rows omitting totalTokens (presence-aware consistency)', () => {
   // num() coerces the missing total to 0; consistency is only enforced
-  // when the reporter actually sent a total. $0 cost keeps the row real:
-  // a 0-token row with nonzero cost still 400s (see previous test).
+  // when the reporter actually sent a total.
   const report = parser.parseReport(JSON.stringify({
     type: 'daily',
     daily: [dailyEntry({ totalTokens: undefined, totalCost: 0 })],
@@ -192,39 +192,24 @@ test('accepts rows omitting totalTokens (presence-aware consistency)', () => {
   assert.equal(report.entries[0].totalTokens, 0);
 });
 
-test('rejects implausible cost above $100/M but keeps $0-cost rows', () => {
-  // 430 tokens cap at $0.043; $10 is ~$23k/M.
-  assert.throws(
-    () => parser.parseReport(JSON.stringify({ type: 'daily', daily: [dailyEntry({ totalCost: 10 })] })),
-    /costUsd/,
-  );
-  // Exactly $100/M on round numbers stays accepted (rejection is strictly above).
-  const atCap = parser.parseReport(JSON.stringify({
+test('high cost-per-token rows are accepted at parse (flagged, not rejected)', () => {
+  // 430 tokens at $10 is ~$23k/M — implausible for token pricing, routine
+  // for per-request billing (Cursor: 150 tok @ $0.04 is a real row). The
+  // parser accepts; cost_implausible flags it in review_flags instead.
+  const pricey = parser.parseReport(JSON.stringify({ type: 'daily', daily: [dailyEntry({ totalCost: 10 })] }));
+  assert.equal(pricey.entries[0].costUsd, 10);
+  const cursorShaped = parser.parseReport(JSON.stringify({
     type: 'daily',
     daily: [dailyEntry({
-      inputTokens: 600_000,
-      outputTokens: 400_000,
+      inputTokens: 100,
+      outputTokens: 50,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalTokens: 1_000_000,
-      totalCost: 100,
+      totalTokens: 150,
+      totalCost: 0.04,
     })],
   }));
-  assert.equal(atCap.entries[0].costUsd, 100);
-  assert.throws(
-    () => parser.parseReport(JSON.stringify({
-      type: 'daily',
-      daily: [dailyEntry({
-        inputTokens: 600_000,
-        outputTokens: 400_000,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        totalTokens: 1_000_000,
-        totalCost: 100.01,
-      })],
-    })),
-    /costUsd/,
-  );
+  assert.equal(cursorShaped.entries[0].costUsd, 0.04);
   // $0-cost rows with tokens (free tiers) must stay accepted.
   const free = parser.parseReport(JSON.stringify({ type: 'daily', daily: [dailyEntry({ totalCost: 0 })] }));
   assert.equal(free.entries[0].totalTokens, 430);
@@ -556,15 +541,15 @@ test('S2: total-only rows 400 against the zeroed component sum (pinned)', () => 
   );
 });
 
-test('S3: omitted total with nonzero cost 400s via the zero-token cap (pinned)', () => {
-  // A missing total coerces to 0 tokens, so any nonzero cost exceeds the cap.
-  assert.throws(
-    () => parser.parseReport(JSON.stringify({
-      type: 'daily',
-      daily: [dailyEntry({ totalTokens: undefined, totalCost: 0.01 })],
-    })),
-    /for 0 tokens/,
-  );
+test('S3: omitted total with nonzero cost is accepted (no ratio reject)', () => {
+  // A missing total coerces to 0 tokens; with no cost-per-token reject,
+  // nonzero cost is accepted (implausible $/M is a review_flags signal).
+  const report = parser.parseReport(JSON.stringify({
+    type: 'daily',
+    daily: [dailyEntry({ totalTokens: undefined, totalCost: 0.01 })],
+  }));
+  assert.equal(report.entries[0].totalTokens, 0);
+  assert.equal(report.entries[0].costUsd, 0.01);
 });
 
 test('S3: omitted total with $0 cost persists total 0 (pinned, not defaulted)', () => {
@@ -586,33 +571,22 @@ test('S3: omitted total with $0 cost persists total 0 (pinned, not defaulted)', 
   assert.equal(report.entries[0].outputTokens, 500_000);
 });
 
-test('S4: $0.01 tiny-row edge — 100 tokens accepted, 99 rejected (pinned)', () => {
-  // Cap is tokens/1e6*$100 with strictly-above rejection: $0.01 equals the
-  // cap at exactly 100 tokens (accepted) and exceeds it at 99 (rejected).
-  const atCap = parser.parseReport(JSON.stringify({
-    type: 'daily',
-    daily: [dailyEntry({
-      inputTokens: 100,
-      outputTokens: 0,
-      cacheCreationTokens: 0,
-      cacheReadTokens: 0,
-      totalTokens: 100,
-      totalCost: 0.01,
-    })],
-  }));
-  assert.equal(atCap.entries[0].costUsd, 0.01);
-  assert.throws(
-    () => parser.parseReport(JSON.stringify({
+test('S4: $0.01 tiny rows accepted at any token count (no ratio reject)', () => {
+  // $0.01 on 100 tokens ($100/M) and on 99 tokens ($101/M) are both
+  // accepted: per-request billing makes any ratio cap unsound as a reject.
+  // Implausible $/M is a cost_implausible review flag instead.
+  for (const total of [100, 99]) {
+    const tiny = parser.parseReport(JSON.stringify({
       type: 'daily',
       daily: [dailyEntry({
-        inputTokens: 99,
+        inputTokens: total,
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        totalTokens: 99,
+        totalTokens: total,
         totalCost: 0.01,
       })],
-    })),
-    /costUsd/,
-  );
+    }));
+    assert.equal(tiny.entries[0].costUsd, 0.01);
+  }
 });

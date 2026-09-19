@@ -497,10 +497,10 @@ function datedReport(rows) {
     type: 'daily',
     daily: rows.map((r) => ({
       date: r.date,
-      inputTokens: r.totalTokens - 100,
-      outputTokens: 100,
-      cacheReadTokens: 0,
-      cacheCreationTokens: 0,
+      inputTokens: r.inputTokens ?? (r.totalTokens - 100),
+      outputTokens: r.outputTokens ?? 100,
+      cacheReadTokens: r.cacheReadTokens ?? 0,
+      cacheCreationTokens: r.cacheCreationTokens ?? 0,
       totalTokens: r.totalTokens,
       totalCost: r.totalCost ?? 1,
       modelsUsed: ['claude-sonnet-4-5'],
@@ -886,6 +886,38 @@ test('H7: flagging failure warns observably but still returns 200', async () => 
   } finally {
     console.warn = origWarn;
   }
+});
+
+// Cost-per-token is a flag, never a reject: per-request billing (Cursor)
+// and premium models make any ratio cap unsound as a hard gate.
+test('cost_implausible flags per-request-priced rows without rejecting', async () => {
+  const { db, batches } = createUploadDatabase();
+  // In-repo Cursor shapes (cursor_usage_test.go): 150 tok @ $0.04, 10 tok @ $0.10.
+  const res = await upload(db, datedReport([
+    { date: '2026-09-10', totalTokens: 150, totalCost: 0.04 },
+    { date: '2026-09-11', totalTokens: 10, totalCost: 0.10, inputTokens: 7, outputTokens: 3 },
+  ]));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.entries, 2);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 2);
+  assert.ok(flags.every((f) => f.bindings[3] === 'cost_implausible'));
+});
+
+test('cost_implausible does not fire at sane ratios', async () => {
+  const { db, batches } = createUploadDatabase();
+  const res = await upload(db, datedReport([
+    { date: '2026-09-10', totalTokens: 11_000_000_000, totalCost: 15000 },
+  ]));
+  assert.equal(res.status, 200);
+  const flags = flagBatch(batches);
+  assert.ok(flags);
+  const reasons = flags.map((f) => f.bindings[3]).sort();
+  assert.deepEqual(reasons, ['cost_absolute', 'tokens_absolute']);
 });
 
 // S1: the median gate counts distinct active days, not rows. 8 history rows

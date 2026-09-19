@@ -79,12 +79,6 @@ function num(val: unknown): number {
   return typeof val === 'number' ? val : 0;
 }
 
-// $100 per million tokens: documented as 30%+ above all-Opus-everything.
-// Anything pricier is a corrupt or hostile row, not real usage.
-// ponytail: ceiling $100/M tokens. Signal this cap is wrong = legit costUsd
-// 400s on real vendor bills. Next rung if it fires = per-platform caps.
-const MAX_COST_USD_PER_MILLION_TOKENS = 100;
-
 // Rejects absurd rows before they can poison max-merged history (usage
 // totals may only ever go UP, so a bad row could never be lowered away).
 // Throws are mapped to HTTP 400 by POST /api/upload in src/index.ts.
@@ -126,13 +120,12 @@ function validateEntry(entry: DailyEntry, raw: Record<string, unknown>, index: n
     }
   }
 
-  // $0-cost rows with tokens stay accepted: 0 is never above the cap.
-  const maxCostUsd = (entry.totalTokens / 1e6) * MAX_COST_USD_PER_MILLION_TOKENS;
-  if (entry.costUsd > maxCostUsd) {
-    throw new Error(
-      `Implausible costUsd for entry at index ${index}: $${entry.costUsd} exceeds $${MAX_COST_USD_PER_MILLION_TOKENS}/M tokens for ${entry.totalTokens} tokens.`
-    );
-  }
+  // NOTE: no cost-per-token ratio reject here. Cost is per-request billing
+  // on some vendors (Cursor: 150 tokens @ $0.04 is a real row), so any ratio
+  // cap false-positives on legitimate uploads — and a 400 kills the whole
+  // report with no recovery (the CLI never commits cache on failure).
+  // Implausible $/M is a review_flags signal instead (cost_implausible in
+  // the /api/upload flag block), never a reject.
 
   // Lexicographic compare works on normalized YYYY-MM-DD dates. One day of
   // grace keeps uploads from any timezone near midnight UTC accepted.
@@ -204,7 +197,7 @@ function parseDataEntry(entry: Record<string, unknown>, type: string, index: num
     inputTokens: num(entry.inputTokens),
     outputTokens: num(entry.outputTokens),
     cacheCreationTokens: num(entry.cacheCreationTokens),
-    cacheReadTokens: num(entry.cacheReadTokens ?? entry.cachedInputTokens),
+    cacheReadTokens: num(entry.cacheReadTokens || entry.cachedInputTokens),
     totalTokens: num(entry.totalTokens),
     costUsd: extractCost(entry),
     modelsUsed: models,

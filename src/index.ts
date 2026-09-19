@@ -1309,6 +1309,14 @@ app.post('/api/upload', async (c) => {
       if (entry.costUsd > 10000) {
         queueFlag(entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd }));
       }
+      // $100 per million tokens, 30%+ above all-Opus-everything. A flag, not
+      // a reject: per-request billing (Cursor) and premium models (o1-pro
+      // $600/M output) make any ratio cap unsound as a hard gate.
+      // ponytail: ceiling $100/M flag. Signal = flag volume on a vendor bill
+      // shape; next rung = per-platform caps.
+      if (entry.totalTokens > 0 && entry.costUsd > (entry.totalTokens / 1e6) * 100) {
+        queueFlag(entry.date, 'cost_implausible', JSON.stringify({ cost_usd: entry.costUsd, total_tokens: entry.totalTokens }));
+      }
     }
     // Relative tripwire: a row above 20x the pre-upsert trailing-30d
     // daily median (sampled above, before this upload committed, so a
