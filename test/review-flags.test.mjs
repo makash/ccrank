@@ -990,6 +990,273 @@ test('median gate needs 7 distinct days: 8 rows over 2 dates do not flag', async
   assert.equal(batches.length, 1);
 });
 
+// B2: plausible costly per-request Cursor rows must never trip a hard reject
+// (the d106177 lesson). Whole-report composition: zero-token cents rows,
+// tiny-token per-request rows, and normal rows upload together — 200, every
+// row persisted, flags review-only.
+test('B2: costly per-request Cursor whole-report uploads 200 with every row persisted', async () => {
+  const { db, batches } = createUploadDatabase();
+  const res = await upload(db, datedReport([
+    { date: '2026-09-10', totalTokens: 0, totalCost: 0.04, inputTokens: 0, outputTokens: 0 },
+    { date: '2026-09-11', totalTokens: 150, totalCost: 0.04 },
+    { date: '2026-09-12', totalTokens: 10, totalCost: 0.10, inputTokens: 7, outputTokens: 3 },
+    { date: '2026-09-13', totalTokens: 430, totalCost: 0.01 },
+  ]));
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.entries, 4);
+  // Every row persisted: review-only flagging never drops report rows.
+  const usage = batches.find((batch) => batch.length > 0 && /INSERT INTO daily_usage/.test(batch[0].sql));
+  assert.ok(usage, 'expected a daily_usage batch');
+  assert.equal(usage.length, 4);
+  assert.deepEqual(usage.map((stmt) => stmt.bindings[10]), [0, 150, 10, 430]);
+  // Only per-row cost-shape flags ($10k/M row included); no reject anywhere.
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 2);
+  assert.ok(flags.every((f) => f.bindings[3] === 'cost_implausible'));
+});
+
+// Daily-aggregate tripwire: the leaderboard SUMs each day across source x
+// platform rows, so per-row absolute checks miss split totals (two same-day
+// 6B rows from distinct sources total 12B with neither row tripping). The
+// handler re-reads stored per-day totals AFTER the upsert commits; this
+// stateful store answers that read from the same rows the upsert merged.
+const AGG_NUMERIC_COLS = [
+  'input_tokens',
+  'output_tokens',
+  'cache_creation_tokens',
+  'cache_read_tokens',
+  'total_tokens',
+  'cost_usd',
+];
+const AGG_BIND_POS = {
+  input_tokens: 6,
+  output_tokens: 7,
+  cache_creation_tokens: 8,
+  cache_read_tokens: 9,
+  total_tokens: 10,
+  cost_usd: 11,
+};
+
+function createAggregateDatabase({ failAggregate = false } = {}) {
+  const usage = new Map(); // user|date|source|platform -> numerics row
+  const batches = [];
+  const aggregateQueries = [];
+  const db = {
+    prepare(sql) {
+      if (failAggregate && /SUM\(total_tokens\)/.test(sql) && /GROUP BY date/.test(sql)) {
+        throw new Error('aggregate unavailable');
+      }
+      const firstFor = async () => {
+        if (/FROM api_tokens/.test(sql)) return { id: 'token-1', user_id: normalUser.id };
+        if (/FROM users/.test(sql)) return normalUser;
+        return null;
+      };
+      const allFor = async (bindings) => {
+        if (/ORDER BY total_tokens/.test(sql)) {
+          return {
+            results: [...usage.values()]
+              .filter((row) => row.total_tokens > 0)
+              .sort((a, b) => a.total_tokens - b.total_tokens)
+              .map((row) => ({ date: row.date, total_tokens: row.total_tokens })),
+          };
+        }
+        if (/SUM\(total_tokens\)/.test(sql) && /GROUP BY date/.test(sql)) {
+          aggregateQueries.push(bindings);
+          const dates = bindings.slice(1);
+          const sums = new Map();
+          for (const row of usage.values()) {
+            if (dates.includes(row.date)) {
+              sums.set(row.date, (sums.get(row.date) || 0) + row.total_tokens);
+            }
+          }
+          return { results: [...sums.entries()].map(([date, day_total]) => ({ date, day_total })) };
+        }
+        return { results: [] };
+      };
+      const statement = {
+        sql,
+        bindings: [],
+        first: () => firstFor([]),
+        all: () => allFor([]),
+        run: async () => ({ success: true }),
+        bind(...bindings) {
+          return {
+            sql,
+            bindings,
+            first: () => firstFor(bindings),
+            all: () => allFor(bindings),
+            run: async () => ({ success: true }),
+          };
+        },
+      };
+      return statement;
+    },
+    async batch(batch) {
+      batches.push(batch);
+      for (const stmt of batch) {
+        if (/INSERT INTO daily_usage/.test(stmt.sql)) {
+          const b = stmt.bindings;
+          const key = [b[2], b[3], b[4], b[5]].join('|');
+          const prev = usage.get(key) || {
+            user_id: b[2],
+            date: b[3],
+            source: b[4],
+            platform: b[5],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0,
+          };
+          const next = { ...prev };
+          for (const column of AGG_NUMERIC_COLS) {
+            const incoming = Number(b[AGG_BIND_POS[column]]) || 0;
+            if (stmt.sql.includes(`MAX(excluded.${column}, daily_usage.${column})`)) {
+              next[column] = Math.max(prev[column], incoming);
+            } else {
+              next[column] = incoming;
+            }
+          }
+          usage.set(key, next);
+        }
+      }
+      return batch.map(() => ({ success: true }));
+    },
+  };
+  return { db, batches, usage, aggregateQueries };
+}
+
+function uploadAs(db, reportJson, source, extraBody = {}) {
+  return app.default.request(
+    'https://ccrank.dev/api/upload',
+    {
+      method: 'POST',
+      headers: { Authorization: 'Bearer [REDACTED]', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ json: reportJson, source, ...extraBody }),
+    },
+    { DB: db }
+  );
+}
+
+function singleRowReport(date, totalTokens, totalCost) {
+  return JSON.stringify({
+    type: 'daily',
+    daily: [{
+      date,
+      inputTokens: totalTokens - 100,
+      outputTokens: 100,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens,
+      totalCost,
+      modelsUsed: ['claude-sonnet-4-5'],
+    }],
+  });
+}
+
+test('daily aggregate: two same-day 6B rows from distinct sources flag once', async () => {
+  const { db, batches, usage } = createAggregateDatabase();
+
+  const first = await uploadAs(db, singleRowReport('2026-09-10', 6_000_000_000, 600), 'laptop');
+  assert.equal(first.status, 200);
+  assert.equal(flagBatch(batches), null); // 6B trips nothing on its own
+
+  const second = await uploadAs(db, singleRowReport('2026-09-10', 6_000_000_000, 600), 'secrig');
+  assert.equal(second.status, 200);
+  assert.equal((await second.json()).ok, true);
+
+  // Max-merge unchanged: both source rows persist at their peaks.
+  assert.equal(usage.get('user-1|2026-09-10|laptop|claude').total_tokens, 6_000_000_000);
+  assert.equal(usage.get('user-1|2026-09-10|secrig|claude').total_tokens, 6_000_000_000);
+  // Exactly one flag: the daily aggregate (neither row trips per-row checks).
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[2], '2026-09-10');
+  assert.equal(flags[0].bindings[3], 'tokens_daily_total');
+  assert.equal(JSON.parse(flags[0].bindings[4]).day_total_tokens, 12_000_000_000);
+});
+
+test('daily aggregate: same-day rows across platforms sum into one flag', async () => {
+  const { db, batches, usage } = createAggregateDatabase();
+
+  const first = await uploadAs(db, singleRowReport('2026-09-11', 6_000_000_000, 600), 'secrig', { platform: 'codex' });
+  assert.equal(first.status, 200);
+  assert.equal(flagBatch(batches), null);
+  const second = await uploadAs(db, singleRowReport('2026-09-11', 6_000_000_000, 600), 'secrig', { platform: 'cursor' });
+  assert.equal(second.status, 200);
+  assert.equal((await second.json()).ok, true);
+
+  assert.equal(usage.get('user-1|2026-09-11|secrig|codex').total_tokens, 6_000_000_000);
+  assert.equal(usage.get('user-1|2026-09-11|secrig|cursor').total_tokens, 6_000_000_000);
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'tokens_daily_total');
+  assert.equal(JSON.parse(flags[0].bindings[4]).day_total_tokens, 12_000_000_000);
+});
+
+test('daily aggregate: exactly 10B across sources does not flag (strict >)', async () => {
+  const { db, batches, usage } = createAggregateDatabase();
+
+  assert.equal((await uploadAs(db, singleRowReport('2026-09-10', 5_000_000_000, 500), 'laptop')).status, 200);
+  assert.equal((await uploadAs(db, singleRowReport('2026-09-10', 5_000_000_000, 500), 'secrig')).status, 200);
+
+  assert.equal(usage.get('user-1|2026-09-10|laptop|claude').total_tokens, 5_000_000_000);
+  assert.equal(usage.get('user-1|2026-09-10|secrig|claude').total_tokens, 5_000_000_000);
+  assert.equal(flagBatch(batches), null);
+});
+
+test('daily aggregate: pre-existing peak plus new rows counts (post-upsert read)', async () => {
+  const { db, batches } = createAggregateDatabase();
+
+  // 9.9B alone trips nothing; a later 0.2B row from another source pushes
+  // the stored day total to 10.1B, which must flag.
+  assert.equal((await uploadAs(db, singleRowReport('2026-09-10', 9_900_000_000, 990), 'laptop')).status, 200);
+  assert.equal(flagBatch(batches), null);
+  const res = await uploadAs(db, singleRowReport('2026-09-10', 200_000_000, 20), 'secrig');
+  assert.equal(res.status, 200);
+
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'tokens_daily_total');
+  assert.equal(JSON.parse(flags[0].bindings[4]).day_total_tokens, 10_100_000_000);
+});
+
+test('daily aggregate: failing aggregate read still inserts absolute flags', async () => {
+  const { db, batches } = createAggregateDatabase({ failAggregate: true });
+
+  const res = await uploadAs(db, singleRowReport('2026-09-10', 11_000_000_000, 5), 'secrig');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).ok, true);
+
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch despite aggregate failure');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[3], 'tokens_absolute');
+});
+
+test('daily aggregate: 600-date upload chunks the aggregate read and stays clean', async () => {
+  const { db, batches, aggregateQueries } = createAggregateDatabase();
+
+  const res = await uploadAs(db, h4DailyReport(600), 'secrig');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).ok, true);
+
+  // 500-per-chunk: 600 distinct dates take exactly two aggregate reads.
+  assert.equal(aggregateQueries.length, 2);
+  assert.equal(aggregateQueries[0].length - 1, 500);
+  assert.equal(aggregateQueries[1].length - 1, 100);
+  assert.equal(flagBatch(batches), null);
+  assert.equal(batches.length, 1); // usage upsert only
+});
+
 // S18: pre-migration cover must survive a SYNCHRONOUSLY throwing prepare()
 // (missing review_flags table), not just async rejections.
 test('GET /admin survives a synchronously throwing review_flags prepare', async () => {
