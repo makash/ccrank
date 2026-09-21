@@ -255,7 +255,7 @@ test('uploads always max-merge, even when the CLI asks to replace', async () => 
     {
       method: 'POST',
       headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: report, source: 'secrig', platform: 'kimi', replace: true }),
+      body: JSON.stringify({ json: report, source: 'secrig', platform: 'kimi', cli_version: '1.7.1', replace: true }),
     },
     { DB: replacement.db }
   );
@@ -277,7 +277,7 @@ test('uploads always max-merge, even when the CLI asks to replace', async () => 
     {
       method: 'POST',
       headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: report, source: 'secrig', platform: 'kimi' }),
+      body: JSON.stringify({ json: report, source: 'secrig', platform: 'kimi', cli_version: '1.7.1' }),
     },
     { DB: legacy.db }
   );

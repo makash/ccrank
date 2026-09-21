@@ -27,9 +27,12 @@ jobs:
         run: |
           cd cli/ccrank-git
           mkdir -p dist
-          GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o dist/ccrank-git_darwin_arm64 .
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o dist/ccrank-git_linux_amd64 .
-          GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o dist/ccrank-git_windows_amd64.exe .
+          # Stamp the release tag into main.version so --version and uploads
+          # identify the binary; on a release event ref_name is the tag.
+          LDFLAGS="-s -w -X main.version=${{ github.ref_name }}"
+          GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/ccrank-git_darwin_arm64 .
+          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/ccrank-git_linux_amd64 .
+          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/ccrank-git_windows_amd64.exe .
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2

@@ -412,7 +412,7 @@ async function lifecycleUpload(db, reportJson, extraBody = {}) {
     {
       method: 'POST',
       headers: { Authorization: 'Bearer [REDACTED]', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: reportJson, source: 'secrig', ...extraBody }),
+      body: JSON.stringify({ json: reportJson, source: 'secrig', cli_version: '1.7.1', ...extraBody }),
     },
     { DB: db }
   );

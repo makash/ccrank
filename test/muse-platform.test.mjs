@@ -155,7 +155,7 @@ test('uploads land on the muse platform and max-merge like every other platform'
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
-      body: JSON.stringify({ json: report, source: 'ccrank-git', platform: 'muse' }),
+      body: JSON.stringify({ json: report, source: 'ccrank-git', platform: 'muse', cli_version: '1.7.1' }),
     },
     { DB: db },
   );
@@ -188,7 +188,7 @@ test('uploads land on the muse platform and max-merge like every other platform'
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
-      body: JSON.stringify({ json: report, source: 'ccrank-git' }),
+      body: JSON.stringify({ json: report, source: 'ccrank-git', cli_version: '1.7.1' }),
     },
     { DB: db },
   );
