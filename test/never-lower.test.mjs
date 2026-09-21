@@ -292,7 +292,7 @@ async function b3Upload(db, rows, extraBody = {}) {
     {
       method: 'POST',
       headers: { Authorization: 'Bearer [REDACTED]', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: b3Report(rows), source: 'secrig', ...extraBody }),
+      body: JSON.stringify({ json: b3Report(rows), source: 'secrig', cli_version: '1.7.1', ...extraBody }),
     },
     { DB: db }
   );

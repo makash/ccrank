@@ -338,6 +338,7 @@ test('upload endpoint maps validation failures to HTTP 400', async () => {
       body: JSON.stringify({
         json: JSON.stringify({ type: 'daily', daily: [dailyEntry({ inputTokens: -5 })] }),
         source: 'secrig',
+        cli_version: '1.7.1',
       }),
     },
     { DB: db },
@@ -353,6 +354,7 @@ test('upload endpoint maps validation failures to HTTP 400', async () => {
       body: JSON.stringify({
         json: JSON.stringify({ type: 'daily', daily: [dailyEntry()] }),
         source: 'secrig',
+        cli_version: '1.7.1',
       }),
     },
     { DB: db },
@@ -510,6 +512,7 @@ test('S17 pin: mixed valid+invalid session upload fails closed with zero daily_u
           ],
         }),
         source: 'secrig',
+        cli_version: '1.7.1',
       }),
     },
     { DB: db },

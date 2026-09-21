@@ -155,6 +155,53 @@ function computeStreak(values: number[]): number {
   return streak;
 }
 
+// ─── CLI minimum-version gate ─────────────────────────────────────────────────
+// Authenticated POST /api/upload and /api/git/upload require a top-level
+// cli_version at or above MIN_CLI_VERSION. Anything missing, malformed, or
+// older is rejected with HTTP 426 before parsing or any D1 write, so stale
+// binaries fail loudly instead of uploading rows the server can no longer
+// interpret. This gate never touches usage history: it runs before the
+// max-merge path and writes nothing itself.
+const MIN_CLI_VERSION = '1.7.1';
+const MIN_CLI_PARTS: [number, number, number] = [1, 7, 1];
+const CLI_RELEASE_URL = 'https://github.com/makash/ccrank/releases/latest';
+
+// Narrow, nonthrowing semver parse: optional leading v, exactly
+// major.minor.patch numerics. Anything else (prereleases, ranges,
+// non-strings) is malformed and returns null.
+function parseCliVersion(raw: unknown): [number, number, number] | null {
+  if (typeof raw !== 'string') return null;
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function cliVersionAtLeast(raw: unknown): boolean {
+  const parts = parseCliVersion(raw);
+  if (!parts) return false;
+  for (let i = 0; i < 3; i++) {
+    if (parts[i] !== MIN_CLI_PARTS[i]) return parts[i] > MIN_CLI_PARTS[i];
+  }
+  return true;
+}
+
+// Builds the 426 rejection body for a stale CLI. seen_cli_version echoes
+// back whatever value arrived, but only when one was actually sent.
+function cliVersionRejection(seen: unknown): Record<string, unknown> {
+  const detail =
+    seen === undefined
+      ? 'Missing cli_version'
+      : `Unsupported cli_version ${JSON.stringify(seen) ?? 'null'}`;
+  const payload: Record<string, unknown> = {
+    ok: false,
+    error: `${detail}: this server requires CLI >= ${MIN_CLI_VERSION}. Download the latest release: ${CLI_RELEASE_URL}`,
+    min_cli_version: MIN_CLI_VERSION,
+    release_url: CLI_RELEASE_URL,
+  };
+  if (seen !== undefined) payload.seen_cli_version = seen;
+  return payload;
+}
+
 // ─── Pages ──────────────────────────────────────────────────────────────────────
 
 app.get('/about', (c) => {
@@ -1152,11 +1199,15 @@ app.post('/api/upload', async (c) => {
   const user = sessionUser || tokenUser;
   if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
 
-  let body: { json: string; source?: string; platform?: string };
+  let body: { json: string; source?: string; platform?: string; cli_version?: unknown };
   try {
     body = await c.req.json();
   } catch {
     return c.json({ ok: false, error: 'Invalid request body' }, 400);
+  }
+
+  if (!cliVersionAtLeast(body.cli_version)) {
+    return c.json(cliVersionRejection(body.cli_version), 426);
   }
 
   if (!body.json || typeof body.json !== 'string') {
@@ -1392,6 +1443,7 @@ app.post('/api/git/upload', async (c) => {
 
   let body: {
     machine?: string;
+    cli_version?: unknown;
     projects: {
       repoName: string;
       repoSlug: string;
@@ -1404,6 +1456,10 @@ app.post('/api/git/upload', async (c) => {
     body = await c.req.json();
   } catch {
     return c.json({ ok: false, error: 'Invalid request body' }, 400);
+  }
+
+  if (!cliVersionAtLeast(body.cli_version)) {
+    return c.json(cliVersionRejection(body.cli_version), 426);
   }
 
   if (!Array.isArray(body.projects) || body.projects.length === 0) {

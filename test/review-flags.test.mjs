@@ -122,7 +122,7 @@ async function upload(db, reportJson) {
     {
       method: 'POST',
       headers: { Authorization: 'Bearer [REDACTED]', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: reportJson, source: 'secrig' }),
+      body: JSON.stringify({ json: reportJson, source: 'secrig', cli_version: '1.7.1' }),
     },
     { DB: db }
   );
@@ -1144,7 +1144,7 @@ function uploadAs(db, reportJson, source, extraBody = {}) {
     {
       method: 'POST',
       headers: { Authorization: 'Bearer [REDACTED]', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ json: reportJson, source, ...extraBody }),
+      body: JSON.stringify({ json: reportJson, source, cli_version: '1.7.1', ...extraBody }),
     },
     { DB: db }
   );
