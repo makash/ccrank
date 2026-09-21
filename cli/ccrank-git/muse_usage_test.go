@@ -629,7 +629,11 @@ func TestMuseLineMayCount(t *testing.T) {
 		t.Fatal("literal marker line must parse")
 	}
 	if !museLineMayCount([]byte(`{"kind":"model_\u0063ompleted"}`)) {
-		t.Fatal("\\u-escaped line must fall back to parsing")
+		t.Fatal("\\u-escaped marker char must fall back to parsing")
+	}
+	// Uppercase hex decodes the same (encoding/json accepts either case).
+	if !museLineMayCount([]byte(`{"kind":"\u006Dodel_completed"}`)) {
+		t.Fatal("uppercase-hex escape must fall back to parsing")
 	}
 	if museLineMayCount([]byte(`{"note":"plain transcript"}`)) {
 		t.Fatal("unmarked line without escapes must skip")
@@ -637,6 +641,40 @@ func TestMuseLineMayCount(t *testing.T) {
 	// Escaped envelope outer carries \\u (which contains \u): fallback.
 	if !museLineMayCount([]byte(`{"record_json":"model_\\u0063ompleted"}`)) {
 		t.Fatal("doubly escaped envelope line must fall back to parsing")
+	}
+	// Nested-syntax escapes can form an inner \u after record_json
+	// unwrapping, so they parse: backslash, u, hex digits.
+	if !museLineMayCount([]byte(`{"record_json":"mo\u005cu0064el"}`)) {
+		t.Fatal("\\u005c backslash escape must fall back to parsing")
+	}
+	if !museLineMayCount([]byte(`{"a":"\u0075"}`)) {
+		t.Fatal("\\u0075 u escape must fall back to parsing")
+	}
+	if !museLineMayCount([]byte(`{"a":"\u0030"}`)) {
+		t.Fatal("\\u0030 digit escape must fall back to parsing")
+	}
+	// Unrelated escapes cannot hide the marker and must skip: emoji,
+	// accented Latin, escaped HTML, newlines.
+	if museLineMayCount([]byte(`{"note":"\u2764\u00e9"}`)) {
+		t.Fatal("emoji/accent escapes must skip")
+	}
+	if museLineMayCount([]byte(`{"note":"\u003cdiv\u003e"}`)) {
+		t.Fatal("escaped HTML must skip")
+	}
+	if museLineMayCount([]byte(`{"note":"a\u000ab"}`)) {
+		t.Fatal("control escape must skip")
+	}
+	// \U is invalid JSON (encoding/json rejects it), so lines hiding
+	// behind it fail validation either way and must skip.
+	if museLineMayCount([]byte(`{"kind":"\U0064"}`)) {
+		t.Fatal("invalid \\U escape must skip")
+	}
+	// Malformed \u (non-hex, truncated) cannot decode to anything.
+	if museLineMayCount([]byte(`{"a":"\uZZZZ"}`)) {
+		t.Fatal("non-hex escape must skip")
+	}
+	if museLineMayCount([]byte(`{"a":"\u12`)) {
+		t.Fatal("truncated escape must skip without panicking")
 	}
 }
 
@@ -703,5 +741,198 @@ func TestMuseSameInodeReadOnce(t *testing.T) {
 	}
 	if got := numberValue(entries[0]["messages"]); got != 1 {
 		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesWhollyEscapedKind(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Every kind character \u-escaped (mixed hex case): no literal marker
+	// anywhere, only marker-char escape candidates.
+	escapedKind := `\u006D\u006f\u0064\u0065\u006c\u005f\u0063\u006F\u006d\u0070\u006C\u0065\u0074\u0065\u0064`
+	var decoded string
+	if err := json.Unmarshal([]byte(`"`+escapedKind+`"`), &decoded); err != nil || decoded != "model_completed" {
+		t.Fatalf("test setup broken: decoded=%q err=%v", decoded, err)
+	}
+	raw := museCompletedRecord("rec-wholly-esc", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0)
+	raw = strings.ReplaceAll(raw, "model_completed", escapedKind)
+	if strings.Contains(raw, "model_completed") {
+		t.Fatal("test setup leaked the literal marker")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		raw,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110 {
+		t.Fatalf("entries = %#v, want one 110-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesNestedEscapeBackslash(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Adversarial envelope: the inner kind's \u escape arrives with its
+	// backslash itself escaped in the outer line (\u005c + literal u0064),
+	// so the outer carries no marker-char escape at all — only the nested
+	// backslash candidate. A marker-chars-only check would skip this
+	// countable line.
+	inner := museCompletedRecord("rec-nest-bs", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0)
+	inner = strings.ReplaceAll(inner, "model_completed", "mo\\u0064el_completed")
+	v := strings.ReplaceAll(inner, "\\u0064", "\\u005cu0064")
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	outer := `{"children":[{"record_json":"` + v + `"}]}`
+	if strings.Contains(outer, "model_completed") {
+		t.Fatal("test setup leaked the literal marker")
+	}
+	if !strings.Contains(outer, `\u005c`) {
+		t.Fatal("test setup lost the nested backslash escape")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		outer,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110 {
+		t.Fatalf("entries = %#v, want one 110-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesNestedEscapeDigit(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Adversarial envelope: a hex digit of the inner kind's \u escape
+	// arrives via an outer \u0030 escape (\\u + \u0030 + 06f), so the outer
+	// line's only candidate is the nested digit escape.
+	inner := museCompletedRecord("rec-nest-dg", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0)
+	inner = strings.ReplaceAll(inner, "model_completed", "m\\u006fdel_completed")
+	v := strings.ReplaceAll(inner, "\\u006f", "\\\\u\\u003006f")
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	outer := `{"children":[{"record_json":"` + v + `"}]}`
+	if strings.Contains(outer, "model_completed") {
+		t.Fatal("test setup leaked the literal marker")
+	}
+	if !strings.Contains(outer, `\u0030`) {
+		t.Fatal("test setup lost the nested digit escape")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		outer,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110 {
+		t.Fatalf("entries = %#v, want one 110-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesMixedEscapedAndOrdinary(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Ordinary direct + ordinary envelope + wholly-escaped direct all count
+	// side by side; an emoji/accent line skips and a marker mention is
+	// rejected by validation.
+	escapedKind := `\u006d\u006f\u0064\u0065\u006c\u005f\u0063\u006f\u006d\u0070\u006c\u0065\u0074\u0065\u0064`
+	escaped := strings.ReplaceAll(
+		museCompletedRecord("rec-mix-esc", ts, "muse-spark-1.3", 50, 5, 0, 0, 0, 0),
+		"model_completed", escapedKind)
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		museCompletedRecord("rec-mix-1", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0),
+		museRetainedFrame(museCompletedRecord("rec-mix-2", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0)),
+		escaped,
+		`{"note":"caf\u00e9 \u2764"}`,
+		`{"note":"model_completed happened earlier"}`,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110+220+55 {
+		t.Fatalf("entries = %#v, want one 385-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 3 {
+		t.Fatalf("messages = %v, want 3 calls", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesSkipsNonCandidateEscapedLines(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// A giant line whose only escapes decode to unrelated characters
+	// (emoji + escaped HTML) carries no candidate and skips the parse;
+	// the neighbor still counts.
+	big := `{"note":"` + strings.Repeat(`\u2764`, 4<<20) + strings.Repeat(`\u003c`, 1<<20) + `"}`
+	if museLineMayCount([]byte(big)) {
+		t.Fatal("non-candidate escaped line must skip")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		big,
+		museCompletedRecord("rec-small", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0),
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 220 {
+		t.Fatalf("entries = %#v, want one 220-token entry", entries)
 	}
 }
