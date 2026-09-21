@@ -2,9 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -53,6 +54,34 @@ type museUsage struct {
 	Reasoning  float64 `json:"reasoning_tokens"`
 }
 
+// markerModelCompleted pre-filters session lines before JSON parsing. Only
+// model_completed events (direct, or wrapped in a retained_frame envelope's
+// record_json strings) can count, so a line carrying the contiguous literal
+// is always parsed. JSON \uXXXX escapes can encode plain ASCII too, so a
+// countable kind may hide without the literal — directly, or doubly escaped
+// inside a record_json envelope (the outer still contains \u). Any line with
+// a \u escape falls back to full parsing. Everything else (transcripts,
+// tool output, bare frames — the bulk of a multi-GB store) skips the parse
+// entirely.
+var markerModelCompleted = []byte("model_completed")
+
+// markerUnicodeEscapeLower/Upper catch the only JSON spelling that can hide
+// the marker: \uXXXX for ASCII letters. \U is invalid JSON but costs one
+// extra scan to stay safe against non-strict writers.
+var markerUnicodeEscapeLower = []byte(`\u`)
+var markerUnicodeEscapeUpper = []byte(`\U`)
+
+// museLineMayCount reports whether a raw session line could decode to a
+// countable event. Literal hits parse; \u-bearing lines parse as a safe
+// fallback since the kind may be escape-encoded; the rest skip.
+func museLineMayCount(raw []byte) bool {
+	if bytes.Contains(raw, markerModelCompleted) {
+		return true
+	}
+	return bytes.Contains(raw, markerUnicodeEscapeLower) ||
+		bytes.Contains(raw, markerUnicodeEscapeUpper)
+}
+
 type museDailyUsage struct {
 	Input         float64
 	Output        float64
@@ -94,6 +123,7 @@ func loadMuseUsageEntries() ([]map[string]any, error) {
 
 	byDate := map[string]*museDailyUsage{}
 	seenRecords := map[string]bool{}
+	var seenFiles []os.FileInfo
 	for _, root := range roots {
 		if _, err := os.Stat(root); err != nil {
 			if os.IsNotExist(err) {
@@ -111,6 +141,21 @@ func loadMuseUsageEntries() ([]map[string]any, error) {
 			if d.IsDir() || filepath.Base(path) != "session.jsonl" {
 				return nil
 			}
+			// Overlapping XDG/default roots or symlinks can surface the
+			// same file under two lexical paths: read each inode once.
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				if os.IsPermission(statErr) || os.IsNotExist(statErr) {
+					return nil
+				}
+				return statErr
+			}
+			for _, seen := range seenFiles {
+				if os.SameFile(seen, info) {
+					return nil
+				}
+			}
+			seenFiles = append(seenFiles, info)
 			return readMuseSession(path, byDate, seenRecords)
 		})
 		if err != nil {
@@ -189,22 +234,38 @@ func readMuseSession(path string, byDate map[string]*museDailyUsage, seenRecords
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	// ReadBytes rather than a Scanner: session lines are unbounded (a
+	// single 54MB retained_frame line killed the old 32MB-capped Scanner
+	// with "token too long" and skipped Muse entirely), the way the grok
+	// importer already reads its update files.
+	// A 1MB read buffer: the store is gigabytes of small lines, and the
+	// 4KB default would pay a syscall per handful of lines.
+	reader := bufio.NewReaderSize(file, 1024*1024)
+	for {
+		raw, readErr := reader.ReadBytes('\n')
+		// The marker check runs on the raw bytes, before trimming and
+		// parsing: most lines cannot count and never pay for either.
+		// Matching lines still go through full validation below, so a
+		// mere mention of the marker in some other payload can't count.
+		// Lines with \u escapes parse as a fallback: the kind may be
+		// escape-encoded without the contiguous literal.
+		if museLineMayCount(raw) {
+			if line := bytes.TrimSpace(raw); len(line) != 0 {
+				var outer museSessionLine
+				if err := json.Unmarshal(line, &outer); err == nil {
+					for _, record := range museSessionRecords(outer) {
+						accumulateMuseRecord(path, record, byDate, seenRecords)
+					}
+				}
+			}
 		}
-		var outer museSessionLine
-		if err := json.Unmarshal([]byte(line), &outer); err != nil {
-			continue
-		}
-		for _, record := range museSessionRecords(outer) {
-			accumulateMuseRecord(path, record, byDate, seenRecords)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
 		}
 	}
-	return scanner.Err()
 }
 
 // museSessionRecords unwraps a log line into its records. Most lines are
@@ -276,17 +337,17 @@ func accumulateMuseRecord(path string, record museSessionLine, byDate map[string
 		return
 	}
 
-	// Every model_completed record carries a stable id, so a re-read session
-	// file can never double-count a call.
-	fingerprint := strings.TrimSpace(record.RecordID)
-	if fingerprint == "" {
-		fingerprint = fmt.Sprintf("%s|%s|%s|%g|%g|%g|%g", path, date, modelName,
-			usage.Input, usage.Output, usage.Cached, usage.Reasoning)
+	// Records with stable ids dedup globally, so a re-read session file
+	// or overlapping roots can never double-count a call. Records without
+	// stable ids always count: token-only fingerprints collapse distinct
+	// equal calls, so re-read protection for them lives in the loader's
+	// same-file dedup instead.
+	if id := strings.TrimSpace(record.RecordID); id != "" {
+		if seenRecords[id] {
+			return
+		}
+		seenRecords[id] = true
 	}
-	if seenRecords[fingerprint] {
-		return
-	}
-	seenRecords[fingerprint] = true
 
 	day := byDate[date]
 	if day == nil {
