@@ -1302,8 +1302,13 @@ app.post('/api/upload', async (c) => {
     };
     // Absolute tripwires, evaluated per uploaded row. Independent ifs: one
     // row can trip both, yielding one flag per reason.
+    // The per-day aggregate check below shares TOKENS_ABSOLUTE_THRESHOLD:
+    // the leaderboard SUMs each day across source x platform rows, so the
+    // per-row check alone misses split totals (two same-day 6B rows from
+    // distinct sources total 12B with neither row tripping).
+    const TOKENS_ABSOLUTE_THRESHOLD = 10_000_000_000;
     for (const entry of report.entries) {
-      if (entry.totalTokens > 10_000_000_000) {
+      if (entry.totalTokens > TOKENS_ABSOLUTE_THRESHOLD) {
         queueFlag(entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens }));
       }
       if (entry.costUsd > 10000) {
@@ -1332,6 +1337,32 @@ app.post('/api/upload', async (c) => {
           queueFlag(entry.date, 'tokens_vs_median', JSON.stringify({ total_tokens: entry.totalTokens, median_30d: preUpsertMedian }));
         }
       }
+    }
+    // Daily-aggregate tripwire (post-upsert): read the stored per-day totals
+    // AFTER the upsert above commits, so pre-existing peaks from other
+    // sources/platforms count alongside the new rows. Own try/catch: a
+    // failing aggregate read must not discard the flags queued above (H5
+    // principle, same silent best-effort as the median pre-read), and never
+    // fails the upload. Chunked so a 3660-date upload never builds a
+    // parameter list near SQLite's variable limit.
+    try {
+      const touchedDates = [...new Set(report.entries.map((entry) => entry.date))];
+      const CHUNK_SIZE = 500;
+      for (let i = 0; i < touchedDates.length; i += CHUNK_SIZE) {
+        const chunk = touchedDates.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const totals = await c.env.DB.prepare(
+          `SELECT date, COALESCE(SUM(total_tokens), 0) AS day_total FROM daily_usage WHERE user_id = ? AND date IN (${placeholders}) GROUP BY date`
+        ).bind(user.id, ...chunk).all();
+        for (const row of ((totals.results || []) as any[])) {
+          const dayTotal = Number(row.day_total) || 0;
+          if (dayTotal > TOKENS_ABSOLUTE_THRESHOLD) {
+            queueFlag(String(row.date), 'tokens_daily_total', JSON.stringify({ day_total_tokens: dayTotal }));
+          }
+        }
+      }
+    } catch {
+      // Aggregate signal unavailable; absolute/median flags still insert below.
     }
     if (flagBatch.length > 0) {
       await c.env.DB.batch(flagBatch);
