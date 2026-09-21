@@ -306,7 +306,7 @@ function createLifecycleDatabase() {
         if (/COUNT\(\*\)/.test(sql)) return { cnt: 0 };
         return null;
       };
-      const allFor = async () => {
+      const allFor = async (bindings) => {
         if (/ORDER BY total_tokens/.test(sql)) {
           return {
             results: [...usage.values()]
@@ -314,6 +314,16 @@ function createLifecycleDatabase() {
               .sort((a, b) => a.total_tokens - b.total_tokens)
               .map((row) => ({ date: row.date, total_tokens: row.total_tokens })),
           };
+        }
+        if (/SUM\(total_tokens\)/.test(sql) && /GROUP BY date/.test(sql)) {
+          const dates = bindings.slice(1);
+          const sums = new Map();
+          for (const row of usage.values()) {
+            if (dates.includes(row.date)) {
+              sums.set(row.date, (sums.get(row.date) || 0) + row.total_tokens);
+            }
+          }
+          return { results: [...sums.entries()].map(([date, day_total]) => ({ date, day_total })) };
         }
         if (/FROM review_flags/.test(sql)) {
           return {
@@ -450,44 +460,56 @@ test('e2e: suspicious upload -> flag row -> review UI -> dismiss -> queue drains
   });
 
   // 1. Suspicious upload is accepted AND persists: review-only never drops data.
+  // The 11B row trips BOTH the per-row absolute check and the post-upsert
+  // daily aggregate (stored day total 11B > 10B).
   const up = await lifecycleUpload(db, report);
   assert.equal(up.status, 200);
   assert.equal((await up.json()).ok, true);
   const stored = usage.get('user-1|2026-09-10|secrig|claude');
   assert.ok(stored, 'expected the uploaded row in the usage store');
   assert.equal(stored.total_tokens, 11_000_000_000);
-  assert.equal(flags.length, 1);
-  assert.equal(flags[0].reason, 'tokens_absolute');
-  assert.equal(flags[0].status, 'open');
-  const flagId = flags[0].id;
-  const detail = flags[0].detail;
+  assert.equal(flags.length, 2);
+  assert.deepEqual(flags.map((f) => f.reason).sort(), ['tokens_absolute', 'tokens_daily_total']);
+  assert.ok(flags.every((f) => f.status === 'open'));
+  const byReason = Object.fromEntries(flags.map((f) => [f.reason, f]));
+  assert.equal(JSON.parse(byReason.tokens_daily_total.detail).day_total_tokens, 11_000_000_000);
+  const details = Object.fromEntries(flags.map((f) => [f.reason, f.detail]));
 
-  // 2. The review UI surfaces the flag with a working dismiss action.
+  // 2. The review UI surfaces both flags, each with a working dismiss action.
   const adminPage = await getAdmin(db, adminCookie);
   assert.equal(adminPage.status, 200);
   const page = await adminPage.text();
   assert.match(page, /tokens_absolute/);
+  assert.match(page, /tokens_daily_total/);
   assert.match(page, /Test User/);
-  assert.ok(page.includes(`/api/admin/flags/${flagId}/dismiss`), 'review UI must link the dismiss action');
+  for (const f of flags) {
+    assert.ok(page.includes(`/api/admin/flags/${f.id}/dismiss`), `review UI must link the dismiss action for ${f.reason}`);
+  }
 
-  // 3. Dismiss flips the row and the queue drains.
-  const dis = await dismiss(db, flagId, adminCookie);
-  assert.equal(dis.status, 200);
-  assert.equal((await dis.json()).ok, true);
-  assert.equal(flags[0].status, 'dismissed');
+  // 3. Dismissing each flips its row and the queue drains.
+  for (const f of flags) {
+    const dis = await dismiss(db, f.id, adminCookie);
+    assert.equal(dis.status, 200);
+    assert.equal((await dis.json()).ok, true);
+  }
+  assert.ok(flags.every((f) => f.status === 'dismissed'));
   const drained = await getAdmin(db, adminCookie);
   assert.equal(drained.status, 200);
   const drainedPage = await drained.text();
   assert.doesNotMatch(drainedPage, /tokens_absolute/);
+  assert.doesNotMatch(drainedPage, /tokens_daily_total/);
   assert.match(drainedPage, /No anomalies flagged/);
 
-  // 4. Re-upload re-trips but stays dismissed with original detail (mute-forever
-  // via INSERT OR IGNORE); the usage peak is untouched (idempotent max-merge).
+  // 4. Re-upload re-trips but both stay dismissed with original detail
+  // (mute-forever via INSERT OR IGNORE); the usage peak is untouched
+  // (idempotent max-merge).
   const up2 = await lifecycleUpload(db, report);
   assert.equal(up2.status, 200);
   assert.equal((await up2.json()).ok, true);
-  assert.equal(flags.length, 1);
-  assert.equal(flags[0].status, 'dismissed');
-  assert.equal(flags[0].detail, detail);
+  assert.equal(flags.length, 2);
+  assert.ok(flags.every((f) => f.status === 'dismissed'));
+  for (const f of flags) {
+    assert.equal(f.detail, details[f.reason], `${f.reason} detail changed after re-trip`);
+  }
   assert.equal(usage.get('user-1|2026-09-10|secrig|claude').total_tokens, 11_000_000_000);
 });
