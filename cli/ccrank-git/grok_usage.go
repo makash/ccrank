@@ -107,6 +107,7 @@ func loadGrokUsageEntries() ([]map[string]any, error) {
 
 	byDate := map[string]*grokDailyUsage{}
 	seenEvents := map[string]bool{}
+	visited := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Grok locks live session directories; skip what we cannot read
@@ -117,6 +118,9 @@ func loadGrokUsageEntries() ([]map[string]any, error) {
 			return err
 		}
 		if d.IsDir() || filepath.Base(path) != "updates.jsonl" {
+			return nil
+		}
+		if markVisitedFile(visited, path) {
 			return nil
 		}
 		return readGrokUpdates(path, byDate, seenEvents)

@@ -1190,6 +1190,27 @@ func loadPiKimiUsageEntries() ([]map[string]any, error) {
 	return loadPiUsageEntriesFor(platformKimi)
 }
 
+// markVisitedFile records path's canonical location and reports whether the
+// same physical file was already visited during this import. A log tree can
+// reach one file through two spellings (a symlinked copy beside the real
+// file, or two configured roots resolving to the same directory): without
+// the guard, importers whose fallback keys pin the path (cf.
+// grokEventFingerprint) count the file twice, and every importer inflates
+// sessionFiles. Content-keyed importers (kimi, glm, pi) already fold the
+// tokens; the guard keeps them from re-reading the bytes. On resolution
+// failure the lexical path is used so a file is never skipped.
+func markVisitedFile(seen map[string]bool, path string) bool {
+	key := path
+	if canonical, err := filepath.EvalSymlinks(path); err == nil {
+		key = canonical
+	}
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
+}
+
 func runPiUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadPiUsageEntriesFor(platformPi)
 	if err != nil {
@@ -1222,6 +1243,7 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	// RSS or 1M+ sessions. Next rung: an mtime-window bound or [16]byte
 	// hash keys.
 	seenRecords := map[string]bool{}
+	visited := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Pi can lock live session files; skip what we cannot read instead
@@ -1232,6 +1254,9 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 			return err
 		}
 		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
+			return nil
+		}
+		if markVisitedFile(visited, path) {
 			return nil
 		}
 		return readPiSession(path, byDate, seenRecords, platform)
