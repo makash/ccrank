@@ -1343,11 +1343,12 @@ app.post('/api/upload', async (c) => {
     // sources/platforms count alongside the new rows. Own try/catch: a
     // failing aggregate read must not discard the flags queued above (H5
     // principle, same silent best-effort as the median pre-read), and never
-    // fails the upload. Chunked so a 3660-date upload never builds a
-    // parameter list near SQLite's variable limit.
+    // fails the upload. Chunked at 99 touched dates (+1 user_id binding) per
+    // query: Cloudflare D1 allows at most 100 bound parameters per query,
+    // and a full-history upload may touch up to 3660 dates.
     try {
       const touchedDates = [...new Set(report.entries.map((entry) => entry.date))];
-      const CHUNK_SIZE = 500;
+      const CHUNK_SIZE = 99;
       for (let i = 0; i < touchedDates.length; i += CHUNK_SIZE) {
         const chunk = touchedDates.slice(i, i + CHUNK_SIZE);
         const placeholders = chunk.map(() => '?').join(',');

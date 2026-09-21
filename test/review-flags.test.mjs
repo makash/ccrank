@@ -1084,6 +1084,13 @@ function createAggregateDatabase({ failAggregate = false } = {}) {
         all: () => allFor([]),
         run: async () => ({ success: true }),
         bind(...bindings) {
+          // D1 allows at most 100 bound parameters per query: the real
+          // bind fails past that, so the mock must fail too — otherwise an
+          // oversized chunk silently passes here while prod drops the
+          // aggregate signal inside the handler's try/catch.
+          if (bindings.length > 100) {
+            throw new Error(`D1 bound-parameter limit exceeded: ${bindings.length} > 100`);
+          }
           return {
             sql,
             bindings,
@@ -1249,12 +1256,76 @@ test('daily aggregate: 600-date upload chunks the aggregate read and stays clean
   assert.equal(res.status, 200);
   assert.equal((await res.json()).ok, true);
 
-  // 500-per-chunk: 600 distinct dates take exactly two aggregate reads.
-  assert.equal(aggregateQueries.length, 2);
-  assert.equal(aggregateQueries[0].length - 1, 500);
-  assert.equal(aggregateQueries[1].length - 1, 100);
+  // 99 dates (+1 user_id binding) per chunk: 600 distinct dates take six
+  // full chunks plus a 6-date tail, every query within the D1 100-binding
+  // limit (the mock throws past 100, so an oversized chunk fails here).
+  assert.equal(aggregateQueries.length, 7);
+  assert.deepEqual(
+    aggregateQueries.map((q) => q.length - 1),
+    [99, 99, 99, 99, 99, 99, 6]
+  );
   assert.equal(flagBatch(batches), null);
   assert.equal(batches.length, 1); // usage upsert only
+});
+
+test('daily aggregate: split-source high day in a later chunk still flags', async () => {
+  const { db, batches, usage, aggregateQueries } = createAggregateDatabase();
+
+  // Seed: 6B on the target date from the first source trips nothing alone.
+  assert.equal((await uploadAs(db, singleRowReport('2026-09-10', 6_000_000_000, 600), 'laptop')).status, 200);
+  assert.equal(flagBatch(batches), null);
+
+  // Second source uploads 120 dates with the 6B target day at index 110 —
+  // past the first 99-date chunk — plus 119 tiny days.
+  const rows = [];
+  for (let i = 0; i < 120; i++) {
+    if (i === 110) {
+      rows.push({
+        date: '2026-09-10',
+        inputTokens: 6_000_000_000 - 100,
+        outputTokens: 100,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 6_000_000_000,
+        totalCost: 600,
+        modelsUsed: ['claude-sonnet-4-5'],
+      });
+    } else {
+      rows.push({
+        date: h4PastDate(i),
+        inputTokens: 330,
+        outputTokens: 100,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 430,
+        totalCost: 0.01,
+        modelsUsed: ['claude-sonnet-4-5'],
+      });
+    }
+  }
+  const before = aggregateQueries.length;
+  const res = await uploadAs(db, JSON.stringify({ type: 'daily', daily: rows }), 'secrig');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).ok, true);
+
+  // Two chunks (99 + 21); the high day sits in the second chunk.
+  const mine = aggregateQueries.slice(before);
+  assert.equal(mine.length, 2);
+  assert.equal(mine[0].length - 1, 99);
+  assert.equal(mine[1].length - 1, 21);
+  assert.ok(mine[1].slice(1).includes('2026-09-10'), 'high day must be read in the later chunk');
+
+  // The flag actually persists: exactly one daily-aggregate flag at 12B.
+  const flags = flagBatch(batches);
+  assert.ok(flags, 'expected a review_flags batch');
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bindings[2], '2026-09-10');
+  assert.equal(flags[0].bindings[3], 'tokens_daily_total');
+  assert.equal(JSON.parse(flags[0].bindings[4]).day_total_tokens, 12_000_000_000);
+  // Never-lower holds: both source peaks stored, tiny rows intact.
+  assert.equal(usage.get('user-1|2026-09-10|laptop|claude').total_tokens, 6_000_000_000);
+  assert.equal(usage.get('user-1|2026-09-10|secrig|claude').total_tokens, 6_000_000_000);
+  assert.equal(usage.get(`user-1|${h4PastDate(0)}|secrig|claude`).total_tokens, 430);
 });
 
 // S18: pre-migration cover must survive a SYNCHRONOUSLY throwing prepare()
