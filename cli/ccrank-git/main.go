@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,8 +37,35 @@ type Project struct {
 }
 
 type Payload struct {
-	Machine  string    `json:"machine,omitempty"`
-	Projects []Project `json:"projects"`
+	Machine    string    `json:"machine,omitempty"`
+	CliVersion string    `json:"cli_version,omitempty"`
+	Projects   []Project `json:"projects"`
+}
+
+// version is the CLI release tag (e.g. v1.7.0), stamped at build time via
+// -ldflags "-X main.version=<tag>" (see .github/workflows/ccrank-git-release.yml).
+// Unstamped local builds report the explicit "dev" fallback instead of an
+// empty string, so every binary identifies itself on --version and uploads.
+var version = "dev"
+
+// cliVersion returns the stamped release tag, or "dev" when the binary was
+// built without ldflags stamping (or with a blank value).
+func cliVersion() string {
+	if v := strings.TrimSpace(version); v != "" {
+		return v
+	}
+	return "dev"
+}
+
+// newPayload builds a git-metadata payload stamped with the CLI version.
+func newPayload(machine string) Payload {
+	return Payload{Machine: strings.TrimSpace(machine), CliVersion: cliVersion()}
+}
+
+// printVersion reports the CLI release tag with enough build context to
+// identify the binary in bug reports.
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "ccrank-git %s (%s/%s, %s)\n", cliVersion(), runtime.GOOS, runtime.GOARCH, runtime.Version())
 }
 
 type Config struct {
@@ -70,7 +98,13 @@ func main() {
 	skipUsage := flag.Bool("skip-usage", false, "Skip automatic ccusage upload")
 	noUsage := flag.Bool("no-usage", false, "Alias for --skip-usage")
 	addThisRepo := flag.Bool("add-repo", false, "Add current repo (or scan directory) to ~/.ccrank/repos.json and exit")
+	versionFlag := flag.Bool("version", false, "Print the CLI version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		printVersion(os.Stdout)
+		return
+	}
 
 	if *allFlag || *allRepos {
 		fmt.Fprintln(os.Stderr, "Note: --all and --all-repos are deprecated. Config is used automatically.")
@@ -107,7 +141,7 @@ func main() {
 		repos = cfg.Repos
 	}
 
-	payload := Payload{Machine: machine}
+	payload := newPayload(machine)
 	summary := Summary{Errors: []string{}}
 	if len(repos) > 0 {
 		var err error
@@ -2009,9 +2043,10 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 	// never had this field; reintroducing it is how 2026-08-15 destroyed
 	// historical peaks. See test/never-lower.test.mjs.
 	payload := map[string]any{
-		"json":     report,
-		"source":   source,
-		"platform": platform,
+		"json":        report,
+		"source":      source,
+		"platform":    platform,
+		"cli_version": cliVersion(),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -2422,10 +2457,8 @@ func buildPayload(repoPaths []string, descriptionOverride string, machine string
 		summary.GitRepos += 1
 	}
 
-	payload := Payload{
-		Machine:  strings.TrimSpace(machine),
-		Projects: projects,
-	}
+	payload := newPayload(machine)
+	payload.Projects = projects
 
 	summary.Uploaded = len(projects)
 	if len(projects) == 0 {
