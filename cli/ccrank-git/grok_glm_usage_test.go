@@ -203,6 +203,110 @@ func TestGrokUsageIsEmptyWithoutASessionsDirectory(t *testing.T) {
 	}
 }
 
+func TestGrokUsageSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Eventless legacy lines pin the path in their fallback fingerprint, so a
+	// symlinked copy of the same file used to count every turn twice. The
+	// same-physical-file guard must read it once.
+	line := `{"timestamp":1786536000,"method":"_x.ai/session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"turn_completed","prompt_id":"prompt-1","usage":{"inputTokens":1000,"outputTokens":200,"totalTokens":1200,"cachedReadTokens":700,"costUsdTicks":10000000000}}}}`
+	real := filepath.Join(home, ".grok", "sessions", "%2Ftmp%2Frepo", "sess-1", "updates.jsonl")
+	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(real, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(home, ".grok", "sessions", "%2Ftmp%2Frepo", "sess-2")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "updates.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadGrokUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 1200 {
+		t.Fatalf("totalTokens = %v, want 1200 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("turns = %v, want 1", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestGLMUsageSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	real := filepath.Join(home, ".zcode", "cli", "rollout", "model-io-sess_abc.jsonl")
+	writeJSONL(t, real, []map[string]any{
+		glmCall("req-1", "2026-08-14T13:47:14.836Z", "GLM-5.3", 251, 17, 192, 0),
+	})
+	linkDir := filepath.Join(home, ".zcode", "cli", "rollout", "archive")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "model-io-sess_abc.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadGLMUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 268 {
+		t.Fatalf("totalTokens = %v, want 268 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestGLMUsageCountsMigratedRequestAcrossRootsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// The same rollout file migrated from the legacy root to the current one;
+	// the shared requestId must fold both copies into one record.
+	call := glmCall("req-1", "2026-08-14T13:47:14.836Z", "GLM-5.3", 251, 17, 192, 0)
+	writeJSONL(t, filepath.Join(home, ".zcode", "cli", "rollout", "model-io-sess_abc.jsonl"), []map[string]any{call})
+	writeJSONL(t, filepath.Join(home, ".zcode", "rollout", "model-io-sess_abc.jsonl"), []map[string]any{call})
+
+	entries, err := loadGLMUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 268 {
+		t.Fatalf("totalTokens = %v, want 268 (migrated request counted once)", got)
+	}
+}
+
 func glmCall(requestID, completedAt, model string, in, out, cacheRead, cacheWrite float64) map[string]any {
 	return map[string]any{
 		"completedAt": completedAt,

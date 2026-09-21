@@ -63,7 +63,11 @@ ccusage's convention is **additive**: `input + output + cacheCreation + cacheRea
 ### 3.2 Grok cost is in "ticks"; the divisor is `1e10`
 `grokCostTicksPerUSD = 1e10`. Pinned by fitting per-model rates against real logs: $1.77–$2.83/M fresh input, $0.39–$0.86/M cached reads — plausible xAI list prices. At `1e9` cached reads would price at $3.90–$8.60/M, which no provider charges. **Do not change without re-deriving.**
 
-### 3.3 `replace=true` vs `replace=false` decides whether the migration works
+### 3.3 `replace=true` vs `replace=false` decided whether the migration worked (superseded)
+> Superseded by the always-max-merge invariant (v1.2.1): the server now ignores
+> any `replace` field and max-merges every numeric column, so no upload can
+> lower a row (see `test/never-lower.test.mjs` and `AGENTS.md`). The paragraphs
+> below describe the pre-v1.2.1 behavior and are kept as history.
 Server-side (`src/index.ts`, the upload handler):
 
 ```js

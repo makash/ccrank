@@ -544,7 +544,33 @@ app.get('/admin', async (c) => {
   if (adminErr) return adminErr;
   const user = c.get('user')!;
 
-  const [userCount, uploadCount, inviteCount, allCodes] = await Promise.all([
+  // Pre-migration cover must be sync-throw-safe: a synchronously throwing
+  // prepare() (missing review_flags table) would blow up the Promise.all
+  // input array before .catch ever attaches. These wrappers convert sync
+  // throws into the same null/empty fallbacks as async rejections.
+  // ORDER BY id tiebreak: created_at is second-resolution; id is random
+  // text, so same-second rows get a stable-but-arbitrary order.
+  const safeFlagCount = (async () => {
+    try {
+      return await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM review_flags WHERE COALESCE(status, 'open') = 'open'").first();
+    } catch {
+      return null;
+    }
+  })();
+  const safeRecentFlags = (async () => {
+    try {
+      return await c.env.DB.prepare(
+        `SELECT rf.id, rf.user_id, rf.date, rf.reason, rf.detail, rf.created_at, u.display_name as display_name
+         FROM review_flags rf LEFT JOIN users u ON rf.user_id = u.id
+         WHERE COALESCE(rf.status, 'open') = 'open'
+         ORDER BY rf.created_at DESC, rf.id LIMIT 20`
+      ).all();
+    } catch {
+      return { results: [] };
+    }
+  })();
+
+  const [userCount, uploadCount, inviteCount, allCodes, flagCount, recentFlags] = await Promise.all([
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM users').first(),
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM uploads').first(),
     c.env.DB.prepare('SELECT COUNT(*) as cnt FROM invite_codes').first(),
@@ -553,6 +579,8 @@ app.get('/admin', async (c) => {
        FROM invite_codes ic LEFT JOIN users u ON ic.created_by = u.id
        ORDER BY ic.created_at DESC LIMIT 100`
     ).all(),
+    safeFlagCount,
+    safeRecentFlags,
   ]);
 
   return c.html(
@@ -560,7 +588,8 @@ app.get('/admin', async (c) => {
       total_users: (userCount as any)?.cnt ?? 0,
       total_uploads: (uploadCount as any)?.cnt ?? 0,
       total_invites: (inviteCount as any)?.cnt ?? 0,
-    }, (allCodes.results || []) as any[])
+      total_flags: (flagCount as any)?.cnt ?? 0,
+    }, (allCodes.results || []) as any[], (recentFlags.results || []) as any[])
   );
 });
 
@@ -1123,7 +1152,7 @@ app.post('/api/upload', async (c) => {
   const user = sessionUser || tokenUser;
   if (!user) return c.json({ ok: false, error: 'Unauthorized' }, 401);
 
-  let body: { json: string; source?: string; platform?: string; replace?: boolean };
+  let body: { json: string; source?: string; platform?: string };
   try {
     body = await c.req.json();
   } catch {
@@ -1143,6 +1172,15 @@ app.post('/api/upload', async (c) => {
     return c.json({ ok: false, error: err.message }, 400);
   }
 
+  // Uploads are bounded by distinct dates in history: a continuous user
+  // since Feb 2025 holds ~570 daily rows by Sept 2026. 3660 (~10 years of
+  // daily rows) stops hostile fan-out without touching honest reports
+  // (full-history pastes included). Rejected before any D1 batch runs.
+  const MAX_UPLOAD_ENTRIES = 3660;
+  if (report.entries.length > MAX_UPLOAD_ENTRIES) {
+    return c.json({ ok: false, error: `Too many entries: ${report.entries.length} exceeds the maximum of ${MAX_UPLOAD_ENTRIES}` }, 400);
+  }
+
   // Allow explicit platform override from CLI (e.g., ccrank-git sends platform)
   const platformOverride = isValidPlatform(body.platform) ? body.platform : null;
   if (platformOverride) {
@@ -1152,10 +1190,10 @@ app.post('/api/upload', async (c) => {
     }
   }
 
-  // Clean up legacy rows created by older parser versions when ccusage renamed date -> period.
-  await c.env.DB.prepare("DELETE FROM daily_usage WHERE user_id = ? AND source = ? AND date LIKE 'unknown-%'")
-    .bind(user.id, source)
-    .run();
+  // Legacy parsers could emit 'unknown-%' dates; the current parser rejects
+  // them instead, so there is nothing left to clean per upload. Manual
+  // one-time cleanup if an old deployment still has such rows:
+  //   DELETE FROM daily_usage WHERE date LIKE 'unknown-%';
 
   // Create upload record
   const uploadId = generateId();
@@ -1204,7 +1242,138 @@ app.post('/api/upload', async (c) => {
     )
   );
 
+  // Review-only anomaly queue: sample the trailing-30d median BEFORE the
+  // upsert batch commits. Sampling after the commit lets a stuffed upload
+  // set its own median so the 20x tripwire never fires. Best-effort: any
+  // failure falls through to null (median check skipped) and never fails
+  // the upload.
+  let preUpsertMedian: number | null = null;
+  try {
+    const medianRows = await c.env.DB.prepare(
+      `SELECT date, total_tokens FROM daily_usage
+       WHERE user_id = ? AND date >= date('now', '-30 days') AND total_tokens > 0
+       ORDER BY total_tokens`
+    ).bind(user.id).all();
+    const medianHistory = ((medianRows.results || []) as any[]);
+    const samples = medianHistory
+      .map((row) => Number(row.total_tokens) || 0)
+      .filter((n) => n > 0);
+    // Gate on distinct active days, not rows: one date can hold several rows
+    // (source x platform). Rows without a date each count as their own day
+    // (defensive; production rows always carry a date).
+    const distinctDays = new Set(
+      medianHistory
+        .filter((row) => (Number(row.total_tokens) || 0) > 0)
+        .map((row, i) => (typeof row.date === 'string' && row.date ? row.date : `\0row${i}`))
+    ).size;
+    if (distinctDays >= 7) {
+      const median = samples[Math.floor(samples.length / 2)];
+      if (median > 0) {
+        preUpsertMedian = median;
+      }
+    }
+  } catch {
+    preUpsertMedian = null;
+  }
+
   await c.env.DB.batch(batch);
+
+  // Review-only anomaly queue: flag suspicious rows for admin review.
+  // NEVER rejects: best-effort inside try/catch so flagging can never fail
+  // an upload (valid reports always return ok:true).
+  try {
+    const flagStmt = c.env.DB.prepare(
+      'INSERT OR IGNORE INTO review_flags (id, user_id, date, reason, detail) VALUES (?, ?, ?, ?, ?)'
+    );
+    const flagBatch: any[] = [];
+    // One upload must not flood the review queue: dedupe by (date, reason)
+    // (tripwires can fire on the same row, and a hostile report can repeat a
+    // date) and hard-cap the batch. The cap is 20 because GET /admin renders
+    // exactly the 20 most recent flags (LIMIT 20), so one upload can fill —
+    // but never overflow — the queue.
+    const MAX_FLAGS_PER_UPLOAD = 20;
+    const seenFlags = new Set<string>();
+    const queueFlag = (date: string, reason: string, detail: string) => {
+      if (flagBatch.length >= MAX_FLAGS_PER_UPLOAD) return;
+      const key = `${date}\0${reason}`;
+      if (seenFlags.has(key)) return;
+      seenFlags.add(key);
+      flagBatch.push(flagStmt.bind(generateId(), user.id, date, reason, detail));
+    };
+    // Absolute tripwires, evaluated per uploaded row. Independent ifs: one
+    // row can trip both, yielding one flag per reason.
+    // The per-day aggregate check below shares TOKENS_ABSOLUTE_THRESHOLD:
+    // the leaderboard SUMs each day across source x platform rows, so the
+    // per-row check alone misses split totals (two same-day 6B rows from
+    // distinct sources total 12B with neither row tripping).
+    const TOKENS_ABSOLUTE_THRESHOLD = 10_000_000_000;
+    for (const entry of report.entries) {
+      if (entry.totalTokens > TOKENS_ABSOLUTE_THRESHOLD) {
+        queueFlag(entry.date, 'tokens_absolute', JSON.stringify({ total_tokens: entry.totalTokens }));
+      }
+      if (entry.costUsd > 10000) {
+        queueFlag(entry.date, 'cost_absolute', JSON.stringify({ cost_usd: entry.costUsd }));
+      }
+      // $100 per million tokens, 30%+ above all-Opus-everything. A flag, not
+      // a reject: per-request billing (Cursor) and premium models (o1-pro
+      // $600/M output) make any ratio cap unsound as a hard gate.
+      // ponytail: ceiling $100/M flag. Signal = flag volume on a vendor bill
+      // shape; next rung = per-platform caps.
+      if (entry.totalTokens > 0 && entry.costUsd > (entry.totalTokens / 1e6) * 100) {
+        queueFlag(entry.date, 'cost_implausible', JSON.stringify({ cost_usd: entry.costUsd, total_tokens: entry.totalTokens }));
+      }
+      // Zero-token rows with significant cost: per-request billing is real
+      // (Cursor cents), but $100+ on zero tokens is not a real shape.
+      if (entry.totalTokens === 0 && entry.costUsd > 100) {
+        queueFlag(entry.date, 'cost_implausible', JSON.stringify({ cost_usd: entry.costUsd, total_tokens: 0 }));
+      }
+    }
+    // Relative tripwire: a row above 20x the pre-upsert trailing-30d
+    // daily median (sampled above, before this upload committed, so a
+    // stuffed upload cannot set its own median).
+    if (preUpsertMedian !== null) {
+      for (const entry of report.entries) {
+        if (entry.totalTokens > preUpsertMedian * 20) {
+          queueFlag(entry.date, 'tokens_vs_median', JSON.stringify({ total_tokens: entry.totalTokens, median_30d: preUpsertMedian }));
+        }
+      }
+    }
+    // Daily-aggregate tripwire (post-upsert): read the stored per-day totals
+    // AFTER the upsert above commits, so pre-existing peaks from other
+    // sources/platforms count alongside the new rows. Own try/catch: a
+    // failing aggregate read must not discard the flags queued above (H5
+    // principle, same silent best-effort as the median pre-read), and never
+    // fails the upload. Chunked at 99 touched dates (+1 user_id binding) per
+    // query: Cloudflare D1 allows at most 100 bound parameters per query,
+    // and a full-history upload may touch up to 3660 dates.
+    try {
+      const touchedDates = [...new Set(report.entries.map((entry) => entry.date))];
+      const CHUNK_SIZE = 99;
+      for (let i = 0; i < touchedDates.length; i += CHUNK_SIZE) {
+        const chunk = touchedDates.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const totals = await c.env.DB.prepare(
+          `SELECT date, COALESCE(SUM(total_tokens), 0) AS day_total FROM daily_usage WHERE user_id = ? AND date IN (${placeholders}) GROUP BY date`
+        ).bind(user.id, ...chunk).all();
+        for (const row of ((totals.results || []) as any[])) {
+          const dayTotal = Number(row.day_total) || 0;
+          if (dayTotal > TOKENS_ABSOLUTE_THRESHOLD) {
+            queueFlag(String(row.date), 'tokens_daily_total', JSON.stringify({ day_total_tokens: dayTotal }));
+          }
+        }
+      }
+    } catch {
+      // Aggregate signal unavailable; absolute/median flags still insert below.
+    }
+    if (flagBatch.length > 0) {
+      await c.env.DB.batch(flagBatch);
+    }
+  } catch (err) {
+    // Review-only: flagging errors (e.g. table missing pre-migration) must
+    // never fail the upload — but warn observably so a dead queue is not
+    // mistaken for "no anomalies".
+    console.warn('[review-flags] flagging failed (non-fatal):', err instanceof Error ? err.message : err);
+  }
 
   return c.json({
     ok: true,
@@ -1587,6 +1756,26 @@ app.post('/api/admin/invites', async (c) => {
 
   await c.env.DB.batch(stmts);
   return c.json({ ok: true, codes });
+});
+
+app.post('/api/admin/flags/:id/dismiss', async (c) => {
+  const user = c.get('user');
+  if (!user || !user.is_admin) return c.json({ ok: false, error: 'Unauthorized' }, 401);
+
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT id FROM review_flags WHERE id = ?').bind(id).first();
+  if (!row) return c.json({ ok: false, error: 'Not found' }, 404);
+
+  // Dismiss is mute-forever per (date, reason): the upload flag insert is
+  // INSERT OR IGNORE on UNIQUE(user_id, date, reason), so a later upload
+  // re-tripping the same (date, reason) inserts nothing — the flag stays
+  // 'dismissed' with its ORIGINAL detail and never re-opens. Pinned by the
+  // mute-forever test in test/flag-dismiss.test.mjs. Re-open-on-retrip
+  // (an upsert clause resetting status to 'open') is a deliberate future
+  // product decision, not a silent follow-up.
+  // Review-only: dismiss flips the flag status and never touches daily_usage.
+  await c.env.DB.prepare("UPDATE review_flags SET status = 'dismissed' WHERE id = ?").bind(id).run();
+  return c.json({ ok: true });
 });
 
 // ─── 404 ────────────────────────────────────────────────────────────────────────

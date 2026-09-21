@@ -861,8 +861,9 @@ export function invitesPage(user: User, codes: { code: string; used_by: string |
 
 export function adminPage(
   user: User,
-  stats: { total_users: number; total_uploads: number; total_invites: number },
-  codes: { code: string; use_count: number; max_uses: number; created_by_name: string | null }[]
+  stats: { total_users: number; total_uploads: number; total_invites: number; total_flags?: number },
+  codes: { code: string; use_count: number; max_uses: number; created_by_name: string | null }[],
+  flags: { id: string; user_id: string; date: string; reason: string; detail: string | null; created_at: string; display_name: string | null; status?: string | null }[] = []
 ): string {
   const rows = codes
     .map(
@@ -874,6 +875,19 @@ export function adminPage(
     )
     .join('');
 
+  const flagRows = flags
+    .map(
+      (f) => `<tr class="border-b border-gray-800/50">
+        <td class="py-2 px-4 text-sm text-gray-400">${escapeHtml(f.created_at)}</td>
+        <td class="py-2 px-4 text-sm">${f.display_name ? escapeHtml(f.display_name) : `<span class="font-mono text-xs">${escapeHtml(f.user_id)}</span>`}</td>
+        <td class="py-2 px-4 font-mono text-xs">${escapeHtml(f.date)}</td>
+        <td class="py-2 px-4"><span class="text-xs bg-red-900/40 text-red-300 border border-red-800/50 rounded px-2 py-0.5">${escapeHtml(f.reason)}</span></td>
+        <td class="py-2 px-4 font-mono text-xs text-gray-500">${f.detail ? escapeHtml(f.detail) : ''}</td>
+        <td class="py-2 px-4"><form method="POST" action="/api/admin/flags/${escapeHtml(f.id)}/dismiss"><button type="submit" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 rounded px-2 py-1 transition">Dismiss</button></form></td>
+      </tr>`
+    )
+    .join('');
+
   return layout(
     'Admin',
     `<div class="max-w-4xl mx-auto">
@@ -881,7 +895,7 @@ export function adminPage(
         <h1 class="text-2xl font-bold mb-1 text-yellow-400">Admin Panel</h1>
       </div>
 
-      <div class="grid grid-cols-3 gap-4 mb-8">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <div class="text-sm text-gray-400 mb-1">Total Users</div>
           <div class="text-2xl font-bold">${stats.total_users}</div>
@@ -893,6 +907,10 @@ export function adminPage(
         <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <div class="text-sm text-gray-400 mb-1">Invite Codes</div>
           <div class="text-2xl font-bold">${stats.total_invites}</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div class="text-sm text-gray-400 mb-1">Review Flags</div>
+          <div class="text-2xl font-bold">${stats.total_flags ?? 0}</div>
         </div>
       </div>
 
@@ -922,6 +940,28 @@ export function adminPage(
             else { alert('Failed'); btn.disabled = false; btn.textContent = 'Generate'; }
           });
         </script>
+      </div>
+
+      <div class="mb-8">
+        <h2 class="text-lg font-semibold mb-4">Review Queue <span class="text-sm font-normal text-gray-500">(anomalies are review-only &mdash; uploads are never rejected)</span></h2>
+        ${flags.length > 0
+          ? `<div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+              <table class="w-full">
+                <thead>
+                  <tr class="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
+                    <th class="py-2 px-4 text-left">Flagged</th>
+                    <th class="py-2 px-4 text-left">User</th>
+                    <th class="py-2 px-4 text-left">Date</th>
+                    <th class="py-2 px-4 text-left">Reason</th>
+                    <th class="py-2 px-4 text-left">Detail</th>
+                    <th class="py-2 px-4 text-left">Action</th>
+                  </tr>
+                </thead>
+                <tbody>${flagRows}</tbody>
+              </table>
+            </div>`
+          : '<p class="text-gray-500 text-sm">No anomalies flagged.</p>'
+        }
       </div>
 
       ${codes.length > 0

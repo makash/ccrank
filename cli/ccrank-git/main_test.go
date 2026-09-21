@@ -1271,3 +1271,501 @@ func TestMergeUsageEntriesAddsAntigravityToExistingDate(t *testing.T) {
 		t.Fatalf("modelBreakdowns[0].cost = %v", got)
 	}
 }
+
+func TestPiDedupCountsDuplicatedSessionFileOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".pi", "agent", "sessions")
+
+	records := []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+	}
+	writeJSONL(t, filepath.Join(root, "session-1.jsonl"), records)
+	writeJSONL(t, filepath.Join(root, "backups", "session-1-copy.jsonl"), records)
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 55 {
+		t.Fatalf("totalTokens = %v, want 55 (duplicated file counted once)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1", got)
+	}
+}
+
+func TestPiDedupCountsRereadRecordOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	message := map[string]any{
+		"type":      "message",
+		"timestamp": "2026-08-12T10:00:00Z",
+		"message": map[string]any{"usage": map[string]any{
+			"input": 50, "output": 5, "totalTokens": 55,
+			"cost": map[string]any{"total": 0.1},
+		}},
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		message,
+		message,
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 55 {
+		t.Fatalf("totalTokens = %v, want 55 (re-read record counted once)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1", got)
+	}
+}
+
+func TestPiDedupCoversSubagentTranscripts(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	tsMillis := float64(day.UnixMilli())
+	record := map[string]any{
+		"recordType": "message", "ts": tsMillis,
+		"timestamp": "2026-09-09T12:00:00Z", "model": "glm-5.3-flash",
+		"message": map[string]any{
+			"provider": "zai", "model": "glm-5.3-flash", "timestamp": tsMillis,
+			"usage": map[string]any{
+				"input": 2000, "output": 200, "cacheRead": 7000, "cacheWrite": 0,
+				"totalTokens": 9200, "cost": map[string]any{"total": 2.5},
+			},
+		},
+	}
+	base := filepath.Join(home, ".pi", "agent", "sessions", "sess", "subagent-artifacts")
+	writeJSONL(t, filepath.Join(base, "w1_transcript.jsonl"), []map[string]any{record, record})
+	writeJSONL(t, filepath.Join(base, "w2_transcript.jsonl"), []map[string]any{record})
+
+	entries, err := loadPiUsageEntriesFor(platformGLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 9200 {
+		t.Fatalf("totalTokens = %v, want 9200 (subagent duplicates counted once)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1", got)
+	}
+}
+
+func TestPiDedupKeepsDistinctRecords(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:01:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 60, "output": 6, "totalTokens": 66,
+				"cost": map[string]any{"total": 0.2},
+			}},
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 121 {
+		t.Fatalf("totalTokens = %v, want 121 (distinct records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiSameSecondIdenticalUsageCountsTwice(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Same second, same usage, differing only in the numeric ts flavor:
+	// two distinct records, so both count (safe direction: totals only
+	// ever go up).
+	day := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	tsBase := float64(day.UnixMilli())
+	usage := func() map[string]any {
+		return map[string]any{
+			"input": 50, "output": 5, "totalTokens": 55,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z", "ts": tsBase,
+			"message": map[string]any{"usage": usage()},
+		},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z", "ts": tsBase + 500,
+			"message": map[string]any{"usage": usage()},
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 110 {
+		t.Fatalf("totalTokens = %v, want 110 (same-second records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiFixedTimestampsOneBucketDifferentCountsTwice(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Identical timestamps in every flavor, one usage bucket different:
+	// distinct records, so both count.
+	usage := func(input float64) map[string]any {
+		return map[string]any{
+			"input": input, "output": 5, "totalTokens": input + 5,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": usage(50)},
+		},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": usage(60)},
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 120 {
+		t.Fatalf("totalTokens = %v, want 120 (one-bucket-different records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiDedupDistinguishesRawRecordShape(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Same date, model, timestamps, and usage, differing only in the raw
+	// record-shape field (type vs recordType): distinct lines, both count.
+	usage := func() map[string]any {
+		return map[string]any{
+			"input": 50, "output": 5, "totalTokens": 55,
+			"cost": map[string]any{"total": 0.1},
+		}
+	}
+	message := func() map[string]any {
+		return map[string]any{
+			"provider": "anthropic", "model": "claude-sonnet",
+			"timestamp": "2026-08-12T10:00:00Z", "usage": usage(),
+		}
+	}
+	writeJSONL(t, filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl"), []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": message(),
+		},
+		{
+			"recordType": "message", "timestamp": "2026-08-12T10:00:00Z",
+			"message": message(),
+		},
+	})
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 110 {
+		t.Fatalf("totalTokens = %v, want 110 (raw-shape-different records both counted)", got)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2", got)
+	}
+}
+
+func TestPiRecordFingerprintCoversRawFieldsAndTimestampReps(t *testing.T) {
+	newEntry := func() (*piSessionLine, *piUsage) {
+		usage := &piUsage{Input: 50, Output: 5, TotalTokens: 55, Cost: piUsageCost{Total: 0.1}}
+		entry := &piSessionLine{
+			Type: "message", Timestamp: "2026-08-12T10:00:00Z",
+			Provider: "anthropic", ModelID: "claude-sonnet",
+			Message: &piMessage{
+				Timestamp: "2026-08-12T10:00:00Z",
+				Provider:  "anthropic", Model: "claude-sonnet", Usage: usage,
+			},
+		}
+		return entry, usage
+	}
+	entry, usage := newEntry()
+	base := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", entry, usage, 55)
+
+	// Identical values stay deterministic.
+	again, againUsage := newEntry()
+	if got := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", again, againUsage, 55); got != base {
+		t.Fatal("identical records must produce identical fingerprints")
+	}
+
+	// Every raw record-shape field participates in the fingerprint.
+	mutations := []struct {
+		name   string
+		mutate func(*piSessionLine)
+	}{
+		{"Type", func(e *piSessionLine) { e.Type = "message2" }},
+		{"RecordType", func(e *piSessionLine) { e.RecordType = "message" }},
+		{"Provider", func(e *piSessionLine) { e.Provider = "other" }},
+		{"Model", func(e *piSessionLine) { e.Model = "other" }},
+		{"ModelID", func(e *piSessionLine) { e.ModelID = "other" }},
+	}
+	for _, m := range mutations {
+		mutated, mutatedUsage := newEntry()
+		m.mutate(mutated)
+		if got := piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", mutated, mutatedUsage, 55); got == base {
+			t.Fatalf("mutating %s must change the fingerprint", m.name)
+		}
+	}
+
+	// Same instant in different Go representations must not collapse to
+	// the same text: %v alone formats string "5" and float64 5 identically.
+	str, strUsage := newEntry()
+	str.Ts = "5"
+	num, numUsage := newEntry()
+	num.Ts = float64(5)
+	if piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", str, strUsage, 55) ==
+		piRecordFingerprint("2026-08-12", "pi-anthropic-claude-sonnet", num, numUsage, 55) {
+		t.Fatal("string and numeric timestamp reps must produce distinct fingerprints")
+	}
+}
+
+func TestKimiUsageSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	real := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "main", "wire.jsonl")
+	writeJSONL(t, real, []map[string]any{
+		{
+			"type":       "usage.record",
+			"time":       float64(1786038447534),
+			"model":      "moonshot-ai/kimi-k3",
+			"usageScope": "turn",
+			"usage": map[string]any{
+				"inputOther":         100,
+				"output":             20,
+				"inputCacheRead":     200,
+				"inputCacheCreation": 10,
+			},
+		},
+	})
+	linkDir := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "archive")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "wire.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadKimiUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 330 {
+		t.Fatalf("totalTokens = %v, want 330 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestPiSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".pi", "agent", "sessions")
+
+	real := filepath.Join(root, "session-1.jsonl")
+	writeJSONL(t, real, []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+	})
+	linkDir := filepath.Join(root, "backups")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "session-1-link.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 55 {
+		t.Fatalf("totalTokens = %v, want 55 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestUploadNeverSendsReplaceForAnyPlatform(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var payloads []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/upload" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		payloads = append(payloads, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	platforms := append([]string{platformCombined}, dedicatedPlatformNames...)
+	for i, platform := range platforms {
+		cacheName := platform
+		if platform == platformCombined {
+			cacheName = "combined"
+		}
+		entries := []map[string]any{{
+			"date":        "2026-09-04",
+			"totalTokens": float64((i + 1) * 10),
+			"totalCost":   0.1,
+		}}
+		report := map[string]any{"type": "daily", "daily": entries}
+		pending, err := prepareUsageUpload(report, entries, cacheName, "none")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(pending.Report, "replace") {
+			t.Fatalf("%s report must not mention replace: %s", platform, pending.Report)
+		}
+		if err := uploadCcusage(server.URL, "test-token", pending.Report, "rig-arbaz", platform); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(payloads) != len(platforms) {
+		t.Fatalf("payloads = %d, want %d", len(payloads), len(platforms))
+	}
+	for i, payload := range payloads {
+		if _, ok := payload["replace"]; ok {
+			t.Fatalf("%s payload must not send replace", platforms[i])
+		}
+		if payload["platform"] != platforms[i] {
+			t.Fatalf("platform = %#v, want %q", payload["platform"], platforms[i])
+		}
+		if _, ok := payload["json"].(string); !ok {
+			t.Fatalf("%s payload is missing its json report", platforms[i])
+		}
+	}
+}

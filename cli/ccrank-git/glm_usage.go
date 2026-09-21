@@ -87,6 +87,7 @@ func loadGLMUsageEntries() ([]map[string]any, error) {
 
 	byDate := map[string]*glmDailyUsage{}
 	seenRequests := map[string]bool{}
+	visited := map[string]bool{}
 	for _, root := range roots {
 		if _, err := os.Stat(root); err != nil {
 			if os.IsNotExist(err) {
@@ -105,6 +106,9 @@ func loadGLMUsageEntries() ([]map[string]any, error) {
 				return nil
 			}
 			if !strings.HasPrefix(filepath.Base(path), "model-io-") {
+				return nil
+			}
+			if markVisitedFile(visited, path) {
 				return nil
 			}
 			return readGLMRollout(path, byDate, seenRequests)

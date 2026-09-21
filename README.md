@@ -98,6 +98,34 @@ npm run db:migrate
 npm run db:seed
 ```
 
+Already-migrated databases: `db:migrate` is a fresh-DB chain and is not
+re-runnable (old `ALTER TABLE` steps abort on migrated DBs). Apply only the
+new files, in numeric order:
+
+```bash
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0011_review_flags.sql
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0012_unknown_date_cleanup.sql
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0013_review_flag_status.sql
+# local twin: add --local to each command above
+```
+
+
+Fresh databases need BOTH `npm run db:migrate` AND `npm run db:seed` —
+schema ships via the migrate chain while seed data
+(`0002_seed_invites.sql`) ships via the seed chain; neither command
+applies the other's files.
+
+If two PRs both add the same `NNNN_` number — e.g. `b0307a0`
+(`chore/perf-health`) added `migrations/0011_user_slugs.sql` while PR #18
+added `migrations/0011_review_flags.sql` — the second PR to merge renames
+its file to the next free number (check `ls migrations/`; `0011`–`0013`
+are taken on this branch by `0011_review_flags.sql`,
+`0012_unknown_date_cleanup.sql`, and `0013_review_flag_status.sql`),
+rewires `db:migrate` /
+`db:migrate:local` in numeric order, and re-runs `npm test`
+(`test/migrations.test.mjs` asserts contiguous numbers, numeric order,
+and order-identical `:local` twins).
+
 ### 4. Configure Google OAuth
 
 1. Create an **OAuth 2.0 Client ID** at [Google Cloud Console > Credentials](https://console.cloud.google.com/apis/credentials)

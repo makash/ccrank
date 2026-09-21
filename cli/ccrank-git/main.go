@@ -651,8 +651,10 @@ func unheldDedicatedAgent(agent string) string {
 // Since every ccusage invocation requests --by-agent, accepting a row without
 // those slices could permanently double-count usage from dedicated platforms.
 // A date whose usage came entirely from those agents collapses to a zero row
-// rather than disappearing, so an inflated row written by an earlier ccrank
-// version is overwritten instead of left ranked.
+// rather than disappearing, so the date stays represented in the local
+// report. The server max-merges, so the zero row cannot lower an inflated
+// row written by an earlier ccrank version; that row keeps its historical
+// peak (see test/never-lower.test.mjs).
 func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) {
 	rebuilt := make([]map[string]any, 0, len(entries))
 	for index, entry := range entries {
@@ -1188,6 +1190,27 @@ func loadPiKimiUsageEntries() ([]map[string]any, error) {
 	return loadPiUsageEntriesFor(platformKimi)
 }
 
+// markVisitedFile records path's canonical location and reports whether the
+// same physical file was already visited during this import. A log tree can
+// reach one file through two spellings (a symlinked copy beside the real
+// file, or two configured roots resolving to the same directory): without
+// the guard, importers whose fallback keys pin the path (cf.
+// grokEventFingerprint) count the file twice, and every importer inflates
+// sessionFiles. Content-keyed importers (kimi, glm, pi) already fold the
+// tokens; the guard keeps them from re-reading the bytes. On resolution
+// failure the lexical path is used so a file is never skipped.
+func markVisitedFile(seen map[string]bool, path string) bool {
+	key := path
+	if canonical, err := filepath.EvalSymlinks(path); err == nil {
+		key = canonical
+	}
+	if seen[key] {
+		return true
+	}
+	seen[key] = true
+	return false
+}
+
 func runPiUsage() (*pendingUsageUpload, *UsageSnapshot, error) {
 	entries, err := loadPiUsageEntriesFor(platformPi)
 	if err != nil {
@@ -1215,6 +1238,12 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	}
 
 	byDate := map[string]*piDailyUsage{}
+	// ponytail: seenRecords is an unbounded in-memory fingerprint set
+	// (~150-200B/key). Fine at current session counts. Signal: multi-GB
+	// RSS or 1M+ sessions. Next rung: an mtime-window bound or [16]byte
+	// hash keys.
+	seenRecords := map[string]bool{}
+	visited := map[string]bool{}
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Pi can lock live session files; skip what we cannot read instead
@@ -1227,7 +1256,10 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
 			return nil
 		}
-		return readPiSession(path, byDate, platform)
+		if markVisitedFile(visited, path) {
+			return nil
+		}
+		return readPiSession(path, byDate, seenRecords, platform)
 	})
 	if err != nil {
 		return nil, err
@@ -1291,7 +1323,7 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 	return entries, nil
 }
 
-func readPiSession(path string, byDate map[string]*piDailyUsage, platform string) error {
+func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map[string]bool, platform string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsPermission(err) {
@@ -1376,6 +1408,14 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, platform string
 			continue
 		}
 
+		// A duplicated .jsonl file or a re-read record carries the same
+		// content twice; count it once.
+		fingerprint := piRecordFingerprint(date, modelName, &entry, usage, totalTokens)
+		if seenRecords[fingerprint] {
+			continue
+		}
+		seenRecords[fingerprint] = true
+
 		day := byDate[date]
 		if day == nil {
 			day = &piDailyUsage{SessionFiles: map[string]bool{}, Models: map[string]*piModelUsage{}}
@@ -1403,6 +1443,34 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, platform string
 		modelUsage.Cost += usage.Cost.Total
 	}
 	return scanner.Err()
+}
+
+// piRecordFingerprint identifies a Pi usage record. Pi stamps session lines
+// with no stable record id (see piSessionLine), so fold on the normalized
+// content instead: the resolved date, the model the record counts toward,
+// the raw record-shape fields, every timestamp flavor the two session
+// shapes carry, and the usage buckets. That counts a duplicated .jsonl file
+// or a re-read record once for both main-session and subagent-transcript
+// shapes. A path+offset key (cf. grokEventFingerprint's fallback in
+// grok_usage.go) cannot dedup here: every line owns a unique offset within
+// a single walk, so content is the only shared key.
+func piRecordFingerprint(date, modelName string, entry *piSessionLine, usage *piUsage, totalTokens float64) string {
+	var msgTs any
+	if entry.Message != nil {
+		msgTs = entry.Message.Timestamp
+	}
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%g|%g|%g|%g|%g|%g",
+		date, modelName, entry.Type, entry.RecordType, entry.Provider, entry.Model, entry.ModelID,
+		piFingerprintTs(entry.Timestamp), piFingerprintTs(entry.Ts), piFingerprintTs(msgTs),
+		usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite,
+		totalTokens, usage.Cost.Total)
+}
+
+// piFingerprintTs formats an untyped timestamp for the fingerprint. The %T
+// prefix keeps distinct representations (string vs numeric vs nil) from
+// collapsing to the same text, while identical values stay deterministic.
+func piFingerprintTs(raw any) string {
+	return fmt.Sprintf("%T:%v", raw, raw)
 }
 
 func piSessionsPath() (string, error) {
@@ -1794,8 +1862,10 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 		// splits out Pi, which ccusage began importing natively and ccrank was
 		// merging on top of; version 4 splits out Codex, whose --by-agent
 		// slices ccrank used to fold into combined. Each split shrinks the
-		// combined bucket, so treat older maxima as empty once and let the
-		// lower corrected rows overwrite it.
+		// combined bucket, so treat older maxima as empty once and re-offer
+		// every current row; rows higher than the server peak apply, and the
+		// lower corrected rows are silently discarded by the server's
+		// max-merge, which can never lower history (see test/never-lower.test.mjs).
 		return maxima, nil
 	}
 

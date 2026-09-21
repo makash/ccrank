@@ -135,6 +135,51 @@ func TestOpenCodeUsageAggregatesAssistantMessages(t *testing.T) {
 	assertNum(t, breakdowns[1], "totalTokens", 660)
 }
 
+func TestOpenCodeUsageEmptyIdsAreNotDeduped(t *testing.T) {
+	localTZ := time.Local
+	noon := time.Date(2026, 8, 20, 12, 0, 0, 0, localTZ).UnixMilli()
+
+	first := openCodeFixtureTokens{Input: 100, Output: 200}
+	second := openCodeFixtureTokens{Input: 7, Output: 8}
+
+	// No PRIMARY KEY on purpose: two rows that carry no id are distinct
+	// valid replies and must both count, never collapse on the empty key.
+	dir := t.TempDir()
+	dbDir := filepath.Join(dir, "opencode")
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dbDir, "opencode.db"))
+	if err != nil {
+		t.Fatalf("open fixture db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE message (id text, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, row := range [][3]any{
+		{"", noon, openCodeFixtureData(t, "x-preview-f-free", 0.25, first)},
+		{"", noon, openCodeFixtureData(t, "qwen3-coder-480b", 0, second)},
+	} {
+		if _, err := db.Exec(`INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)`, row[0], "ses_fixture", row[1], row[1], row[2]); err != nil {
+			t.Fatalf("insert fixture row: %v", err)
+		}
+	}
+	db.Close()
+	t.Setenv("XDG_DATA_HOME", dir)
+
+	entries, err := loadOpenCodeUsageEntries()
+	if err != nil {
+		t.Fatalf("loadOpenCodeUsageEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	day := openCodeEntryByDate(t, entries, "2026-08-20")
+	assertNum(t, day, "totalTokens", 315)
+	assertNum(t, day, "totalCost", 0.25)
+}
+
 func TestOpenCodeUsageMissingInstallIsEmpty(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	entries, err := loadOpenCodeUsageEntries()
