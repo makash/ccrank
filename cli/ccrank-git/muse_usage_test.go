@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,38 @@ func museCompletedRecord(id string, recordedAt float64, model string, input, out
 	record := map[string]any{
 		"schema_version": 1,
 		"id":             id,
+		"stream":         map[string]any{"kind": "session", "id": "sess-1"},
+		"sequence":       1,
+		"recorded_at":    recordedAt,
+		"record_type":    "event",
+		"payload_type":   "runtime.session",
+		"payload": map[string]any{
+			"kind":   "run",
+			"run_id": "run-1",
+			"event": map[string]any{
+				"kind":  "model_completed",
+				"model": model,
+				"usage": map[string]any{
+					"input_tokens":       input,
+					"output_tokens":      output,
+					"cached_tokens":      cached,
+					"cache_write_tokens": cacheWrite,
+					"cache_read_tokens":  cacheRead,
+					"reasoning_tokens":   reasoning,
+				},
+			},
+		},
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+func museCompletedRecordNoID(recordedAt float64, model string, input, output, cached, cacheWrite, cacheRead, reasoning float64) string {
+	record := map[string]any{
+		"schema_version": 1,
 		"stream":         map[string]any{"kind": "session", "id": "sess-1"},
 		"sequence":       1,
 		"recorded_at":    recordedAt,
@@ -283,7 +316,7 @@ func TestMuseUsageDateFormats(t *testing.T) {
 	}
 }
 
-func TestMuseFallbackFingerprintDedups(t *testing.T) {
+func TestMuseEmptyIDPreservesSeparateCalls(t *testing.T) {
 	byDate := map[string]*museDailyUsage{}
 	seen := map[string]bool{}
 	record := museSessionLine{
@@ -295,16 +328,18 @@ func TestMuseFallbackFingerprintDedups(t *testing.T) {
 			Usage: &museUsage{Input: 100, Output: 10},
 		}},
 	}
-	// No record id: the path/date/model/counters fingerprint still dedups a
-	// re-read of the same line.
+	// No record id: without a stable id two equal calls are
+	// indistinguishable from a re-read, so both count. Re-read protection
+	// for id-less records lives in the loader's same-file dedup, not in a
+	// token fingerprint that would collapse distinct equal calls.
 	accumulateMuseRecord("/s/session.jsonl", record, byDate, seen)
 	accumulateMuseRecord("/s/session.jsonl", record, byDate, seen)
 	total := 0.0
 	for _, day := range byDate {
 		total += day.TotalTokens
 	}
-	if total != 110 {
-		t.Fatalf("total = %v, want 110 counted once", total)
+	if total != 220 {
+		t.Fatalf("total = %v, want 220 counted as separate calls", total)
 	}
 }
 
@@ -385,8 +420,288 @@ func TestMuseEnvelopeOuterRecordCounts(t *testing.T) {
 	}
 }
 
+func TestLoadMuseUsageEntriesSkipsUnmarkedLines(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// A real store's killer line was a 54MB blob with no usage records at
+	// all: unmarked lines skip parsing entirely, giant or not.
+	big := `{"note":"` + strings.Repeat("n", 33<<20) + `"}`
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		big,
+		museCompletedRecord("rec-small", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0),
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 220 {
+		t.Fatalf("entries = %#v, want one 220-token entry", entries)
+	}
+}
+
+func TestLoadMuseUsageEntriesMarkerMentionDoesNotCount(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		// Passes the marker pre-filter, but full validation still
+		// rejects it: not a runtime.session model_completed event.
+		`{"note":"model_completed happened earlier"}`,
+		museCompletedRecord("rec-small", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0),
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 220 {
+		t.Fatalf("entries = %#v, want one 220-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
 func TestMuseUsageMaximaCacheName(t *testing.T) {
 	if _, err := usageMaximaPath(platformMuse); err != nil {
 		t.Fatalf("usageMaximaPath(muse) = %v", err)
+	}
+}
+
+func TestLoadMuseUsageEntriesOversizedLine(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// A real session grew a 54MB retained_frame line, past the old 32MB
+	// Scanner cap ("token too long" skipped Muse entirely). Pad a valid
+	// record past that cap: it must still parse and count, along with the
+	// line after it.
+	big := museCompletedRecord("rec-big", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0)
+	big = big[:len(big)-1] + `,"padding":"` + strings.Repeat("p", 33<<20) + `"}`
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		big,
+		museCompletedRecord("rec-small", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0),
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 330 {
+		t.Fatalf("entries = %#v, want one 330-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2 calls", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesEscapedKindDirect(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// JSON \uXXXX can encode ASCII: "model_\u0063ompleted" decodes to
+	// model_completed without the contiguous literal. A literal-only
+	// pre-filter would skip this countable line; the \u fallback parses it.
+	raw := museCompletedRecord("rec-esc", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0)
+	escaped := strings.ReplaceAll(raw, "model_completed", "model_\\u0063ompleted")
+	if strings.Contains(escaped, "model_completed") {
+		t.Fatal("test setup leaked the literal marker")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		escaped,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110 {
+		t.Fatalf("entries = %#v, want one 110-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesEscapedKindEnvelope(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Same escape, wrapped in a retained_frame envelope: the inner
+	// backslash is doubly escaped in the outer line (\\u), so the outer
+	// carries no literal marker but still carries \u for the fallback.
+	inner := museCompletedRecord("rec-esc-env", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0)
+	innerEscaped := strings.ReplaceAll(inner, "model_completed", "model_\\u0063ompleted")
+	frame := museRetainedFrame(innerEscaped)
+	if strings.Contains(frame, "model_completed") {
+		t.Fatal("test setup leaked the literal marker into the envelope")
+	}
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		frame,
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 220 {
+		t.Fatalf("entries = %#v, want one 220-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
+	}
+}
+
+func TestLoadMuseUsageEntriesEOFWithoutNewline(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// The ReadBytes loop must process the final chunk even when the file
+	// ends without '\n' (ReadBytes returns data + io.EOF together).
+	path := filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := museCompletedRecord("rec-eof-1", ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0) + "\n" +
+		museCompletedRecord("rec-eof-2", ts, "muse-spark-1.3", 200, 20, 0, 0, 0, 0)
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 330 {
+		t.Fatalf("entries = %#v, want one 330-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2 calls", got)
+	}
+}
+
+func TestMuseLineMayCount(t *testing.T) {
+	if !museLineMayCount([]byte(`{"kind":"model_completed"}`)) {
+		t.Fatal("literal marker line must parse")
+	}
+	if !museLineMayCount([]byte(`{"kind":"model_\u0063ompleted"}`)) {
+		t.Fatal("\\u-escaped line must fall back to parsing")
+	}
+	if museLineMayCount([]byte(`{"note":"plain transcript"}`)) {
+		t.Fatal("unmarked line without escapes must skip")
+	}
+	// Escaped envelope outer carries \\u (which contains \u): fallback.
+	if !museLineMayCount([]byte(`{"record_json":"model_\\u0063ompleted"}`)) {
+		t.Fatal("doubly escaped envelope line must fall back to parsing")
+	}
+}
+
+func TestMuseEmptyIDEqualCallsBothCount(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	// Two distinct same-day calls without stable ids and identical usage
+	// (microseconds apart): a path/date/model/token fingerprint collapses
+	// the second, so both must count as separate calls.
+	writeMuseSession(t, filepath.Join(home, ".local", "share", "muse", "sessions", "s", "session.jsonl"), []string{
+		museCompletedRecordNoID(ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0),
+		museCompletedRecordNoID(ts+1, "muse-spark-1.3", 100, 10, 0, 0, 0, 0),
+	})
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 220 {
+		t.Fatalf("entries = %#v, want one 220-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 2 {
+		t.Fatalf("messages = %v, want 2 separate calls", got)
+	}
+}
+
+func TestMuseSameInodeReadOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	dataHome := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+
+	day := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	ts := float64(day.UnixMicro())
+	realMuse := filepath.Join(home, ".local", "share", "muse")
+	writeMuseSession(t, filepath.Join(realMuse, "sessions", "s1", "session.jsonl"), []string{
+		museCompletedRecordNoID(ts, "muse-spark-1.3", 100, 10, 0, 0, 0, 0),
+	})
+	// XDG root resolves to the same inode via a symlink, so the loader
+	// sees the same file under two lexical paths. A path-keyed fallback
+	// would count it twice; filesystem-identity dedup reads it once.
+	if err := os.Symlink(realMuse, filepath.Join(dataHome, "muse")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadMuseUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || numberValue(entries[0]["totalTokens"]) != 110 {
+		t.Fatalf("entries = %#v, want one 110-token entry", entries)
+	}
+	if got := numberValue(entries[0]["messages"]); got != 1 {
+		t.Fatalf("messages = %v, want 1 call", got)
 	}
 }
