@@ -57,29 +57,85 @@ type museUsage struct {
 // markerModelCompleted pre-filters session lines before JSON parsing. Only
 // model_completed events (direct, or wrapped in a retained_frame envelope's
 // record_json strings) can count, so a line carrying the contiguous literal
-// is always parsed. JSON \uXXXX escapes can encode plain ASCII too, so a
-// countable kind may hide without the literal — directly, or doubly escaped
-// inside a record_json envelope (the outer still contains \u). Any line with
-// a \u escape falls back to full parsing. Everything else (transcripts,
-// tool output, bare frames — the bulk of a multi-GB store) skips the parse
-// entirely.
+// is always parsed. A countable kind can also hide without the literal via
+// JSON \uXXXX escapes (directly, or doubly escaped inside a record_json
+// envelope), so lines with an escape capable of hiding the marker fall back
+// to full parsing — see museHasEscapeCandidate. Everything else
+// (transcripts, tool output, bare frames — the bulk of a multi-GB store)
+// skips the parse entirely.
 var markerModelCompleted = []byte("model_completed")
 
-// markerUnicodeEscapeLower/Upper catch the only JSON spelling that can hide
-// the marker: \uXXXX for ASCII letters. \U is invalid JSON but costs one
-// extra scan to stay safe against non-strict writers.
-var markerUnicodeEscapeLower = []byte(`\u`)
-var markerUnicodeEscapeUpper = []byte(`\U`)
+var markerUnicodeEscape = []byte(`\u`)
 
 // museLineMayCount reports whether a raw session line could decode to a
-// countable event. Literal hits parse; \u-bearing lines parse as a safe
+// countable event. Literal hits parse; escape candidates parse as a safe
 // fallback since the kind may be escape-encoded; the rest skip.
 func museLineMayCount(raw []byte) bool {
 	if bytes.Contains(raw, markerModelCompleted) {
 		return true
 	}
-	return bytes.Contains(raw, markerUnicodeEscapeLower) ||
-		bytes.Contains(raw, markerUnicodeEscapeUpper)
+	return museHasEscapeCandidate(raw)
+}
+
+// museHasEscapeCandidate scans raw for a \uXXXX escape capable of hiding the
+// marker. A countable kind decodes to "model_completed"; without the literal,
+// at least one of its letters/underscore must come from a \u escape (no other
+// JSON escape yields those characters), so direct records leave a marker-char
+// escape behind. Inside a record_json envelope the same holds one level down,
+// where each character of the inner \uXXXX may itself arrive via an outer
+// escape — hence escapes decoding to nested \u syntax (backslash, u, hex
+// digits) are candidates too. Anything else cannot hide the marker: emoji,
+// HTML and control escapes decode to unrelated characters, and \U is invalid
+// JSON (encoding/json rejects it, so such lines fail validation either way).
+func museHasEscapeCandidate(raw []byte) bool {
+	for i := 0; i+1 < len(raw); {
+		j := bytes.Index(raw[i:], markerUnicodeEscape)
+		if j < 0 {
+			return false
+		}
+		i += j
+		if i+6 <= len(raw) {
+			if cp, ok := museDecodeHex4(raw[i+2 : i+6]); ok && museEscapeCandidateDecodes(cp) {
+				return true
+			}
+		}
+		i += 2
+	}
+	return false
+}
+
+// museEscapeCandidateDecodes reports whether code point cp could participate
+// in a literal-hidden model_completed: a marker letter/underscore, or a
+// character that could form another \u escape after record_json unwrapping.
+func museEscapeCandidateDecodes(cp uint16) bool {
+	switch cp {
+	case 'm', 'o', 'd', 'e', 'l', '_', 'c', 'p', 't', '\\', 'u':
+		return true
+	}
+	return cp >= '0' && cp <= '9' ||
+		cp >= 'A' && cp <= 'F' ||
+		cp >= 'a' && cp <= 'f'
+}
+
+// museDecodeHex4 decodes 4 ASCII hex digits (either case, as encoding/json
+// accepts) to a code point.
+func museDecodeHex4(b []byte) (uint16, bool) {
+	var cp uint16
+	for _, c := range b {
+		var v uint16
+		switch {
+		case c >= '0' && c <= '9':
+			v = uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			v = uint16(c - 'a' + 10)
+		case c >= 'A' && c <= 'F':
+			v = uint16(c - 'A' + 10)
+		default:
+			return 0, false
+		}
+		cp = cp*16 + v
+	}
+	return cp, true
 }
 
 type museDailyUsage struct {
@@ -247,8 +303,8 @@ func readMuseSession(path string, byDate map[string]*museDailyUsage, seenRecords
 		// parsing: most lines cannot count and never pay for either.
 		// Matching lines still go through full validation below, so a
 		// mere mention of the marker in some other payload can't count.
-		// Lines with \u escapes parse as a fallback: the kind may be
-		// escape-encoded without the contiguous literal.
+		// Lines with a marker-hiding escape candidate parse as a fallback:
+		// the kind may be \u-encoded without the contiguous literal.
 		if museLineMayCount(raw) {
 			if line := bytes.TrimSpace(raw); len(line) != 0 {
 				var outer museSessionLine
