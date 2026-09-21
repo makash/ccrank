@@ -1620,3 +1620,152 @@ func TestPiRecordFingerprintCoversRawFieldsAndTimestampReps(t *testing.T) {
 		t.Fatal("string and numeric timestamp reps must produce distinct fingerprints")
 	}
 }
+
+func TestKimiUsageSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	real := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "main", "wire.jsonl")
+	writeJSONL(t, real, []map[string]any{
+		{
+			"type":       "usage.record",
+			"time":       float64(1786038447534),
+			"model":      "moonshot-ai/kimi-k3",
+			"usageScope": "turn",
+			"usage": map[string]any{
+				"inputOther":         100,
+				"output":             20,
+				"inputCacheRead":     200,
+				"inputCacheCreation": 10,
+			},
+		},
+	})
+	linkDir := filepath.Join(home, ".kimi-code", "sessions", "wd-a", "session_session-1", "agents", "archive")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "wire.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadKimiUsageEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 330 {
+		t.Fatalf("totalTokens = %v, want 330 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestPiSymlinkedDuplicateFileReadsOnce(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".pi", "agent", "sessions")
+
+	real := filepath.Join(root, "session-1.jsonl")
+	writeJSONL(t, real, []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		{
+			"type":      "message",
+			"timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"usage": map[string]any{
+				"input": 50, "output": 5, "totalTokens": 55,
+				"cost": map[string]any{"total": 0.1},
+			}},
+		},
+	})
+	linkDir := filepath.Join(root, "backups")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(linkDir, "session-1-link.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 daily entry, got %d", len(entries))
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 55 {
+		t.Fatalf("totalTokens = %v, want 55 (symlinked file read once)", got)
+	}
+	if got := numberValue(entries[0]["sessionFiles"]); got != 1 {
+		t.Fatalf("sessionFiles = %v, want 1", got)
+	}
+}
+
+func TestUploadNeverSendsReplaceForAnyPlatform(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	var payloads []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/upload" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		payloads = append(payloads, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	platforms := append([]string{platformCombined}, dedicatedPlatformNames...)
+	for i, platform := range platforms {
+		cacheName := platform
+		if platform == platformCombined {
+			cacheName = "combined"
+		}
+		entries := []map[string]any{{
+			"date":        "2026-09-04",
+			"totalTokens": float64((i + 1) * 10),
+			"totalCost":   0.1,
+		}}
+		report := map[string]any{"type": "daily", "daily": entries}
+		pending, err := prepareUsageUpload(report, entries, cacheName, "none")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(pending.Report, "replace") {
+			t.Fatalf("%s report must not mention replace: %s", platform, pending.Report)
+		}
+		if err := uploadCcusage(server.URL, "test-token", pending.Report, "rig-arbaz", platform); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(payloads) != len(platforms) {
+		t.Fatalf("payloads = %d, want %d", len(payloads), len(platforms))
+	}
+	for i, payload := range payloads {
+		if _, ok := payload["replace"]; ok {
+			t.Fatalf("%s payload must not send replace", platforms[i])
+		}
+		if payload["platform"] != platforms[i] {
+			t.Fatalf("platform = %#v, want %q", payload["platform"], platforms[i])
+		}
+		if _, ok := payload["json"].(string); !ok {
+			t.Fatalf("%s payload is missing its json report", platforms[i])
+		}
+	}
+}

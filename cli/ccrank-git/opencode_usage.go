@@ -123,11 +123,15 @@ func loadOpenCodeUsageEntries() ([]map[string]any, error) {
 			continue
 		}
 		// One row per assistant reply; the id guard folds any duplicate the
-		// database hands back into a single record.
-		if seenMessages[id] {
-			continue
+		// database hands back into a single record. Only non-empty ids dedup:
+		// a row without an id carries no identity, so collapsing on the empty
+		// key would drop distinct valid replies.
+		if id != "" {
+			if seenMessages[id] {
+				continue
+			}
+			seenMessages[id] = true
 		}
-		seenMessages[id] = true
 
 		var parsed openCodeMessageData
 		if err := json.Unmarshal([]byte(data), &parsed); err != nil || parsed.Tokens == nil {

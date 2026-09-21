@@ -78,12 +78,16 @@ func loadKimiUsageEntries() ([]map[string]any, error) {
 
 	byDate := map[string]*kimiDailyUsage{}
 	seenRecords := map[string]bool{}
+	visited := map[string]bool{}
 	for _, root := range roots {
 		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if d.IsDir() || filepath.Base(path) != "wire.jsonl" {
+				return nil
+			}
+			if markVisitedFile(visited, path) {
 				return nil
 			}
 			return readKimiWire(path, byDate, seenRecords)
