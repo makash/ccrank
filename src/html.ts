@@ -620,22 +620,22 @@ export function uploadPage(user: User, message: { type: 'success' | 'error'; tex
       key: 'mac',
       label: 'macOS (Apple Silicon)',
       file: 'ccrank-git_darwin_arm64',
-      download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64',
-      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
+      download: 'https://github.com/makash/ccrank/releases/latest/download/ccrank-git_darwin_arm64',
+      command: 'curl -L -o ccrank-git https://github.com/makash/ccrank/releases/latest/download/ccrank-git_darwin_arm64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
     },
     {
       key: 'linux',
       label: 'Linux x64',
       file: 'ccrank-git_linux_amd64',
-      download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64',
-      command: 'curl -L -o ccrank-git https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
+      download: 'https://github.com/makash/ccrank/releases/latest/download/ccrank-git_linux_amd64',
+      command: 'curl -L -o ccrank-git https://github.com/makash/ccrank/releases/latest/download/ccrank-git_linux_amd64 && chmod +x ccrank-git && ./ccrank-git --url https://ccrank.dev --token YOUR_TOKEN --upload-usage',
     },
     {
       key: 'windows',
       label: 'Windows x64',
       file: 'ccrank-git_windows_amd64.exe',
-      download: 'https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe',
-      command: 'powershell -Command \"iwr -Uri https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe -OutFile ccrank-git.exe; .\\\\ccrank-git.exe --url https://ccrank.dev --token YOUR_TOKEN --upload-usage\"',
+      download: 'https://github.com/makash/ccrank/releases/latest/download/ccrank-git_windows_amd64.exe',
+      command: 'powershell -Command \"iwr -Uri https://github.com/makash/ccrank/releases/latest/download/ccrank-git_windows_amd64.exe -OutFile ccrank-git.exe; .\\\\ccrank-git.exe --url https://ccrank.dev --token YOUR_TOKEN --upload-usage\"',
     },
   ];
 
@@ -1522,9 +1522,9 @@ export function settingsPage(
           </div>
           <div class="mt-4 text-xs text-gray-500">
             Download the CLI:
-            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_darwin_arm64" target="_blank" rel="noopener">macOS arm64</a>
-            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_linux_amd64" target="_blank" rel="noopener">Linux x64</a>
-            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/claude-leaderboard-using-ccusage/releases/latest/download/ccrank-git_windows_amd64.exe" target="_blank" rel="noopener">Windows x64</a>
+            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/ccrank/releases/latest/download/ccrank-git_darwin_arm64" target="_blank" rel="noopener">macOS arm64</a>
+            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/ccrank/releases/latest/download/ccrank-git_linux_amd64" target="_blank" rel="noopener">Linux x64</a>
+            <a class="text-purple-300 hover:text-purple-200 ml-2" href="https://github.com/makash/ccrank/releases/latest/download/ccrank-git_windows_amd64.exe" target="_blank" rel="noopener">Windows x64</a>
           </div>
         </div>
 

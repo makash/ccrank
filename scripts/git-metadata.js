@@ -74,6 +74,8 @@ async function main() {
 
   const payload = {
     machine: opts.machine || undefined,
+    // Pinned floor for the server minimum-version gate (HTTP 426 below it).
+    cli_version: '1.7.1',
     projects: [
       {
         repoName,
@@ -119,7 +121,7 @@ async function main() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${opts.token}`,
         },
-        body: JSON.stringify({ json: ccusage, source: opts.machine || 'default' }),
+        body: JSON.stringify({ json: ccusage, source: opts.machine || 'default', cli_version: '1.7.1' }),
       });
       const data2 = await res2.json().catch(() => ({}));
       if (!res2.ok || !data2.ok) {
