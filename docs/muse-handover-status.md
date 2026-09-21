@@ -81,28 +81,43 @@ Pi 39.3B/107d, Codex 9.3B/75d, OpenCode 1.2B/15d, GLM 389.5M/4d, Grok
 - Five daily sums >10B (public rounded labels): Aug27 11.3B, Aug29 12.6B,
   Aug30 19.6B, Aug31 21.0B, Sep1 15.7B — ≈80.2B combined. Top cost days:
   Aug30 $34,705.90, Aug31 $34,638.23. Top-20 days ≈ 191B (65% of lifetime).
-- Row-count ("sessions") per day never exceeds 4; several 4–9.6B days sit on
-  a SINGLE row. Effective rates vary by day ($1.65/M on Aug31 → cache-heavy;
-  ~$5/M on Sep15 → output-heavy), consistent with real mix shifts.
+- Row-count ("sessions") heatmap cells equal `COUNT(*)` rows in
+  `daily_usage` for that (user, date) — see the `heatmapRows` query in the
+  `/user/:slug` handler (`src/index.ts`) rendered as `title="DATE: N"`.
+  Observed N ranges 1–4; it never exceeds 4 in the 365d window. Five
+  multi-B days sit on a SINGLE row (N=1): 2026-08-18 6.5B ($9,745.14),
+  2026-09-02 9.6B ($10,587.49), 2026-09-10 5.7B ($8,278.36), 2026-09-11
+  5.6B ($3,378.45), 2026-09-20 4.0B ($12,417.59). A single-row day
+  excludes same-day cross-key multiplicity for THAT day only (its total
+  cannot be a sum of several same-day keys); within-row duplication
+  (double-counted values inside one row) remains possible every day.
+  The ≤4 rows/day observation does NOT rule out cross-key duplication as
+  a primary cause across the window. Effective $/M varies by day ($1.65
+  on Aug31 vs ~$5 on Sep15); the cause of the mix shift is undetermined
+  from public data.
 
 ### 3.2 Control (#1, 348.5B): gradual ramp, comparable peaks
 
 Same method: Jan 2.5B → Apr 21B → Jun 61B → Jul 86B → Aug 89B; top day
-19.8B (Jul11) ≈ Will Mitchell's 21.0B peak; up to 9 rows/day. Top-3 cache
-rates 90–96%: cache-read inflation dominates ALL top users, not one.
+19.8B (Jul11) ≈ Will Mitchell's 21.0B peak (within ~6%); up to 9 rows/day.
+High usage is shared by control profiles (top-3 cache rates 90–96%,
+comparable peaks) — with NO causal proof: this comparison alone proves
+nothing about mechanism (not cache inflation, not a shared harness, not a
+common counting bug).
 
 ### 3.3 Proven vs hypotheses (no fraud inferred from high numbers)
 
 Proven (public data): anomalous VOLUME and CONCENTRATION (85% in ~7 weeks
-starting ~Aug17, right after the Aug15 replace incident); cross-key
-duplication (same tokens under multiple source/platform rows) is ruled out
-as the primary mechanism — ≤4 keys/day bounds it at ~4x, and single-row
-multi-B days cannot be cross-key duplicates at all.
+starting ~Aug17, right after the Aug15 replace incident); plus the narrow
+single-row exclusion in §3.1 (five dated N=1 days cannot be same-day
+cross-key sums — within-row duplication still possible on those days).
+NOT proven: any statement about the primary cause. Cross-key duplication
+remains a live hypothesis despite ≤4 rows/day.
 Hypotheses needing D1 (§6.2): within-row client double-count (importer
 counting records twice — B1, other executors); two machines with
-overlapping history under different `source` keys (≤4x bound); genuine
-24/7 harness usage (output ≈ 5.1M/day over 199d is high but harness-
-plausible; $/M mix shifts look organic); post-incident re-upload
+overlapping history under different `source` keys; genuine
+24/7 harness usage (output ≈ 5.1M/day over 199d is high; whether a harness
+explains it is undetermined); post-incident re-upload
 ratcheting (chronology is suggestive, mechanism unclear under max-merge).
 Public evidence is anomalous volume, NOT proof of duplicate records or
 misconduct. No correction is justified on current evidence (§6 preamble).
@@ -223,19 +238,20 @@ account) or its account id + token via the documented path. Until then:
 no applied-migration confirmation, no per-row anomaly truth, no prod
 apply. All B6 findings above are public-page evidence only.
 
-## 8. Followups (drafted `bd` commands — NOT created: no `bd` binary here)
+## 8. Followups (filed in `.beads/issues.jsonl` — cla4 sole writer)
 
-`.beads/issues.jsonl` deliberately untouched (shared data, no writer
-conflicts risked, no ids invented). Run after review:
+No `bd` binary in this env, so these were appended as offline records in
+the existing JSONL format (unique new ids, whole file re-validated as
+one object per line). No old X-series ids referenced.
 
-```bash
-bd create "perf-health: renumber 0011_user_slugs to 0014 after PR18" \
-  --description "chore/perf-health (local-only b0307a0) carries a rival migrations/0011_user_slugs.sql. After PR #18 merges with 0011_review_flags, rebase and renumber to 0014_user_slugs + rewire db:migrate chain. Evidence: docs/muse-handover-status.md §1.2" --priority 1 --type task
-bd create "D1 verify-first: NULL numerics + unknown-% blast radius" \
-  --description "Run docs/muse-handover-status.md §6.1 SELECTs from an authed shell before PR18 rollout. Gates 0012 blast radius and the 0010 NULL-hole exposure." --priority 1 --type task
-bd create "Anomaly ground truth: Will Mitchell spike-day row split" \
-  --description "Run §6.2 SELECTs (aggregates only, no PII export). Decides whether any audited correction is ever justified. Current status: volume proven anomalous, duplication unproven." --priority 2 --type task
-```
+- `claude-leaderboard-using-ccusage-d1v` (P1 task): prod D1 applied-state
+  verification from the owner account — gates PR18 rollout (§6.1).
+- `claude-leaderboard-using-ccusage-hco` (P2 task): audited historical
+  correction decision — only if D1 proves duplicates; default no-op (§6).
+- `claude-leaderboard-using-ccusage-mrf` (P1 feature): review-only
+  trailing-median ramp + all-time volume fan-out followups.
+- `claude-leaderboard-using-ccusage-phr` (P1 task): renumber local-only
+  perf-health `0011_user_slugs` → 0014 after PR18 merge (§1.2).
 
 ## 9. Handover pointer
 
