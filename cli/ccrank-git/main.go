@@ -190,7 +190,7 @@ func main() {
 		// Combined rows are max-merged server-side (never-lower). Do not send
 		// a replace flag — the LDP CLI never had one, and a replace=true
 		// upload destroyed ~27B tokens of historical peaks on 2026-08-15.
-		err = uploadUsageReport(*urlFlag, *tokenFlag, pending, machine, platformCombined, "combined")
+		err = uploadUsageReport(*urlFlag, *tokenFlag, pending, machine, platformCombined)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -364,7 +364,7 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 	if strings.TrimSpace(job.Source) != "" {
 		source = strings.TrimSpace(job.Source)
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, pending, source, job.Platform, job.Platform); err != nil {
+	if err := uploadUsageReport(job.BaseURL, job.Token, pending, source, job.Platform); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
@@ -689,6 +689,13 @@ func unheldDedicatedAgent(agent string) string {
 // report. The server max-merges, so the zero row cannot lower an inflated
 // row written by an earlier ccrank version; that row keeps its historical
 // peak (see test/never-lower.test.mjs).
+//
+// totalTokens is derived from the four component fields, never copied from the
+// slices. Some agents (ccusage's Antigravity importer) report a slice total
+// above the sum of the token fields they expose, and the server 400s the whole
+// upload when a row's total is more than 0.1% off its component sum. A day
+// dominated by such an agent would trip that check, so every combined row is
+// made self-consistent by construction.
 func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) {
 	rebuilt := make([]map[string]any, 0, len(entries))
 	for index, entry := range entries {
@@ -705,7 +712,7 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			continue
 		}
 
-		var input, output, cacheCreation, cacheRead, total, cost float64
+		var input, output, cacheCreation, cacheRead, cost float64
 		modelNames := []string{}
 		modelBreakdowns := []any{}
 		for _, raw := range agents {
@@ -727,7 +734,6 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			output += numberValue(agent["outputTokens"])
 			cacheCreation += numberValue(agent["cacheCreationTokens"])
 			cacheRead += numberValue(agent["cacheReadTokens"])
-			total += numberValue(agent["totalTokens"])
 			cost += usageCostValue(agent)
 			for _, model := range extractModelNames(agent["modelsUsed"]) {
 				modelNames = append(modelNames, model)
@@ -737,6 +743,7 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			}
 		}
 		sort.Strings(modelNames)
+		total := input + output + cacheCreation + cacheRead
 
 		rebuilt = append(rebuilt, map[string]any{
 			"date":                     date,
@@ -2077,32 +2084,20 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 
 // uploadUsageReport posts a prepared usage report and settles the monotonic
 // maxima cache accordingly: the cache advances only once the upload is
-// confirmed (HTTP 2xx), and any failure clears it so the offered rows come
-// back on the next run instead of being marked as uploaded forever.
-func uploadUsageReport(baseURL, token string, pending *pendingUsageUpload, machine, platform, cacheName string) error {
+// confirmed (HTTP 2xx). A failed upload leaves the cache exactly as it was.
+// prepareUsageUpload never writes it, so the rows that were offered simply come
+// back on the next run. The cache must NOT be cleared on failure: an empty
+// cache re-offers the entire history as one batch, and a single row the server
+// rejects anywhere in it then fails every later run too (a retry loop that
+// only ends when that row disappears).
+func uploadUsageReport(baseURL, token string, pending *pendingUsageUpload, machine, platform string) error {
 	if err := uploadCcusage(baseURL, token, pending.Report, machine, platform); err != nil {
-		if resetErr := resetUsageMaxima(cacheName); resetErr != nil {
-			return fmt.Errorf("%w (could not reset retry cache: %v)", err, resetErr)
-		}
 		return err
 	}
 	if err := pending.Commit(); err != nil {
 		// The rows are on the server; re-offering them next run is harmless
 		// because the server max-merges.
 		return fmt.Errorf("uploaded, but could not record the retry cache: %w", err)
-	}
-	return nil
-}
-
-// resetUsageMaxima deletes a platform's maxima cache so rows prepared for a
-// failed upload are re-offered next run. A missing cache is already reset.
-func resetUsageMaxima(cacheName string) error {
-	path, pathErr := usageMaximaPath(cacheName)
-	if pathErr != nil {
-		return pathErr
-	}
-	if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-		return removeErr
 	}
 	return nil
 }
