@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -143,6 +144,9 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 		`{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 		`{"version":2,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 		`{"version":3,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
+		// Version 4 combined totals were slice sums that can sit above the
+		// component-derived totals written from version 5 on.
+		`{"version":4,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 	} {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -212,7 +216,7 @@ func TestUploadCcusageNeverSendsReplace(t *testing.T) {
 	}
 }
 
-func TestUploadUsageReportResetsMaximaAfterFailedUpload(t *testing.T) {
+func TestUploadUsageReportKeepsMaximaAfterFailedUpload(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	cacheDir := filepath.Join(home, ".ccrank")
@@ -233,12 +237,78 @@ func TestUploadUsageReportResetsMaximaAfterFailedUpload(t *testing.T) {
 		Report: `{"daily":[]}`,
 		Commit: func() error { t.Fatal("commit must not run for a failed upload"); return nil },
 	}
-	err := uploadUsageReport(server.URL, "test-token", pending, "secrig", "kimi", "kimi")
+	err := uploadUsageReport(server.URL, "test-token", pending, "secrig", "kimi")
 	if err == nil {
 		t.Fatal("expected failed upload")
 	}
-	if _, statErr := os.Stat(cachePath); !os.IsNotExist(statErr) {
-		t.Fatalf("expected retry cache removal, got %v", statErr)
+	after, readErr := os.ReadFile(cachePath)
+	if readErr != nil {
+		t.Fatalf("a failed upload must leave the maxima cache in place, got %v", readErr)
+	}
+	if string(after) != `{"version":2,"daily":[]}` {
+		t.Fatalf("a failed upload must not modify the maxima cache, got %s", after)
+	}
+}
+
+// A failed upload must not throw away rows the server already accepted. With an
+// empty cache the whole history is re-offered as one batch, so a single row the
+// server rejects anywhere in it would then fail every later run as well.
+func TestFailedUploadKeepsCommittedRowsSoOnlyNewRowsAreReoffered(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	accept := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !accept {
+			http.Error(w, `{"ok":false,"error":"rejected"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+
+	report := map[string]any{"type": "daily"}
+	unchanged := "no higher combined usage rows found"
+
+	first := []map[string]any{
+		{"date": "2026-07-01", "totalTokens": 400.0, "totalCost": 1.0},
+		{"date": "2026-07-02", "totalTokens": 250.0, "totalCost": 0.5},
+	}
+	pending, err := prepareUsageUpload(report, first, "combined", unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformCombined); err != nil {
+		t.Fatal(err)
+	}
+
+	// A later run has one new row and the server rejects the batch.
+	accept = false
+	next := func() []map[string]any {
+		return []map[string]any{
+			{"date": "2026-07-01", "totalTokens": 400.0, "totalCost": 1.0},
+			{"date": "2026-07-02", "totalTokens": 250.0, "totalCost": 0.5},
+			{"date": "2026-07-03", "totalTokens": 90.0, "totalCost": 0.2},
+		}
+	}
+	pending, err = prepareUsageUpload(report, next(), "combined", unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformCombined); err == nil {
+		t.Fatal("expected the rejected upload to surface")
+	}
+
+	retried, err := prepareUsageUpload(report, next(), "combined", unchanged)
+	if err != nil {
+		t.Fatalf("the rejected row must be re-offered, got %v", err)
+	}
+	if !strings.Contains(retried.Report, `"2026-07-03"`) {
+		t.Fatalf("retried report lost the new row: %s", retried.Report)
+	}
+	if strings.Contains(retried.Report, `"2026-07-01"`) || strings.Contains(retried.Report, `"2026-07-02"`) {
+		t.Fatalf("a failed upload must not re-offer rows the server already has: %s", retried.Report)
 	}
 }
 
@@ -263,7 +333,7 @@ func TestFailedUploadLeavesNoMaximaBehindAndReoffersRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi, platformKimi); err == nil {
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi); err == nil {
 		t.Fatal("expected the failed upload to surface")
 	}
 
@@ -308,7 +378,7 @@ func TestSuccessfulUploadCommitsExactRowsAndSuppressesAnIdenticalRerun(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi, platformKimi); err != nil {
+	if err := uploadUsageReport(server.URL, "test-token", pending, "rig", platformKimi); err != nil {
 		t.Fatal(err)
 	}
 	if len(bodies) != 1 {
@@ -740,6 +810,77 @@ func TestPiUsageIsRoutedToThePlatformThatOwnsEachModel(t *testing.T) {
 	}
 }
 
+func TestServerConsistentTotal(t *testing.T) {
+	for _, tc := range []struct{ reported, components, want float64 }{
+		{10190, 10000, 10000},    // 1.9% off: replaced by the component sum
+		{100050, 100000, 100050}, // 0.05% off: within tolerance, kept as reported
+		{0, 0, 0},
+		{5, 3, 3}, // tolerance floor is 1 token
+		{5, 4, 5},
+	} {
+		if got := serverConsistentTotal(tc.reported, tc.components); got != tc.want {
+			t.Fatalf("serverConsistentTotal(%v, %v) = %v, want %v", tc.reported, tc.components, got, tc.want)
+		}
+	}
+}
+
+// Pi copies the session's own totalTokens when it is non-zero. A record whose
+// total is more than 0.1% off its components would get the server to reject the
+// whole Pi upload (and the Kimi/Grok/GLM uploads that merge Pi records), so it
+// is replaced by the component sum; consistent records keep their total.
+func TestPiRecordWithInconsistentTotalIsMadeServerConsistent(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	message := func(ts string, input, output, cacheRead, total int) map[string]any {
+		return map[string]any{
+			"type":      "message",
+			"timestamp": ts,
+			"message": map[string]any{"usage": map[string]any{
+				"input": input, "output": output, "cacheRead": cacheRead,
+				"totalTokens": total, "cost": map[string]any{"total": 0.1},
+			}},
+		}
+	}
+	records := []map[string]any{
+		{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"},
+		message("2026-08-12T10:00:00Z", 1000, 200, 8800, 10190), // 1.9% off -> 10000
+		message("2026-08-12T10:01:00Z", 50, 5, 0, 55),           // consistent -> 55
+		message("2026-08-12T10:02:00Z", 100000, 0, 0, 100050),   // within tolerance -> 100050
+	}
+	var data []byte
+	for _, record := range records {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, encoded...)
+		data = append(data, '\n')
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 110105 {
+		t.Fatalf("totalTokens = %v, want 110105 (10000 + 55 + 100050)", got)
+	}
+	assertServerConsistentTotal(t, entries[0])
+}
+
 func TestPiSubagentTranscriptsCountTowardOwningPlatform(t *testing.T) {
 	oldLocal := time.Local
 	time.Local = time.UTC
@@ -967,7 +1108,7 @@ func TestUnheldDedicatedAgentDetection(t *testing.T) {
 func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	report := []byte(`{"daily":[{"period":"2026-08-14","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
 		"agents":[
-			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1},
 			{"agent":"grok","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"totalTokens":220,"totalCost":2}
 		]}]}`)
 	_, entries, err := parseCcusageReport(report)
@@ -978,8 +1119,8 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dedicated Grok rows must be held out without blocking combined usage, got %v", err)
 	}
-	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
-		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 510 {
+		t.Fatalf("combined entries = %#v, want only Claude's 510 tokens", combined)
 	}
 
 	// Codex rows are held out the same way now that Codex uploads separately.
@@ -1004,7 +1145,7 @@ func TestCombinedRebuildHoldsOutNewlySupportedDedicatedAgents(t *testing.T) {
 func TestCombinedRebuildHoldsOutCursorAgent(t *testing.T) {
 	report := []byte(`{"daily":[{"period":"2026-09-04","inputTokens":300,"outputTokens":30,"totalTokens":330,"totalCost":3,
 		"agents":[
-			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":110,"totalCost":1},
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1},
 			{"agent":"cursor","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"totalTokens":220,"totalCost":2}
 		]}]}`)
 	_, entries, err := parseCcusageReport(report)
@@ -1015,8 +1156,8 @@ func TestCombinedRebuildHoldsOutCursorAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Cursor rows must be held out without blocking combined usage, got %v", err)
 	}
-	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 110 {
-		t.Fatalf("combined entries = %#v, want only Claude's 110 tokens", combined)
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 510 {
+		t.Fatalf("combined entries = %#v, want only Claude's 510 tokens", combined)
 	}
 }
 
@@ -1155,6 +1296,383 @@ func TestCombinedRebuildEmitsAZeroRowWhenOnlyDedicatedAgentsRan(t *testing.T) {
 	}
 	if got := usageDate(combined[0]); got != "2026-08-14" {
 		t.Fatalf("combined date = %q", got)
+	}
+}
+
+// assertServerConsistentTotal mirrors validateEntry in src/parser.ts: the server
+// rejects the whole upload when a row's totalTokens is more than 0.1% (at least
+// 1 token) away from the sum of its four component fields.
+func assertServerConsistentTotal(t *testing.T, row map[string]any) {
+	t.Helper()
+	cacheRead := numberValue(row["cacheReadTokens"])
+	if cacheRead == 0 {
+		cacheRead = numberValue(row["cachedInputTokens"]) // parser.ts: cacheReadTokens || cachedInputTokens
+	}
+	sum := numberValue(row["inputTokens"]) + numberValue(row["outputTokens"]) +
+		numberValue(row["cacheCreationTokens"]) + cacheRead
+	total := numberValue(row["totalTokens"])
+	tolerance := math.Max(1, math.Abs(total)*0.001)
+	if math.Abs(total-sum) > tolerance {
+		t.Fatalf("row %v: totalTokens %v differs from component sum %v beyond tolerance %v (the server would reject the whole upload)", row["date"], total, sum, tolerance)
+	}
+}
+
+// ccusage's Antigravity slices report a total above the sum of the token fields
+// they expose (extra tokens with no field of their own). Copying that total made
+// Antigravity-dominated days fail the server's consistency check.
+func TestCombinedRebuildFoldsUnexplainedSliceTokensIntoOutput(t *testing.T) {
+	report := []byte(`{"daily":[
+		{"period":"2026-07-01","agents":[
+			{"agent":"antigravity","inputTokens":1000,"outputTokens":200,"cacheCreationTokens":0,"cacheReadTokens":8800,"totalTokens":10190,"totalCost":0.5},
+			{"agent":"codex","inputTokens":50,"outputTokens":50,"cacheReadTokens":900,"totalTokens":1000,"totalCost":0.1}]},
+		{"period":"2026-07-02","agents":[
+			{"agent":"antigravity","inputTokens":100,"outputTokens":20,"cacheReadTokens":880,"totalTokens":1019,"totalCost":0.05},
+			{"agent":"claude","inputTokens":10,"outputTokens":5,"cacheCreationTokens":5,"cacheReadTokens":980,"totalTokens":1000,"totalCost":0.2}]}
+	]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined) != 2 {
+		t.Fatalf("combined entries = %#v", combined)
+	}
+	// The total is unchanged from the slice totals (10190; 1019 + 1000); the
+	// unexplained remainder (190; 19) is folded into outputTokens (200+190;
+	// 20+19+5) so the row equals its component sum.
+	for index, want := range []struct{ total, output float64 }{{10190, 390}, {2019, 44}} {
+		if got := numberValue(combined[index]["totalTokens"]); got != want.total {
+			t.Fatalf("row %d totalTokens = %v, want %v", index, got, want.total)
+		}
+		if got := numberValue(combined[index]["outputTokens"]); got != want.output {
+			t.Fatalf("row %d outputTokens = %v, want %v (remainder folded in)", index, got, want.output)
+		}
+		assertServerConsistentTotal(t, combined[index])
+	}
+}
+
+func TestSliceTokensCountsOnlyCoherentSlices(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                    string
+		slice                                                   map[string]any
+		wantVerdict                                             sliceVerdict
+		wantInput, wantOutput, wantCacheCreation, wantCacheRead float64
+	}{
+		{"total above components by a plausible gap is folded into output",
+			map[string]any{"inputTokens": 100.0, "outputTokens": 10.0, "cacheReadTokens": 400.0, "totalTokens": 530.0}, sliceCounted, 100, 30, 0, 400},
+		{"consistent slice is unchanged",
+			map[string]any{"inputTokens": 100.0, "outputTokens": 10.0, "cacheReadTokens": 400.0, "totalTokens": 510.0}, sliceCounted, 100, 10, 0, 400},
+		{"components a hair above the total (within the server tolerance) are counted as is",
+			map[string]any{"inputTokens": 100000.0, "totalTokens": 99950.0}, sliceCounted, 100000, 0, 0, 0},
+		{"missing total counts the components",
+			map[string]any{"inputTokens": 100.0, "outputTokens": 10.0, "totalTokens": 0.0}, sliceCounted, 100, 10, 0, 0},
+		{"empty slice is fine and counts nothing",
+			map[string]any{"totalTokens": 0.0}, sliceCounted, 0, 0, 0, 0},
+		{"cachedInputTokens counts as cache read",
+			map[string]any{"inputTokens": 100.0, "cachedInputTokens": 400.0, "totalTokens": 500.0}, sliceCounted, 100, 0, 0, 400},
+		// A total implausibly far above the fields is not trusted, but the
+		// fields themselves can never exceed what the slice reports, so they
+		// (and the slice's cost) still count instead of being dropped.
+		{"a huge total over one token field counts only the field",
+			map[string]any{"agent": "antigravity", "inputTokens": 10.0, "totalTokens": 5e9}, sliceComponentsOnly, 10, 0, 0, 0},
+		{"an unexplained gap just over 5% counts only the fields",
+			map[string]any{"inputTokens": 40000.0, "outputTokens": 1000.0, "totalTokens": 46000.0}, sliceComponentsOnly, 40000, 1000, 0, 0},
+		// Not counted: over-counting is permanent (the server never lowers a
+		// row); an under-count can still be corrected later.
+		{"overlapping fields (components far above the total) would inflate the row",
+			map[string]any{"inputTokens": 1000.0, "outputTokens": 100.0, "cacheReadTokens": 800.0, "totalTokens": 1100.0}, sliceSkip, 0, 0, 0, 0},
+		{"a total with no component fields is not attributed",
+			map[string]any{"totalTokens": 500.0}, sliceSkip, 0, 0, 0, 0},
+		{"a negative field would make the server reject the whole upload",
+			map[string]any{"inputTokens": -5.0, "outputTokens": 105.0, "totalTokens": 100.0}, sliceSkip, 0, 0, 0, 0},
+		{"a negative total is not counted",
+			map[string]any{"inputTokens": 5.0, "totalTokens": -100.0}, sliceSkip, 0, 0, 0, 0},
+	} {
+		input, output, cacheCreation, cacheRead, verdict := sliceTokens(tc.slice)
+		if verdict != tc.wantVerdict || input != tc.wantInput || output != tc.wantOutput || cacheCreation != tc.wantCacheCreation || cacheRead != tc.wantCacheRead {
+			t.Fatalf("%s: got verdict=%v in=%v out=%v cc=%v cr=%v, want verdict=%v in=%v out=%v cc=%v cr=%v", tc.name,
+				verdict, input, output, cacheCreation, cacheRead, tc.wantVerdict, tc.wantInput, tc.wantOutput, tc.wantCacheCreation, tc.wantCacheRead)
+		}
+	}
+}
+
+// An unusable slice is skipped from the row (with a warning) and a slice with an
+// untrustworthy total still counts its token fields, instead of making the
+// whole upload fail or inflating history permanently.
+func TestCombinedAndCodexRowsHandleIncoherentSlices(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1},
+		{"agent":"gemini","inputTokens":10,"totalTokens":5000000000,"totalCost":9},
+		{"agent":"grumble","inputTokens":1000,"outputTokens":100,"cacheReadTokens":800,"totalTokens":1100,"totalCost":4},
+		{"agent":"codex","inputTokens":50,"outputTokens":5,"cacheReadTokens":0,"totalTokens":55,"totalCost":0.1},
+		{"agent":"codex","inputTokens":1000,"outputTokens":100,"cacheReadTokens":800,"totalTokens":1100,"totalCost":7}]}]}`)
+	_, raw, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// claude 510 + gemini's 10 token field (its absurd 5e9 total is ignored);
+	// the overlapping "grumble" slice is skipped entirely, cost included.
+	if got := numberValue(combined[0]["totalTokens"]); got != 520 {
+		t.Fatalf("combined totalTokens = %v, want 520", got)
+	}
+	if got := usageCostValue(combined[0]); got != 10 {
+		t.Fatalf("combined cost = %v, want 10 (claude 1 + gemini 9; grumble skipped)", got)
+	}
+	assertServerConsistentTotal(t, combined[0])
+	pending, _, err := runCodexUsageFromEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(wire.Daily[0]["totalTokens"]); got != 55 {
+		t.Fatalf("codex totalTokens = %v, want only the coherent slice (55)", got)
+	}
+	assertServerConsistentTotal(t, wire.Daily[0])
+}
+
+// ccusage's "zcode" agent is Z Code, which ccrank already uploads as the GLM
+// platform from its rollout files; folding it into combined counts it twice.
+func TestCombinedRebuildHoldsOutZCode(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-08-28","agents":[
+		{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1},
+		{"agent":"zcode","inputTokens":700,"outputTokens":80,"cacheReadTokens":18000,"totalTokens":18780,"totalCost":2}]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatalf("zcode must be held out without blocking combined usage, got %v", err)
+	}
+	if len(combined) != 1 || numberValue(combined[0]["totalTokens"]) != 510 {
+		t.Fatalf("combined entries = %#v, want only Claude's 510 tokens", combined)
+	}
+}
+
+func TestCcusageAntigravityDates(t *testing.T) {
+	_, raw, err := parseCcusageReport([]byte(`{"daily":[
+		{"period":"2026-07-01","agents":[{"agent":"antigravity","inputTokens":1,"totalTokens":1},{"agent":"codex","totalTokens":5}]},
+		{"period":"2026-07-02","agents":[{"agent":"antigravity","inputTokens":0,"totalTokens":0}]},
+		{"period":"2026-07-03","agents":[{"agent":"claude","inputTokens":1,"totalTokens":1}]},
+		{"period":"2026-07-04","agents":[{"agent":"antigravity","inputTokens":1000,"outputTokens":100,"cacheReadTokens":800,"totalTokens":1100}]}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ccusageAntigravityDates(raw)
+	// 07-04's slice is skipped as incoherent (overlapping fields), so the
+	// transcript estimate must remain the fallback for that date.
+	if len(got) != 1 || !got["2026-07-01"] {
+		t.Fatalf("antigravity dates = %#v, want only 2026-07-01", got)
+	}
+}
+
+func writeAntigravityTranscript(t *testing.T, home, date string, chars int) {
+	t.Helper()
+	path := filepath.Join(home, ".gemini", "antigravity-cli", "brain", "sess-"+date, ".system_generated", "logs", "transcript.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+		"created_at": date + "T09:00:00Z", "content": strings.Repeat("x", chars),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(line, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ccusage imports Antigravity natively; ccrank's transcript estimate covers the
+// same sessions, so it must not be added on dates ccusage already reports, but
+// stays as a fallback for dates ccusage does not.
+func TestAntigravityTranscriptEstimateOnlyFillsDatesCcusageMisses(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeAntigravityTranscript(t, home, "2026-07-01", 400) // 100 estimated tokens
+	writeAntigravityTranscript(t, home, "2026-07-05", 800) // 200 estimated tokens
+
+	newEntries := func() []map[string]any {
+		return []map[string]any{{
+			"date": "2026-07-01", "inputTokens": 1000.0, "outputTokens": 0.0,
+			"cacheCreationTokens": 0.0, "cacheReadTokens": 0.0, "totalTokens": 1000.0,
+		}}
+	}
+	report := map[string]any{"daily": []map[string]any{}}
+
+	covered := loadLocalUsageEntries(newEntries(), report, map[string]bool{"2026-07-01": true})
+	if len(covered) != 2 || numberValue(covered[0]["totalTokens"]) != 1000 {
+		t.Fatalf("covered date must keep ccusage's total untouched, got %#v", covered)
+	}
+	if usageDate(covered[1]) != "2026-07-05" || numberValue(covered[1]["totalTokens"]) != 200 {
+		t.Fatalf("a date ccusage misses must still get the estimate, got %#v", covered)
+	}
+
+	uncovered := loadLocalUsageEntries(newEntries(), report, nil)
+	if numberValue(uncovered[0]["totalTokens"]) != 1100 {
+		t.Fatalf("without ccusage coverage the estimate is added, got %#v", uncovered[0])
+	}
+}
+
+// The server reads cachedInputTokens as the cache-read count when
+// cacheReadTokens is absent, so a derived total must not drop those tokens.
+func TestCombinedRebuildCountsCachedInputTokensLikeTheServer(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"claude","inputTokens":100,"outputTokens":10,"cachedInputTokens":400,"totalTokens":510,"totalCost":1}]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 510 {
+		t.Fatalf("totalTokens = %v, want 510 (100 + 10 + 400 cached)", got)
+	}
+	if got := numberValue(combined[0]["cacheReadTokens"]); got != 400 {
+		t.Fatalf("cacheReadTokens = %v, want the cached tokens carried over", got)
+	}
+	assertServerConsistentTotal(t, combined[0])
+}
+
+// The dedicated Codex upload is built from the same ccusage slices and is
+// validated by the same server rule, so it derives its total the same way.
+func TestCodexRowFoldsUnexplainedTokensIntoOutput(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"codex","inputTokens":1000,"outputTokens":200,"cacheReadTokens":8800,"totalTokens":10190,"totalCost":0.5}]}]}`)
+	_, raw, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, _, err := runCodexUsageFromEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Daily) != 1 {
+		t.Fatalf("wire rows = %#v", wire.Daily)
+	}
+	if got := numberValue(wire.Daily[0]["totalTokens"]); got != 10190 {
+		t.Fatalf("codex totalTokens = %v, want the slice total 10190 kept", got)
+	}
+	if got := numberValue(wire.Daily[0]["outputTokens"]); got != 390 {
+		t.Fatalf("codex outputTokens = %v, want 390 (200 + the 190 remainder)", got)
+	}
+	assertServerConsistentTotal(t, wire.Daily[0])
+}
+
+// The Codex builder honours the server's cachedInputTokens fallback too.
+func TestCodexRowCountsCachedInputTokens(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, raw, err := parseCcusageReport([]byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"codex","inputTokens":100,"outputTokens":10,"cachedInputTokens":400,"totalTokens":510,"totalCost":0.5}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, _, err := runCodexUsageFromEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(wire.Daily[0]["cacheReadTokens"]); got != 400 {
+		t.Fatalf("codex cacheReadTokens = %v, want 400", got)
+	}
+	assertServerConsistentTotal(t, wire.Daily[0])
+}
+
+// The Antigravity transcript estimator is merged into combined rows afterwards;
+// it adds the same amount to a row's total and its components.
+func TestCombinedRowStaysConsistentAfterAntigravityTranscriptMerge(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"antigravity","inputTokens":1000,"outputTokens":200,"cacheReadTokens":8800,"totalTokens":10190,"totalCost":0.5}]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimate := []map[string]any{{
+		"date": "2026-07-01", "inputTokens": 73.0, "outputTokens": 13.0,
+		"cacheCreationTokens": 0.0, "cacheReadTokens": 0.0, "totalTokens": 86.0,
+	}}
+	merged := mergeUsageEntries(combined, estimate)
+	if len(merged) != 1 {
+		t.Fatalf("merged entries = %#v", merged)
+	}
+	if got := numberValue(merged[0]["totalTokens"]); got != 10276 {
+		t.Fatalf("merged totalTokens = %v, want 10276 (10190 + 86)", got)
+	}
+	assertServerConsistentTotal(t, merged[0])
+}
+
+// The rows that actually go on the wire, not just the in-memory entries, must
+// pass the server's total check, including an Antigravity-only first row of the
+// day and the full-history batch a run with no cache offers.
+func TestCombinedUploadPayloadPassesServerTotalCheck(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	report := []byte(`{"daily":[
+		{"period":"2026-06-30","agents":[{"agent":"codex","inputTokens":5,"outputTokens":5,"totalTokens":10}]},
+		{"period":"2026-07-01","agents":[
+			{"agent":"antigravity","inputTokens":1000,"outputTokens":200,"cacheReadTokens":8800,"totalTokens":10190,"totalCost":0.5}]},
+		{"period":"2026-09-29","agents":[
+			{"agent":"antigravity","inputTokens":50,"outputTokens":10,"cacheReadTokens":40,"totalTokens":101,"totalCost":0.01}]}
+	]}`)
+	parsed, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setReportEntries(parsed, combined)
+	pending, err := prepareUsageUpload(parsed, combined, "combined", "no higher combined usage rows found")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Daily) != 3 {
+		t.Fatalf("wire rows = %d, want the full 3-row history: %s", len(wire.Daily), pending.Report)
+	}
+	for _, row := range wire.Daily {
+		assertServerConsistentTotal(t, row)
 	}
 }
 
@@ -1767,5 +2285,169 @@ func TestUploadNeverSendsReplaceForAnyPlatform(t *testing.T) {
 		if _, ok := payload["json"].(string); !ok {
 			t.Fatalf("%s payload is missing its json report", platforms[i])
 		}
+	}
+}
+
+// Each Pi record can be within the server's 1-token tolerance floor and still
+// drift past 0.1% once many tiny records are summed into the day row the server
+// actually checks, so the aggregate is guarded too.
+func TestPiDayRowIsServerConsistentWhenTinyRecordsDrift(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(home, ".pi", "agent", "sessions", "session-1.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	records := []map[string]any{{"type": "model_change", "provider": "anthropic", "modelId": "claude-sonnet"}}
+	for minute := 0; minute < 5; minute++ {
+		records = append(records, map[string]any{
+			"type":      "message",
+			"timestamp": fmt.Sprintf("2026-08-12T10:0%d:00Z", minute),
+			"message": map[string]any{"usage": map[string]any{
+				"input": 300, "output": 100, "totalTokens": 401, // 1 token off each: within the per-record floor
+				"cost": map[string]any{"total": 0.1},
+			}},
+		})
+	}
+	var data []byte
+	for _, record := range records {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = append(data, encoded...)
+		data = append(data, '\n')
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := loadPiUsageEntriesFor(platformPi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if got := numberValue(entries[0]["totalTokens"]); got != 2000 {
+		t.Fatalf("day totalTokens = %v, want the component sum 2000 (5 x 401 = 2005 is beyond the server tolerance)", got)
+	}
+	assertServerConsistentTotal(t, entries[0])
+}
+
+// The shipped wiring, not just the pieces: runCcusage must hand ccusage's own
+// Antigravity dates to loadLocalUsageEntries so the transcript estimate is not
+// added on top of them. A fake npx serves the ccusage output.
+func TestRunCcusageDoesNotDoubleCountAntigravityWhereCcusageReportsIt(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeAntigravityTranscript(t, home, "2026-07-01", 400) // would add 100 estimated tokens
+
+	bin := t.TempDir()
+	fixture := filepath.Join(bin, "ccusage.json")
+	if err := os.WriteFile(fixture, []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"antigravity","inputTokens":1000,"outputTokens":0,"cacheReadTokens":0,"totalTokens":1000,"totalCost":0.5}]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "npx"), []byte("#!/bin/sh\ncat "+fixture+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+
+	pending, _, _, err := runCcusage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Daily) != 1 {
+		t.Fatalf("wire rows = %#v", wire.Daily)
+	}
+	if got := numberValue(wire.Daily[0]["totalTokens"]); got != 1000 {
+		t.Fatalf("totalTokens = %v, want ccusage's 1000 with no transcript estimate on top", got)
+	}
+}
+
+func TestUncoveredZCodeEntriesKeepsZCodeOnlyWhereGLMHasNoData(t *testing.T) {
+	_, raw, err := parseCcusageReport([]byte(`{"daily":[
+		{"period":"2026-08-14","agents":[{"agent":"zcode","inputTokens":22306,"outputTokens":4456,"cacheReadTokens":321920,"totalTokens":348682,"totalCost":0.13}]},
+		{"period":"2026-08-28","agents":[{"agent":"zcode","inputTokens":709370,"outputTokens":82816,"cacheReadTokens":18093184,"totalTokens":18885370,"totalCost":2}]},
+		{"period":"2026-08-29","agents":[{"agent":"claude","inputTokens":1,"totalTokens":1}]}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := uncoveredZCodeEntries(raw, map[string]bool{"2026-08-28": true})
+	if len(rows) != 1 || usageDate(rows[0]) != "2026-08-14" {
+		t.Fatalf("rows = %#v, want only the uncovered 2026-08-14", rows)
+	}
+	if got := numberValue(rows[0]["totalTokens"]); got != 348682 {
+		t.Fatalf("totalTokens = %v, want 348682", got)
+	}
+	assertServerConsistentTotal(t, rows[0])
+}
+
+// End to end through the real runCcusage: zcode usage the native GLM upload
+// already covers stays out of combined (no double count), and zcode usage on a
+// date whose rollout files were pruned is kept (no real usage lost).
+func TestRunCcusageKeepsZCodeOnlyWhereTheGLMUploadDoesNotCoverIt(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.UTC
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Native Z Code rollout exists for 2026-08-28 only.
+	writeJSONL(t, filepath.Join(home, ".zcode", "cli", "rollout", "model-io-sess_abc.jsonl"), []map[string]any{
+		glmCall("req-1", "2026-08-28T13:47:14.836Z", "GLM-5.3", 251, 17, 192, 0),
+	})
+
+	bin := t.TempDir()
+	fixture := filepath.Join(bin, "ccusage.json")
+	if err := os.WriteFile(fixture, []byte(`{"daily":[
+		{"period":"2026-08-14","agents":[{"agent":"zcode","inputTokens":22306,"outputTokens":4456,"cacheReadTokens":321920,"totalTokens":348682,"totalCost":0.13}]},
+		{"period":"2026-08-28","agents":[
+			{"agent":"claude","inputTokens":100,"outputTokens":10,"cacheReadTokens":400,"totalTokens":510,"totalCost":1},
+			{"agent":"zcode","inputTokens":709370,"outputTokens":82816,"cacheReadTokens":18093184,"totalTokens":18885370,"totalCost":2}]}
+	]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "npx"), []byte("#!/bin/sh\ncat "+fixture+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+
+	pending, _, _, err := runCcusage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	totals := map[string]float64{}
+	for _, row := range wire.Daily {
+		totals[usageDate(row)] = numberValue(row["totalTokens"])
+		assertServerConsistentTotal(t, row)
+	}
+	if totals["2026-08-14"] != 348682 {
+		t.Fatalf("2026-08-14 = %v, want zcode's 348682 kept (GLM has no data that day)", totals["2026-08-14"])
+	}
+	if totals["2026-08-28"] != 510 {
+		t.Fatalf("2026-08-28 = %v, want only Claude's 510 (zcode is uploaded as GLM that day)", totals["2026-08-28"])
 	}
 }

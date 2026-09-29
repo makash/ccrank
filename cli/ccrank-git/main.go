@@ -10,6 +10,7 @@ import (
 	"html"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -190,7 +191,7 @@ func main() {
 		// Combined rows are max-merged server-side (never-lower). Do not send
 		// a replace flag — the LDP CLI never had one, and a replace=true
 		// upload destroyed ~27B tokens of historical peaks on 2026-08-15.
-		err = uploadUsageReport(*urlFlag, *tokenFlag, pending, machine, platformCombined, "combined")
+		err = uploadUsageReport(*urlFlag, *tokenFlag, pending, machine, platformCombined)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Combined usage: upload failed -", err.Error())
 			usageErr = err
@@ -364,7 +365,7 @@ func uploadDedicatedPlatform(job dedicatedPlatformUpload) *UsageSnapshot {
 	if strings.TrimSpace(job.Source) != "" {
 		source = strings.TrimSpace(job.Source)
 	}
-	if err := uploadUsageReport(job.BaseURL, job.Token, pending, source, job.Platform, job.Platform); err != nil {
+	if err := uploadUsageReport(job.BaseURL, job.Token, pending, source, job.Platform); err != nil {
 		fmt.Fprintln(os.Stderr, "  "+job.Label+": upload failed -", err.Error())
 		return nil
 	}
@@ -500,7 +501,7 @@ func runCcusage() (*pendingUsageUpload, *UsageSnapshot, []map[string]any, error)
 	out, err := cmd.Output()
 	if err != nil {
 		report := map[string]any{"daily": []map[string]any{}}
-		entries := loadLocalUsageEntries(nil, report)
+		entries := loadLocalUsageEntries(nil, report, nil)
 		if len(entries) == 0 {
 			return nil, nil, nil, errors.New("no combined usage data found (is Node installed?)")
 		}
@@ -522,9 +523,12 @@ func runCcusage() (*pendingUsageUpload, *UsageSnapshot, []map[string]any, error)
 		if rebuildErr != nil {
 			return nil, nil, nil, rebuildErr
 		}
+		if extras := zcodeNotUploadedAsGLM(raw); len(extras) > 0 {
+			entries = mergeUsageEntries(entries, extras)
+		}
 		setReportEntries(report, entries)
 	}
-	entries = loadLocalUsageEntries(entries, report)
+	entries = loadLocalUsageEntries(entries, report, ccusageAntigravityDates(raw))
 	if len(entries) == 0 && parseErr != nil {
 		return nil, nil, nil, parseErr
 	}
@@ -551,7 +555,7 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 		if date == "" {
 			continue
 		}
-		var input, output, cacheCreation, cacheRead, total, cost float64
+		var input, output, cacheCreation, cacheRead, cost float64
 		modelNames := []string{}
 		modelBreakdowns := []any{}
 		found := false
@@ -564,11 +568,18 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 				continue
 			}
 			found = true
-			input += numberValue(agent["inputTokens"])
-			output += numberValue(agent["outputTokens"])
-			cacheCreation += numberValue(agent["cacheCreationTokens"])
-			cacheRead += numberValue(agent["cacheReadTokens"])
-			total += numberValue(agent["totalTokens"])
+			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, verdict := sliceTokens(agent)
+			if verdict == sliceSkip {
+				warnSkippedSlice(date, agent)
+				continue
+			}
+			if verdict == sliceComponentsOnly {
+				warnUnexplainedSlice(date, agent)
+			}
+			input += sliceInput
+			output += sliceOutput
+			cacheCreation += sliceCacheCreation
+			cacheRead += sliceCacheReadTokens
 			cost += usageCostValue(agent)
 			for _, model := range extractModelNames(agent["modelsUsed"]) {
 				modelNames = append(modelNames, model)
@@ -581,6 +592,9 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 			continue
 		}
 		sort.Strings(modelNames)
+		// Derived, not copied from the slices, for the same server-consistency
+		// reason as rebuildCombinedEntries.
+		total := input + output + cacheCreation + cacheRead
 		rows = append(rows, map[string]any{
 			"date":                     date,
 			"inputTokens":              input,
@@ -611,18 +625,24 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 
 func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string]any, error) {
 	report, entries, err := parseCcusageReport(out)
+	var covered map[string]bool
 	if err != nil {
 		report = map[string]any{"daily": []map[string]any{}}
 		entries = nil
 	} else {
+		covered = ccusageAntigravityDates(entries)
+		raw := entries
 		entries, err = rebuildCombinedEntries(entries)
 		if err != nil {
 			return nil, nil, err
 		}
+		if extras := zcodeNotUploadedAsGLM(raw); len(extras) > 0 {
+			entries = mergeUsageEntries(entries, extras)
+		}
 		setReportEntries(report, entries)
 	}
 
-	entries = loadLocalUsageEntries(entries, report)
+	entries = loadLocalUsageEntries(entries, report, covered)
 	if len(entries) == 0 && err != nil {
 		return nil, nil, err
 	}
@@ -631,15 +651,21 @@ func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string
 
 // loadLocalUsageEntries folds in agents ccusage cannot see. Pi is deliberately
 // absent: ccusage imports it natively now, and ccrank uploads it under its own
-// platform, so merging it here would count every Pi session twice.
-func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []map[string]any {
+// platform, so merging it here would count every Pi session twice. Antigravity
+// is imported natively by ccusage too, so the transcript estimate is only a
+// fallback: dates in ccusageCovered (ones ccusage already reports an
+// antigravity slice for) are skipped rather than counted twice.
+func loadLocalUsageEntries(entries []map[string]any, report map[string]any, ccusageCovered map[string]bool) []map[string]any {
 	antigravityEntries, err := loadAntigravityUsageEntries()
 	if err != nil {
 		// Tolerate unreadable transcripts: they are skipped with a warning
 		// rather than failing the run. The combined upload always max-merges
 		// server-side, so a partial local view can never lower a row.
 		fmt.Fprintln(os.Stderr, "  Gemini Antigravity: skipped -", err.Error())
-	} else if len(antigravityEntries) > 0 {
+		return entries
+	}
+	antigravityEntries = withoutCoveredDates(antigravityEntries, ccusageCovered)
+	if len(antigravityEntries) > 0 {
 		entries = mergeUsageEntries(entries, antigravityEntries)
 		setReportEntries(report, entries)
 	}
@@ -648,13 +674,16 @@ func loadLocalUsageEntries(entries []map[string]any, report map[string]any) []ma
 
 // ccusage imports Pi and Kimi natively, and ccrank uploads both under their own
 // platform. Holding them out of the combined bucket keeps usage a dedicated
-// importer already reports from being counted twice.
+// importer already reports from being counted twice. "zcode" is ccusage's name
+// for Z Code, whose rollout files ccrank already uploads as the GLM platform
+// (the name does not start with "glm", so unheldDedicatedAgent cannot catch it).
 var ccusageDedicatedAgents = map[string]bool{
 	"pi":       true,
 	"kimi":     true,
 	"opencode": true,
 	"grok":     true,
 	"glm":      true,
+	"zcode":    true,
 	"cursor":   true,
 	"codex":    true,
 	"muse":     true,
@@ -689,6 +718,14 @@ func unheldDedicatedAgent(agent string) string {
 // report. The server max-merges, so the zero row cannot lower an inflated
 // row written by an earlier ccrank version; that row keeps its historical
 // peak (see test/never-lower.test.mjs).
+//
+// Each row's totalTokens is the sum of its four component fields, never a copy
+// of the slice totals. Some agents (ccusage's Antigravity importer) report a
+// slice total above the sum of the token fields they expose; sliceTokens folds
+// that remainder into outputTokens, so the total is unchanged and the row is
+// self-consistent. The server 400s the whole upload when a row's total is more
+// than 0.1% off its component sum, and a day dominated by such an agent would
+// trip that check.
 func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) {
 	rebuilt := make([]map[string]any, 0, len(entries))
 	for index, entry := range entries {
@@ -705,9 +742,7 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			continue
 		}
 
-		var input, output, cacheCreation, cacheRead, total, cost float64
-		modelNames := []string{}
-		modelBreakdowns := []any{}
+		slices := make([]map[string]any, 0, len(agents))
 		for _, raw := range agents {
 			agent, ok := raw.(map[string]any)
 			if !ok {
@@ -723,40 +758,263 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 				// every combined row, so fail loudly instead.
 				return nil, fmt.Errorf("ccusage --by-agent row %s reports agent %q from the dedicated %q platform; add it to ccusageDedicatedAgents or upgrade ccrank so its usage is not double-counted", date, name, owner)
 			}
-			input += numberValue(agent["inputTokens"])
-			output += numberValue(agent["outputTokens"])
-			cacheCreation += numberValue(agent["cacheCreationTokens"])
-			cacheRead += numberValue(agent["cacheReadTokens"])
-			total += numberValue(agent["totalTokens"])
-			cost += usageCostValue(agent)
-			for _, model := range extractModelNames(agent["modelsUsed"]) {
-				modelNames = append(modelNames, model)
-			}
-			if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
-				modelBreakdowns = append(modelBreakdowns, breakdowns...)
-			}
+			slices = append(slices, agent)
 		}
-		sort.Strings(modelNames)
-
-		rebuilt = append(rebuilt, map[string]any{
-			"date":                     date,
-			"inputTokens":              input,
-			"outputTokens":             output,
-			"cacheCreationTokens":      cacheCreation,
-			"cacheReadTokens":          cacheRead,
-			"totalInputTokens":         input,
-			"totalOutputTokens":        output,
-			"totalCacheCreationTokens": cacheCreation,
-			"totalCacheReadTokens":     cacheRead,
-			"totalTokens":              total,
-			"totalCost":                cost,
-			"totalCostUSD":             cost,
-			"costUSD":                  cost,
-			"modelsUsed":               modelNames,
-			"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
-		})
+		rebuilt = append(rebuilt, combinedRowFromSlices(date, slices))
 	}
 	return rebuilt, nil
+}
+
+// combinedRowFromSlices sums ccusage agent slices into one combined-shaped row.
+// The row total is the sum of its four component fields (see sliceTokens for
+// how each slice is counted, and warned about when it is not counted in full).
+func combinedRowFromSlices(date string, slices []map[string]any) map[string]any {
+	var input, output, cacheCreation, cacheRead, cost float64
+	modelNames := []string{}
+	modelBreakdowns := []any{}
+	for _, agent := range slices {
+		sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, verdict := sliceTokens(agent)
+		if verdict == sliceSkip {
+			warnSkippedSlice(date, agent)
+			continue
+		}
+		if verdict == sliceComponentsOnly {
+			warnUnexplainedSlice(date, agent)
+		}
+		input += sliceInput
+		output += sliceOutput
+		cacheCreation += sliceCacheCreation
+		cacheRead += sliceCacheReadTokens
+		cost += usageCostValue(agent)
+		for _, model := range extractModelNames(agent["modelsUsed"]) {
+			modelNames = append(modelNames, model)
+		}
+		if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
+			modelBreakdowns = append(modelBreakdowns, breakdowns...)
+		}
+	}
+	sort.Strings(modelNames)
+	total := input + output + cacheCreation + cacheRead
+
+	return map[string]any{
+		"date":                     date,
+		"inputTokens":              input,
+		"outputTokens":             output,
+		"cacheCreationTokens":      cacheCreation,
+		"cacheReadTokens":          cacheRead,
+		"totalInputTokens":         input,
+		"totalOutputTokens":        output,
+		"totalCacheCreationTokens": cacheCreation,
+		"totalCacheReadTokens":     cacheRead,
+		"totalTokens":              total,
+		"totalCost":                cost,
+		"totalCostUSD":             cost,
+		"costUSD":                  cost,
+		"modelsUsed":               modelNames,
+		"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
+	}
+}
+
+// sliceCacheRead mirrors the server's cacheReadTokens || cachedInputTokens
+// fallback (src/parser.ts) so a total derived from the component fields never
+// drops cached tokens a slice reported under the alternate name.
+func sliceCacheRead(agent map[string]any) float64 {
+	if cacheRead := numberValue(agent["cacheReadTokens"]); cacheRead != 0 {
+		return cacheRead
+	}
+	return numberValue(agent["cachedInputTokens"])
+}
+
+// maxUnexplainedFraction bounds how much of a slice's reported total may be
+// tokens with no field of their own. Real ccusage Antigravity slices sit at
+// 0.2-0.7%; beyond 5% the total is treated as an accounting bug and not trusted,
+// so a corrupt total can never be uploaded (the server never lowers a stored
+// row, so an over-count would be permanent while an under-count can still be
+// corrected later).
+const maxUnexplainedFraction = 0.05
+
+type sliceVerdict int
+
+const (
+	// sliceSkip: not counted at all (the zero value, so an unset verdict is safe).
+	sliceSkip sliceVerdict = iota
+	// sliceCounted: the token fields, plus any plausible unexplained remainder
+	// folded into output, are counted.
+	sliceCounted
+	// sliceComponentsOnly: the reported total is implausibly far above the token
+	// fields, so only the fields themselves (which can never exceed what the
+	// slice reports) are counted; the remainder is ignored.
+	sliceComponentsOnly
+)
+
+// sliceTokens returns a ccusage agent slice's four token fields and how the
+// slice is counted. When the slice reports a totalTokens above their sum by a
+// plausible amount, the difference is tokens ccusage counts but exposes no field
+// for (Antigravity's thinking tokens); it is folded into outputTokens, the way
+// opencode_usage.go folds reasoning into output. That keeps the row total
+// unchanged while making it equal its component sum, which the server requires
+// (src/parser.ts: total within 0.1% of the components). A missing total (0)
+// counts the components, like the Pi/Kimi loaders. Not counted (sliceSkip):
+// negative values (the server rejects the whole upload for them), a total with
+// no component fields (the server rejects total-only rows on purpose), and
+// components above the total by more than the server's own tolerance
+// (overlapping fields would inflate the row).
+func sliceTokens(agent map[string]any) (input, output, cacheCreation, cacheRead float64, verdict sliceVerdict) {
+	input = numberValue(agent["inputTokens"])
+	output = numberValue(agent["outputTokens"])
+	cacheCreation = numberValue(agent["cacheCreationTokens"])
+	cacheRead = sliceCacheRead(agent)
+	total := numberValue(agent["totalTokens"])
+	if input < 0 || output < 0 || cacheCreation < 0 || cacheRead < 0 || total < 0 {
+		return 0, 0, 0, 0, sliceSkip
+	}
+	components := input + output + cacheCreation + cacheRead
+	gap := total - components
+	switch {
+	case components == 0:
+		if total == 0 {
+			return 0, 0, 0, 0, sliceCounted
+		}
+		return 0, 0, 0, 0, sliceSkip
+	case total == 0:
+		return input, output, cacheCreation, cacheRead, sliceCounted
+	case gap >= 0 && gap <= maxUnexplainedFraction*total:
+		return input, output + gap, cacheCreation, cacheRead, sliceCounted
+	case gap > 0:
+		return input, output, cacheCreation, cacheRead, sliceComponentsOnly
+	case -gap <= math.Max(1, total*0.001):
+		return input, output, cacheCreation, cacheRead, sliceCounted
+	default:
+		return 0, 0, 0, 0, sliceSkip
+	}
+}
+
+func sliceComponentSum(agent map[string]any) float64 {
+	return numberValue(agent["inputTokens"]) + numberValue(agent["outputTokens"]) +
+		numberValue(agent["cacheCreationTokens"]) + sliceCacheRead(agent)
+}
+
+// warnSkippedSlice reports a slice sliceTokens refused to count, so the gap in
+// the upload is visible in the run log instead of silent.
+func warnSkippedSlice(date string, agent map[string]any) {
+	fmt.Fprintf(os.Stderr, "  ccusage %v slice for %s skipped: totalTokens %.0f does not match its token fields (%.0f); not uploaded so it cannot over-count history\n",
+		agent["agent"], date, numberValue(agent["totalTokens"]), sliceComponentSum(agent))
+}
+
+// warnUnexplainedSlice reports a slice whose total is implausibly far above its
+// token fields; only the fields are counted.
+func warnUnexplainedSlice(date string, agent map[string]any) {
+	fmt.Fprintf(os.Stderr, "  ccusage %v slice for %s reports %.0f tokens but only %.0f in its token fields; counting the token fields only\n",
+		agent["agent"], date, numberValue(agent["totalTokens"]), sliceComponentSum(agent))
+}
+
+const ccusageAntigravityAgent = "antigravity"
+
+// ccusageAntigravityDates lists the dates whose pre-rebuild ccusage row has an
+// antigravity slice with usage. ccusage imports Antigravity natively now, so
+// ccrank's own transcript estimate for those dates would count the same
+// sessions a second time (and the server never lowers a row once uploaded).
+func ccusageAntigravityDates(raw []map[string]any) map[string]bool {
+	dates := map[string]bool{}
+	for _, entry := range raw {
+		agents, ok := entry["agents"].([]any)
+		if !ok {
+			continue
+		}
+		date := usageDate(entry)
+		if date == "" {
+			continue
+		}
+		for _, item := range agents {
+			agent, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name := strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"])))
+			if name != ccusageAntigravityAgent || numberValue(agent["totalTokens"]) <= 0 {
+				continue
+			}
+			// Only a slice that is actually counted covers its date; if it is
+			// skipped the transcript estimate stays as the fallback.
+			if _, _, _, _, verdict := sliceTokens(agent); verdict != sliceSkip {
+				dates[date] = true
+			}
+		}
+	}
+	return dates
+}
+
+const ccusageZCodeAgent = "zcode"
+
+// uncoveredZCodeEntries rebuilds combined-shaped rows from ccusage's zcode
+// slices for dates the native Z Code (GLM) upload has no usage for. zcode is held
+// out of combined because ccrank uploads the same Z Code usage as the GLM
+// platform, but where the rollout files were pruned nothing else counts it, so
+// holding it out there would drop real usage.
+func uncoveredZCodeEntries(raw []map[string]any, covered map[string]bool) []map[string]any {
+	rows := []map[string]any{}
+	for _, entry := range raw {
+		date := usageDate(entry)
+		agents, ok := entry["agents"].([]any)
+		if date == "" || !ok || covered[date] {
+			continue
+		}
+		slices := []map[string]any{}
+		for _, item := range agents {
+			agent, ok := item.(map[string]any)
+			if ok && strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"]))) == ccusageZCodeAgent {
+				slices = append(slices, agent)
+			}
+		}
+		if len(slices) > 0 {
+			rows = append(rows, combinedRowFromSlices(date, slices))
+		}
+	}
+	return rows
+}
+
+// zcodeNotUploadedAsGLM is the rows to merge back into combined: zcode usage on
+// dates the native GLM loader does not cover. When the loader cannot be read
+// there is no telling what GLM covers, so zcode stays held out (an under-count
+// can be corrected later; a double count cannot).
+func zcodeNotUploadedAsGLM(raw []map[string]any) []map[string]any {
+	native, err := loadGLMUsageEntries()
+	if err != nil {
+		return nil
+	}
+	covered := map[string]bool{}
+	for _, entry := range native {
+		if numberValue(entry["totalTokens"]) > 0 {
+			covered[usageDate(entry)] = true
+		}
+	}
+	return uncoveredZCodeEntries(raw, covered)
+}
+
+func withoutCoveredDates(entries []map[string]any, covered map[string]bool) []map[string]any {
+	if len(covered) == 0 {
+		return entries
+	}
+	kept := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		if !covered[usageDate(entry)] {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
+}
+
+// serverConsistentTotal returns reported unchanged while it is within the
+// server's tolerance of the component sum (src/parser.ts validateEntry: more
+// than 0.1%, at least 1 token, rejects the whole upload), and the component sum
+// otherwise. Loaders that trust an upstream total use it so one inconsistent
+// record cannot get a whole platform's upload rejected; rows the server already
+// accepts are left exactly as they were.
+func serverConsistentTotal(reported, componentSum float64) float64 {
+	if math.Abs(reported-componentSum) > math.Max(1, math.Abs(reported)*0.001) {
+		return componentSum
+	}
+	return reported
 }
 
 func extractModelNames(raw any) []string {
@@ -1343,15 +1601,18 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 			"totalOutputTokens":        usage.Output,
 			"totalCacheCreationTokens": usage.CacheWrite,
 			"totalCacheReadTokens":     usage.CacheRead,
-			"totalTokens":              usage.TotalTokens,
-			"totalCost":                usage.Cost,
-			"totalCostUSD":             usage.Cost,
-			"costUSD":                  usage.Cost,
-			"modelsUsed":               modelNames,
-			"modelBreakdowns":          modelBreakdowns,
-			"messages":                 usage.Messages,
-			"sessionFiles":             len(usage.SessionFiles),
-			"source":                   "pi-session-jsonl",
+			// The day row is what the server checks, and per-record guards can
+			// still drift past its 0.1% tolerance when summed over many tiny
+			// records, so the aggregate is guarded too.
+			"totalTokens":     serverConsistentTotal(usage.TotalTokens, usage.Input+usage.Output+usage.CacheWrite+usage.CacheRead),
+			"totalCost":       usage.Cost,
+			"totalCostUSD":    usage.Cost,
+			"costUSD":         usage.Cost,
+			"modelsUsed":      modelNames,
+			"modelBreakdowns": modelBreakdowns,
+			"messages":        usage.Messages,
+			"sessionFiles":    len(usage.SessionFiles),
+			"source":          "pi-session-jsonl",
 		})
 	}
 	return entries, nil
@@ -1449,6 +1710,8 @@ func readPiSession(path string, byDate map[string]*piDailyUsage, seenRecords map
 			continue
 		}
 		seenRecords[fingerprint] = true
+		// Applied after the fingerprint so dedup keys still use the raw record.
+		totalTokens = serverConsistentTotal(totalTokens, inputTokens+outputTokens+cacheWriteTokens+cacheReadTokens)
 
 		day := byDate[date]
 		if day == nil {
@@ -1869,8 +2132,10 @@ func usageTotals(entries []map[string]any) map[string]any {
 // correction is impossible regardless — the smaller grok rows simply lose the
 // merge until their tokens genuinely grow again. Version 4 splits Codex out
 // of the combined bucket, shrinking those rows the way Kimi (v2) and Pi (v3)
-// did.
-const usageMaximaVersion = 4
+// did. Version 5 holds Z Code ("zcode") out of the combined bucket, since it
+// uploads as GLM, and skips the Antigravity transcript estimate on dates ccusage
+// reports itself; both shrink combined rows that older versions counted twice.
+const usageMaximaVersion = 5
 
 func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	path, err := usageMaximaPath(cacheName)
@@ -1895,8 +2160,9 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 		// Version 2 split Kimi out of the legacy combined platform; version 3
 		// splits out Pi, which ccusage began importing natively and ccrank was
 		// merging on top of; version 4 splits out Codex, whose --by-agent
-		// slices ccrank used to fold into combined. Each split shrinks the
-		// combined bucket, so treat older maxima as empty once and re-offer
+		// slices ccrank used to fold into combined; version 5 holds zcode out
+		// and stops double-counting Antigravity. Each change shrinks the combined
+		// bucket, so treat older maxima as empty once and re-offer
 		// every current row; rows higher than the server peak apply, and the
 		// lower corrected rows are silently discarded by the server's
 		// max-merge, which can never lower history (see test/never-lower.test.mjs).
@@ -2077,32 +2343,20 @@ func uploadCcusage(baseURL, token, report, machine, platform string) error {
 
 // uploadUsageReport posts a prepared usage report and settles the monotonic
 // maxima cache accordingly: the cache advances only once the upload is
-// confirmed (HTTP 2xx), and any failure clears it so the offered rows come
-// back on the next run instead of being marked as uploaded forever.
-func uploadUsageReport(baseURL, token string, pending *pendingUsageUpload, machine, platform, cacheName string) error {
+// confirmed (HTTP 2xx). A failed upload leaves the cache exactly as it was.
+// prepareUsageUpload never writes it, so the rows that were offered simply come
+// back on the next run. The cache must NOT be cleared on failure: an empty
+// cache re-offers the entire history as one batch, and a single row the server
+// rejects anywhere in it then fails every later run too (a retry loop that
+// only ends when that row disappears).
+func uploadUsageReport(baseURL, token string, pending *pendingUsageUpload, machine, platform string) error {
 	if err := uploadCcusage(baseURL, token, pending.Report, machine, platform); err != nil {
-		if resetErr := resetUsageMaxima(cacheName); resetErr != nil {
-			return fmt.Errorf("%w (could not reset retry cache: %v)", err, resetErr)
-		}
 		return err
 	}
 	if err := pending.Commit(); err != nil {
 		// The rows are on the server; re-offering them next run is harmless
 		// because the server max-merges.
 		return fmt.Errorf("uploaded, but could not record the retry cache: %w", err)
-	}
-	return nil
-}
-
-// resetUsageMaxima deletes a platform's maxima cache so rows prepared for a
-// failed upload are re-offered next run. A missing cache is already reset.
-func resetUsageMaxima(cacheName string) error {
-	path, pathErr := usageMaximaPath(cacheName)
-	if pathErr != nil {
-		return pathErr
-	}
-	if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-		return removeErr
 	}
 	return nil
 }
