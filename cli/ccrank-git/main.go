@@ -523,6 +523,9 @@ func runCcusage() (*pendingUsageUpload, *UsageSnapshot, []map[string]any, error)
 		if rebuildErr != nil {
 			return nil, nil, nil, rebuildErr
 		}
+		if extras := zcodeNotUploadedAsGLM(raw); len(extras) > 0 {
+			entries = mergeUsageEntries(entries, extras)
+		}
 		setReportEntries(report, entries)
 	}
 	entries = loadLocalUsageEntries(entries, report, ccusageAntigravityDates(raw))
@@ -565,10 +568,13 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 				continue
 			}
 			found = true
-			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, countable := sliceTokens(agent)
-			if !countable {
+			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, verdict := sliceTokens(agent)
+			if verdict == sliceSkip {
 				warnSkippedSlice(date, agent)
 				continue
+			}
+			if verdict == sliceComponentsOnly {
+				warnUnexplainedSlice(date, agent)
 			}
 			input += sliceInput
 			output += sliceOutput
@@ -625,9 +631,13 @@ func parseCcusageReportWithLocalExtras(out []byte) (map[string]any, []map[string
 		entries = nil
 	} else {
 		covered = ccusageAntigravityDates(entries)
+		raw := entries
 		entries, err = rebuildCombinedEntries(entries)
 		if err != nil {
 			return nil, nil, err
+		}
+		if extras := zcodeNotUploadedAsGLM(raw); len(extras) > 0 {
+			entries = mergeUsageEntries(entries, extras)
 		}
 		setReportEntries(report, entries)
 	}
@@ -732,9 +742,7 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			continue
 		}
 
-		var input, output, cacheCreation, cacheRead, cost float64
-		modelNames := []string{}
-		modelBreakdowns := []any{}
+		slices := make([]map[string]any, 0, len(agents))
 		for _, raw := range agents {
 			agent, ok := raw.(map[string]any)
 			if !ok {
@@ -750,45 +758,61 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 				// every combined row, so fail loudly instead.
 				return nil, fmt.Errorf("ccusage --by-agent row %s reports agent %q from the dedicated %q platform; add it to ccusageDedicatedAgents or upgrade ccrank so its usage is not double-counted", date, name, owner)
 			}
-			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, countable := sliceTokens(agent)
-			if !countable {
-				warnSkippedSlice(date, agent)
-				continue
-			}
-			input += sliceInput
-			output += sliceOutput
-			cacheCreation += sliceCacheCreation
-			cacheRead += sliceCacheReadTokens
-			cost += usageCostValue(agent)
-			for _, model := range extractModelNames(agent["modelsUsed"]) {
-				modelNames = append(modelNames, model)
-			}
-			if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
-				modelBreakdowns = append(modelBreakdowns, breakdowns...)
-			}
+			slices = append(slices, agent)
 		}
-		sort.Strings(modelNames)
-		total := input + output + cacheCreation + cacheRead
-
-		rebuilt = append(rebuilt, map[string]any{
-			"date":                     date,
-			"inputTokens":              input,
-			"outputTokens":             output,
-			"cacheCreationTokens":      cacheCreation,
-			"cacheReadTokens":          cacheRead,
-			"totalInputTokens":         input,
-			"totalOutputTokens":        output,
-			"totalCacheCreationTokens": cacheCreation,
-			"totalCacheReadTokens":     cacheRead,
-			"totalTokens":              total,
-			"totalCost":                cost,
-			"totalCostUSD":             cost,
-			"costUSD":                  cost,
-			"modelsUsed":               modelNames,
-			"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
-		})
+		rebuilt = append(rebuilt, combinedRowFromSlices(date, slices))
 	}
 	return rebuilt, nil
+}
+
+// combinedRowFromSlices sums ccusage agent slices into one combined-shaped row.
+// The row total is the sum of its four component fields (see sliceTokens for
+// how each slice is counted, and warned about when it is not counted in full).
+func combinedRowFromSlices(date string, slices []map[string]any) map[string]any {
+	var input, output, cacheCreation, cacheRead, cost float64
+	modelNames := []string{}
+	modelBreakdowns := []any{}
+	for _, agent := range slices {
+		sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, verdict := sliceTokens(agent)
+		if verdict == sliceSkip {
+			warnSkippedSlice(date, agent)
+			continue
+		}
+		if verdict == sliceComponentsOnly {
+			warnUnexplainedSlice(date, agent)
+		}
+		input += sliceInput
+		output += sliceOutput
+		cacheCreation += sliceCacheCreation
+		cacheRead += sliceCacheReadTokens
+		cost += usageCostValue(agent)
+		for _, model := range extractModelNames(agent["modelsUsed"]) {
+			modelNames = append(modelNames, model)
+		}
+		if breakdowns, ok := agent["modelBreakdowns"].([]any); ok {
+			modelBreakdowns = append(modelBreakdowns, breakdowns...)
+		}
+	}
+	sort.Strings(modelNames)
+	total := input + output + cacheCreation + cacheRead
+
+	return map[string]any{
+		"date":                     date,
+		"inputTokens":              input,
+		"outputTokens":             output,
+		"cacheCreationTokens":      cacheCreation,
+		"cacheReadTokens":          cacheRead,
+		"totalInputTokens":         input,
+		"totalOutputTokens":        output,
+		"totalCacheCreationTokens": cacheCreation,
+		"totalCacheReadTokens":     cacheRead,
+		"totalTokens":              total,
+		"totalCost":                cost,
+		"totalCostUSD":             cost,
+		"costUSD":                  cost,
+		"modelsUsed":               modelNames,
+		"modelBreakdowns":          mergeModelBreakdowns(nil, modelBreakdowns),
+	}
 }
 
 // sliceCacheRead mirrors the server's cacheReadTokens || cachedInputTokens
@@ -803,53 +827,85 @@ func sliceCacheRead(agent map[string]any) float64 {
 
 // maxUnexplainedFraction bounds how much of a slice's reported total may be
 // tokens with no field of their own. Real ccusage Antigravity slices sit at
-// 0.2-0.7%; beyond 5% the slice is treated as an accounting bug rather than
-// folded, so a corrupt total can never be uploaded (the server never lowers a
-// stored row, so an over-count would be permanent while an under-count can
-// still be corrected later).
+// 0.2-0.7%; beyond 5% the total is treated as an accounting bug and not trusted,
+// so a corrupt total can never be uploaded (the server never lowers a stored
+// row, so an over-count would be permanent while an under-count can still be
+// corrected later).
 const maxUnexplainedFraction = 0.05
 
-// sliceTokens returns a ccusage agent slice's four token fields, and false when
-// the slice is too incoherent to count. When the slice reports a totalTokens
-// above their sum by a plausible amount, the difference is tokens ccusage
-// counts but exposes no field for (Antigravity's thinking tokens); it is folded
-// into outputTokens, the way opencode_usage.go folds reasoning into output. That
-// keeps the row total unchanged while making it equal its component sum, which
-// the server requires (src/parser.ts: total within 0.1% of the components).
-// A missing total (0) counts the components, like the Pi/Kimi loaders. Not
-// counted (false): a total with no component fields (the server rejects
-// total-only rows on purpose), a gap over maxUnexplainedFraction, and
+type sliceVerdict int
+
+const (
+	// sliceSkip: not counted at all (the zero value, so an unset verdict is safe).
+	sliceSkip sliceVerdict = iota
+	// sliceCounted: the token fields, plus any plausible unexplained remainder
+	// folded into output, are counted.
+	sliceCounted
+	// sliceComponentsOnly: the reported total is implausibly far above the token
+	// fields, so only the fields themselves (which can never exceed what the
+	// slice reports) are counted; the remainder is ignored.
+	sliceComponentsOnly
+)
+
+// sliceTokens returns a ccusage agent slice's four token fields and how the
+// slice is counted. When the slice reports a totalTokens above their sum by a
+// plausible amount, the difference is tokens ccusage counts but exposes no field
+// for (Antigravity's thinking tokens); it is folded into outputTokens, the way
+// opencode_usage.go folds reasoning into output. That keeps the row total
+// unchanged while making it equal its component sum, which the server requires
+// (src/parser.ts: total within 0.1% of the components). A missing total (0)
+// counts the components, like the Pi/Kimi loaders. Not counted (sliceSkip):
+// negative values (the server rejects the whole upload for them), a total with
+// no component fields (the server rejects total-only rows on purpose), and
 // components above the total by more than the server's own tolerance
 // (overlapping fields would inflate the row).
-func sliceTokens(agent map[string]any) (input, output, cacheCreation, cacheRead float64, ok bool) {
+func sliceTokens(agent map[string]any) (input, output, cacheCreation, cacheRead float64, verdict sliceVerdict) {
 	input = numberValue(agent["inputTokens"])
 	output = numberValue(agent["outputTokens"])
 	cacheCreation = numberValue(agent["cacheCreationTokens"])
 	cacheRead = sliceCacheRead(agent)
-	components := input + output + cacheCreation + cacheRead
 	total := numberValue(agent["totalTokens"])
+	if input < 0 || output < 0 || cacheCreation < 0 || cacheRead < 0 || total < 0 {
+		return 0, 0, 0, 0, sliceSkip
+	}
+	components := input + output + cacheCreation + cacheRead
 	gap := total - components
 	switch {
 	case components == 0:
-		return 0, 0, 0, 0, total == 0
+		if total == 0 {
+			return 0, 0, 0, 0, sliceCounted
+		}
+		return 0, 0, 0, 0, sliceSkip
 	case total == 0:
-		return input, output, cacheCreation, cacheRead, true
+		return input, output, cacheCreation, cacheRead, sliceCounted
 	case gap >= 0 && gap <= maxUnexplainedFraction*total:
-		return input, output + gap, cacheCreation, cacheRead, true
-	case gap < 0 && -gap <= math.Max(1, total*0.001):
-		return input, output, cacheCreation, cacheRead, true
+		return input, output + gap, cacheCreation, cacheRead, sliceCounted
+	case gap > 0:
+		return input, output, cacheCreation, cacheRead, sliceComponentsOnly
+	case -gap <= math.Max(1, total*0.001):
+		return input, output, cacheCreation, cacheRead, sliceCounted
 	default:
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, 0, sliceSkip
 	}
+}
+
+func sliceComponentSum(agent map[string]any) float64 {
+	return numberValue(agent["inputTokens"]) + numberValue(agent["outputTokens"]) +
+		numberValue(agent["cacheCreationTokens"]) + sliceCacheRead(agent)
 }
 
 // warnSkippedSlice reports a slice sliceTokens refused to count, so the gap in
 // the upload is visible in the run log instead of silent.
 func warnSkippedSlice(date string, agent map[string]any) {
-	components := numberValue(agent["inputTokens"]) + numberValue(agent["outputTokens"]) +
-		numberValue(agent["cacheCreationTokens"]) + sliceCacheRead(agent)
 	fmt.Fprintf(os.Stderr, "  ccusage %v slice for %s skipped: totalTokens %.0f does not match its token fields (%.0f); not uploaded so it cannot over-count history\n",
-		agent["agent"], date, numberValue(agent["totalTokens"]), components)
+		agent["agent"], date, numberValue(agent["totalTokens"]), sliceComponentSum(agent))
+}
+
+// warnUnexplainedSlice reports a slice whose total is implausibly far above its
+// token fields; only the fields are counted.
+func warnUnexplainedSlice(date string, agent map[string]any) {
+	fmt.Fprintf(os.Stderr, "  ccusage %v slice for %s reports %.0f tokens but only %.0f in its token fields; counting the token fields only\n",
+		agent["agent"], date, numberValue(agent["totalTokens"]), sliceComponentSum(agent))
 }
 
 const ccusageAntigravityAgent = "antigravity"
@@ -875,12 +931,64 @@ func ccusageAntigravityDates(raw []map[string]any) map[string]bool {
 				continue
 			}
 			name := strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"])))
-			if name == ccusageAntigravityAgent && numberValue(agent["totalTokens"]) > 0 {
+			if name != ccusageAntigravityAgent || numberValue(agent["totalTokens"]) <= 0 {
+				continue
+			}
+			// Only a slice that is actually counted covers its date; if it is
+			// skipped the transcript estimate stays as the fallback.
+			if _, _, _, _, verdict := sliceTokens(agent); verdict != sliceSkip {
 				dates[date] = true
 			}
 		}
 	}
 	return dates
+}
+
+const ccusageZCodeAgent = "zcode"
+
+// uncoveredZCodeEntries rebuilds combined-shaped rows from ccusage's zcode
+// slices for dates the native Z Code (GLM) upload has no usage for. zcode is held
+// out of combined because ccrank uploads the same Z Code usage as the GLM
+// platform, but where the rollout files were pruned nothing else counts it, so
+// holding it out there would drop real usage.
+func uncoveredZCodeEntries(raw []map[string]any, covered map[string]bool) []map[string]any {
+	rows := []map[string]any{}
+	for _, entry := range raw {
+		date := usageDate(entry)
+		agents, ok := entry["agents"].([]any)
+		if date == "" || !ok || covered[date] {
+			continue
+		}
+		slices := []map[string]any{}
+		for _, item := range agents {
+			agent, ok := item.(map[string]any)
+			if ok && strings.ToLower(strings.TrimSpace(fmt.Sprint(agent["agent"]))) == ccusageZCodeAgent {
+				slices = append(slices, agent)
+			}
+		}
+		if len(slices) > 0 {
+			rows = append(rows, combinedRowFromSlices(date, slices))
+		}
+	}
+	return rows
+}
+
+// zcodeNotUploadedAsGLM is the rows to merge back into combined: zcode usage on
+// dates the native GLM loader does not cover. When the loader cannot be read
+// there is no telling what GLM covers, so zcode stays held out (an under-count
+// can be corrected later; a double count cannot).
+func zcodeNotUploadedAsGLM(raw []map[string]any) []map[string]any {
+	native, err := loadGLMUsageEntries()
+	if err != nil {
+		return nil
+	}
+	covered := map[string]bool{}
+	for _, entry := range native {
+		if numberValue(entry["totalTokens"]) > 0 {
+			covered[usageDate(entry)] = true
+		}
+	}
+	return uncoveredZCodeEntries(raw, covered)
 }
 
 func withoutCoveredDates(entries []map[string]any, covered map[string]bool) []map[string]any {
