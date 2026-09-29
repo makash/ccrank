@@ -565,7 +565,11 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 				continue
 			}
 			found = true
-			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens := sliceTokens(agent)
+			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, countable := sliceTokens(agent)
+			if !countable {
+				warnSkippedSlice(date, agent)
+				continue
+			}
 			input += sliceInput
 			output += sliceOutput
 			cacheCreation += sliceCacheCreation
@@ -746,7 +750,11 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 				// every combined row, so fail loudly instead.
 				return nil, fmt.Errorf("ccusage --by-agent row %s reports agent %q from the dedicated %q platform; add it to ccusageDedicatedAgents or upgrade ccrank so its usage is not double-counted", date, name, owner)
 			}
-			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens := sliceTokens(agent)
+			sliceInput, sliceOutput, sliceCacheCreation, sliceCacheReadTokens, countable := sliceTokens(agent)
+			if !countable {
+				warnSkippedSlice(date, agent)
+				continue
+			}
 			input += sliceInput
 			output += sliceOutput
 			cacheCreation += sliceCacheCreation
@@ -793,24 +801,55 @@ func sliceCacheRead(agent map[string]any) float64 {
 	return numberValue(agent["cachedInputTokens"])
 }
 
-// sliceTokens returns a ccusage agent slice's four token fields. When the slice
-// reports a totalTokens above their sum, the difference is tokens ccusage counts
-// but exposes no field for (Antigravity's thinking tokens); it is folded into
-// outputTokens, the way opencode_usage.go folds reasoning into output. That
+// maxUnexplainedFraction bounds how much of a slice's reported total may be
+// tokens with no field of their own. Real ccusage Antigravity slices sit at
+// 0.2-0.7%; beyond 5% the slice is treated as an accounting bug rather than
+// folded, so a corrupt total can never be uploaded (the server never lowers a
+// stored row, so an over-count would be permanent while an under-count can
+// still be corrected later).
+const maxUnexplainedFraction = 0.05
+
+// sliceTokens returns a ccusage agent slice's four token fields, and false when
+// the slice is too incoherent to count. When the slice reports a totalTokens
+// above their sum by a plausible amount, the difference is tokens ccusage
+// counts but exposes no field for (Antigravity's thinking tokens); it is folded
+// into outputTokens, the way opencode_usage.go folds reasoning into output. That
 // keeps the row total unchanged while making it equal its component sum, which
-// the server requires (src/parser.ts: total within 0.1% of the components). A
-// slice with no component fields at all is left alone: the server rejects
-// total-only rows on purpose, so an uncorroborated total is not attributed.
-func sliceTokens(agent map[string]any) (input, output, cacheCreation, cacheRead float64) {
+// the server requires (src/parser.ts: total within 0.1% of the components).
+// A missing total (0) counts the components, like the Pi/Kimi loaders. Not
+// counted (false): a total with no component fields (the server rejects
+// total-only rows on purpose), a gap over maxUnexplainedFraction, and
+// components above the total by more than the server's own tolerance
+// (overlapping fields would inflate the row).
+func sliceTokens(agent map[string]any) (input, output, cacheCreation, cacheRead float64, ok bool) {
 	input = numberValue(agent["inputTokens"])
 	output = numberValue(agent["outputTokens"])
 	cacheCreation = numberValue(agent["cacheCreationTokens"])
 	cacheRead = sliceCacheRead(agent)
 	components := input + output + cacheCreation + cacheRead
-	if gap := numberValue(agent["totalTokens"]) - components; gap > 0 && components > 0 {
-		output += gap
+	total := numberValue(agent["totalTokens"])
+	gap := total - components
+	switch {
+	case components == 0:
+		return 0, 0, 0, 0, total == 0
+	case total == 0:
+		return input, output, cacheCreation, cacheRead, true
+	case gap >= 0 && gap <= maxUnexplainedFraction*total:
+		return input, output + gap, cacheCreation, cacheRead, true
+	case gap < 0 && -gap <= math.Max(1, total*0.001):
+		return input, output, cacheCreation, cacheRead, true
+	default:
+		return 0, 0, 0, 0, false
 	}
-	return input, output, cacheCreation, cacheRead
+}
+
+// warnSkippedSlice reports a slice sliceTokens refused to count, so the gap in
+// the upload is visible in the run log instead of silent.
+func warnSkippedSlice(date string, agent map[string]any) {
+	components := numberValue(agent["inputTokens"]) + numberValue(agent["outputTokens"]) +
+		numberValue(agent["cacheCreationTokens"]) + sliceCacheRead(agent)
+	fmt.Fprintf(os.Stderr, "  ccusage %v slice for %s skipped: totalTokens %.0f does not match its token fields (%.0f); not uploaded so it cannot over-count history\n",
+		agent["agent"], date, numberValue(agent["totalTokens"]), components)
 }
 
 const ccusageAntigravityAgent = "antigravity"
@@ -1454,15 +1493,18 @@ func loadPiUsageEntriesFor(platform string) ([]map[string]any, error) {
 			"totalOutputTokens":        usage.Output,
 			"totalCacheCreationTokens": usage.CacheWrite,
 			"totalCacheReadTokens":     usage.CacheRead,
-			"totalTokens":              usage.TotalTokens,
-			"totalCost":                usage.Cost,
-			"totalCostUSD":             usage.Cost,
-			"costUSD":                  usage.Cost,
-			"modelsUsed":               modelNames,
-			"modelBreakdowns":          modelBreakdowns,
-			"messages":                 usage.Messages,
-			"sessionFiles":             len(usage.SessionFiles),
-			"source":                   "pi-session-jsonl",
+			// The day row is what the server checks, and per-record guards can
+			// still drift past its 0.1% tolerance when summed over many tiny
+			// records, so the aggregate is guarded too.
+			"totalTokens":     serverConsistentTotal(usage.TotalTokens, usage.Input+usage.Output+usage.CacheWrite+usage.CacheRead),
+			"totalCost":       usage.Cost,
+			"totalCostUSD":    usage.Cost,
+			"costUSD":         usage.Cost,
+			"modelsUsed":      modelNames,
+			"modelBreakdowns": modelBreakdowns,
+			"messages":        usage.Messages,
+			"sessionFiles":    len(usage.SessionFiles),
+			"source":          "pi-session-jsonl",
 		})
 	}
 	return entries, nil
