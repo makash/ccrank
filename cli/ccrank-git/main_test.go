@@ -144,6 +144,9 @@ func TestCombinedMaximaVersionAllowsPlatformSplitsToLowerLegacyRows(t *testing.T
 		`{"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 		`{"version":2,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 		`{"version":3,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
+		// Version 4 combined totals were slice sums that can sit above the
+		// component-derived totals written from version 5 on.
+		`{"version":4,"daily":[{"date":"2026-08-12","totalTokens":1000,"totalCost":2}]}`,
 	} {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -1230,8 +1233,12 @@ func TestCombinedRebuildEmitsAZeroRowWhenOnlyDedicatedAgentsRan(t *testing.T) {
 // 1 token) away from the sum of its four component fields.
 func assertServerConsistentTotal(t *testing.T, row map[string]any) {
 	t.Helper()
+	cacheRead := numberValue(row["cacheReadTokens"])
+	if cacheRead == 0 {
+		cacheRead = numberValue(row["cachedInputTokens"]) // parser.ts: cacheReadTokens || cachedInputTokens
+	}
 	sum := numberValue(row["inputTokens"]) + numberValue(row["outputTokens"]) +
-		numberValue(row["cacheCreationTokens"]) + numberValue(row["cacheReadTokens"])
+		numberValue(row["cacheCreationTokens"]) + cacheRead
 	total := numberValue(row["totalTokens"])
 	tolerance := math.Max(1, math.Abs(total)*0.001)
 	if math.Abs(total-sum) > tolerance {
@@ -1268,6 +1275,57 @@ func TestCombinedRebuildDerivesTotalFromComponents(t *testing.T) {
 		}
 		assertServerConsistentTotal(t, combined[index])
 	}
+}
+
+// The server reads cachedInputTokens as the cache-read count when
+// cacheReadTokens is absent, so a derived total must not drop those tokens.
+func TestCombinedRebuildCountsCachedInputTokensLikeTheServer(t *testing.T) {
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"claude","inputTokens":100,"outputTokens":10,"cachedInputTokens":400,"totalTokens":510,"totalCost":1}]}]}`)
+	_, entries, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := rebuildCombinedEntries(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(combined[0]["totalTokens"]); got != 510 {
+		t.Fatalf("totalTokens = %v, want 510 (100 + 10 + 400 cached)", got)
+	}
+	if got := numberValue(combined[0]["cacheReadTokens"]); got != 400 {
+		t.Fatalf("cacheReadTokens = %v, want the cached tokens carried over", got)
+	}
+	assertServerConsistentTotal(t, combined[0])
+}
+
+// The dedicated Codex upload is built from the same ccusage slices and is
+// validated by the same server rule, so it derives its total the same way.
+func TestCodexRowDerivesTotalFromComponents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	report := []byte(`{"daily":[{"period":"2026-07-01","agents":[
+		{"agent":"codex","inputTokens":1000,"outputTokens":200,"cacheReadTokens":8800,"totalTokens":10190,"totalCost":0.5}]}]}`)
+	_, raw, err := parseCcusageReport(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, _, err := runCodexUsageFromEntries(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Daily []map[string]any `json:"daily"`
+	}
+	if err := json.Unmarshal([]byte(pending.Report), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Daily) != 1 {
+		t.Fatalf("wire rows = %#v", wire.Daily)
+	}
+	if got := numberValue(wire.Daily[0]["totalTokens"]); got != 10000 {
+		t.Fatalf("codex totalTokens = %v, want the component sum 10000", got)
+	}
+	assertServerConsistentTotal(t, wire.Daily[0])
 }
 
 // The Antigravity transcript estimator is merged into combined rows afterwards;

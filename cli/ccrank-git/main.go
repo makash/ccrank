@@ -551,7 +551,7 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 		if date == "" {
 			continue
 		}
-		var input, output, cacheCreation, cacheRead, total, cost float64
+		var input, output, cacheCreation, cacheRead, cost float64
 		modelNames := []string{}
 		modelBreakdowns := []any{}
 		found := false
@@ -567,8 +567,7 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 			input += numberValue(agent["inputTokens"])
 			output += numberValue(agent["outputTokens"])
 			cacheCreation += numberValue(agent["cacheCreationTokens"])
-			cacheRead += numberValue(agent["cacheReadTokens"])
-			total += numberValue(agent["totalTokens"])
+			cacheRead += sliceCacheRead(agent)
 			cost += usageCostValue(agent)
 			for _, model := range extractModelNames(agent["modelsUsed"]) {
 				modelNames = append(modelNames, model)
@@ -581,6 +580,9 @@ func runCodexUsageFromEntries(raw []map[string]any) (*pendingUsageUpload, *Usage
 			continue
 		}
 		sort.Strings(modelNames)
+		// Derived, not copied from the slices, for the same server-consistency
+		// reason as rebuildCombinedEntries.
+		total := input + output + cacheCreation + cacheRead
 		rows = append(rows, map[string]any{
 			"date":                     date,
 			"inputTokens":              input,
@@ -733,7 +735,7 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 			input += numberValue(agent["inputTokens"])
 			output += numberValue(agent["outputTokens"])
 			cacheCreation += numberValue(agent["cacheCreationTokens"])
-			cacheRead += numberValue(agent["cacheReadTokens"])
+			cacheRead += sliceCacheRead(agent)
 			cost += usageCostValue(agent)
 			for _, model := range extractModelNames(agent["modelsUsed"]) {
 				modelNames = append(modelNames, model)
@@ -764,6 +766,16 @@ func rebuildCombinedEntries(entries []map[string]any) ([]map[string]any, error) 
 		})
 	}
 	return rebuilt, nil
+}
+
+// sliceCacheRead mirrors the server's cacheReadTokens || cachedInputTokens
+// fallback (src/parser.ts) so a total derived from the component fields never
+// drops cached tokens a slice reported under the alternate name.
+func sliceCacheRead(agent map[string]any) float64 {
+	if cacheRead := numberValue(agent["cacheReadTokens"]); cacheRead != 0 {
+		return cacheRead
+	}
+	return numberValue(agent["cachedInputTokens"])
 }
 
 func extractModelNames(raw any) []string {
@@ -1876,8 +1888,10 @@ func usageTotals(entries []map[string]any) map[string]any {
 // correction is impossible regardless — the smaller grok rows simply lose the
 // merge until their tokens genuinely grow again. Version 4 splits Codex out
 // of the combined bucket, shrinking those rows the way Kimi (v2) and Pi (v3)
-// did.
-const usageMaximaVersion = 4
+// did. Version 5 derives combined totalTokens from the component fields: older
+// caches hold slice-sum totals that can sit above the derived total and would
+// hide small increases from isHigherUsageSnapshot.
+const usageMaximaVersion = 5
 
 func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 	path, err := usageMaximaPath(cacheName)
@@ -1902,8 +1916,9 @@ func loadUsageMaxima(cacheName string) (map[string]map[string]any, error) {
 		// Version 2 split Kimi out of the legacy combined platform; version 3
 		// splits out Pi, which ccusage began importing natively and ccrank was
 		// merging on top of; version 4 splits out Codex, whose --by-agent
-		// slices ccrank used to fold into combined. Each split shrinks the
-		// combined bucket, so treat older maxima as empty once and re-offer
+		// slices ccrank used to fold into combined; version 5 lowers combined
+		// totals to the component sum. Each change shrinks the combined
+		// bucket, so treat older maxima as empty once and re-offer
 		// every current row; rows higher than the server peak apply, and the
 		// lower corrected rows are silently discarded by the server's
 		// max-merge, which can never lower history (see test/never-lower.test.mjs).
