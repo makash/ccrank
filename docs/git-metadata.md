@@ -132,6 +132,6 @@ Usage data with `--upload-usage`:
 - Daily GLM token totals from `~/.zcode/cli/rollout` (Z Code logs carry no pricing, so cost is recorded as zero)
 - Daily Muse Code token totals from `~/.local/share/muse/sessions` (contributor-plan logs carry no pricing, so cost is recorded as zero)
 - Kimi, Grok, and GLM models run through Pi, added to those platforms and carrying the cost Pi recorded for them
-- Model breakdowns where available
+- Model breakdowns where available (token counts and cost per model, shown on `/analytics` under Models by Platform)
 
 No raw commit messages, diffs, prompts, responses, or agent transcript content are uploaded.

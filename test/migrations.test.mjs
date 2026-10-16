@@ -278,6 +278,7 @@ const FRESH_CHAIN = [
   '0011_review_flags.sql',
   '0012_unknown_date_cleanup.sql',
   '0013_review_flag_status.sql',
+  '0014_model_breakdowns.sql',
 ];
 
 function seedUserAndUsage(dbPath) {
@@ -287,7 +288,7 @@ function seedUserAndUsage(dbPath) {
   );
 }
 
-test('full chain 0001..0013 applies cleanly to a fresh database', (t) => {
+test('full chain 0001..0014 applies cleanly to a fresh database', (t) => {
   if (skipWithoutSqlite3(t)) return;
   const db = freshDb(t);
   for (const file of FRESH_CHAIN) applyMigration(db, file);
@@ -302,6 +303,13 @@ test('full chain 0001..0013 applies cleanly to a fresh database', (t) => {
     (r) => r.name,
   );
   assert.ok(flagCols.includes('status'), 'fresh chain must end with review_flags.status');
+  const usageCols = queryJson(db, "SELECT name FROM pragma_table_info('daily_usage');").map(
+    (r) => r.name,
+  );
+  assert.ok(
+    usageCols.includes('model_breakdowns'),
+    'fresh chain must end with daily_usage.model_breakdowns',
+  );
   const triggers = queryJson(
     db,
     "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name;",
@@ -408,6 +416,41 @@ test('0013 backfills open, defaults new rows, and re-run fails without data chan
     queryJson(db, 'SELECT * FROM review_flags ORDER BY id;'),
     snapshot,
     'failed 0013 re-run must leave flag rows untouched',
+  );
+});
+
+test('0014 adds a nullable model_breakdowns, preserves rows, and re-run fails without data change', (t) => {
+  if (skipWithoutSqlite3(t)) return;
+  const db = freshDb(t);
+  for (const file of FRESH_CHAIN.slice(0, 13)) applyMigration(db, file); // stop after 0013
+  seedUserAndUsage(db);
+  runSql(
+    db,
+    `INSERT INTO daily_usage (id, upload_id, user_id, date, source, platform, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, models_used)
+     VALUES ('r1', 'up1', 'u1', '2026-01-01', 'mac', 'claude', 100, 50, 10, 1000, 1160, 1.5, '["opus"]');`,
+  );
+  const before = queryJson(db, 'SELECT * FROM daily_usage ORDER BY id;');
+  applyMigration(db, '0014_model_breakdowns.sql');
+  const after = queryJson(db, 'SELECT * FROM daily_usage ORDER BY id;');
+  assert.deepStrictEqual(
+    after,
+    before.map((row) => ({ ...row, model_breakdowns: null })),
+    '0014 must leave every existing row identical and give it a NULL model_breakdowns',
+  );
+  assert.equal(
+    queryJson(db, 'SELECT COUNT(*) AS n FROM daily_usage_audit;')[0].n,
+    0,
+    '0014 is an ALTER only — it must not touch usage rows, so the audit trail stays empty',
+  );
+  // Like 0013, a bare ALTER cannot be re-run: it must fail loudly on the
+  // duplicate column and leave every row untouched.
+  const rerun = runSql(db, readFileSync(join(migrationsDir, '0014_model_breakdowns.sql'), 'utf8'));
+  assert.notEqual(rerun.status, 0, 're-running 0014 must fail (duplicate column)');
+  assert.match((rerun.stderr || '').toLowerCase(), /duplicate column/);
+  assert.deepStrictEqual(
+    queryJson(db, 'SELECT * FROM daily_usage ORDER BY id;'),
+    after,
+    'failed 0014 re-run must leave usage rows untouched',
   );
 });
 

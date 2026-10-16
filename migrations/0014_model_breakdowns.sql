@@ -1,0 +1,12 @@
+-- model_breakdowns: per-model usage detail for each daily_usage row, as a JSON
+-- array of {modelName, inputTokens, outputTokens, cacheCreationTokens,
+-- cacheReadTokens, totalTokens, cost}. NULL until a client uploads breakdowns.
+--
+-- It is display metadata, but its token sums are shown to users, so the
+-- /api/upload upsert keeps it monotonic like the numeric columns: a smaller
+-- report never replaces a larger one, and an upload that carries no
+-- breakdown never clears one.
+--
+-- Apply this BEFORE deploying the Worker that writes it: the upload INSERT
+-- names the column, so every upload fails until it exists.
+ALTER TABLE daily_usage ADD COLUMN model_breakdowns TEXT;
