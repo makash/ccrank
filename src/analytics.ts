@@ -1,5 +1,6 @@
-import { escapeHtml, formatCost, formatTokens, type User } from './utils';
+import { escapeHtml, formatCost, formatPercent, formatTokens, type User } from './utils';
 import { layout } from './html';
+import type { ModelUsage, ModelUsageSummary, PlatformModels } from './models';
 
 const PLATFORM_ORDER = ['claude', 'codex', 'kimi', 'grok', 'glm', 'pi', 'opencode', 'cursor', 'muse'];
 
@@ -36,6 +37,8 @@ export interface AnalyticsData {
   days: AnalyticsDay[];
   totals: { tokens: number; cost: number; users: number };
   topUsers: AnalyticsUserSeries[];
+  /** Absent when the model query failed; the section is then hidden. */
+  models?: ModelUsageSummary;
 }
 
 function statCard(label: string, value: string, valueClass: string): string {
@@ -78,6 +81,83 @@ function dailyConsumptionChart(days: AnalyticsDay[]): string {
       <div class="flex flex-wrap gap-3">${platformLegend(new Set(days.flatMap((d) => Object.keys(d.byPlatform))))}</div>
     </div>
     <div class="flex items-end gap-[2px]">${columns}</div>`;
+}
+
+// Zero cost means "not reported" (Kimi, Grok, GLM, Muse log tokens only), so
+// show a dash rather than a misleading $0.00.
+function perMillion(cost: number, tokens: number): string {
+  if (cost <= 0 || tokens <= 0) return '—';
+  const rate = cost / (tokens / 1_000_000);
+  return rate < 0.01 ? '<$0.01' : formatCost(rate);
+}
+
+function modelRow(model: ModelUsage, platformTokens: number, hex: string): string {
+  const share = platformTokens > 0 ? model.totalTokens / platformTokens : 0;
+  const cacheRate = model.totalTokens > 0 ? model.cacheReadTokens / model.totalTokens : 0;
+  return `<tr class="border-b border-gray-800/50 hover:bg-gray-800/30 transition">
+        <td class="py-2 px-3 font-mono text-sm text-gray-300 break-all">${escapeHtml(model.model)}</td>
+        <td class="py-2 px-3 text-right font-mono text-cyan-400">${formatTokens(model.totalTokens)}</td>
+        <td class="py-2 px-3 text-right font-mono text-green-400">${formatTokens(model.outputTokens)}</td>
+        <td class="py-2 px-3 text-right text-sm text-gray-400">${formatPercent(cacheRate)}</td>
+        <td class="py-2 px-3 text-right font-mono text-purple-400">${model.costUsd > 0 ? formatCost(model.costUsd) : '—'}</td>
+        <td class="py-2 px-3 text-right text-sm text-gray-400">${perMillion(model.costUsd, model.totalTokens)}</td>
+        <td class="py-2 px-3 text-right text-sm text-gray-400">${model.users}</td>
+        <td class="py-2 px-3 text-right text-sm text-gray-400 whitespace-nowrap"><span class="inline-block align-middle w-14 h-1.5 rounded bg-gray-800 mr-2"><span class="block h-1.5 rounded" style="width:${(share * 100).toFixed(1)}%;background:${hex}"></span></span>${formatPercent(share)}</td>
+      </tr>`;
+}
+
+function platformModelsBlock(group: PlatformModels): string {
+  const meta = PLATFORM_COLORS[group.platform];
+  const rows = group.models.map((model) => modelRow(model, group.totalTokens, meta.hex)).join('');
+  const hiddenCount = group.modelCount - group.models.length;
+  const hiddenTokens = group.totalTokens - group.models.reduce((sum, model) => sum + model.totalTokens, 0);
+  const more =
+    hiddenCount > 0
+      ? `<tr><td colspan="8" class="py-2 px-3 text-xs text-gray-500">+${hiddenCount} more model${hiddenCount === 1 ? '' : 's'} · ${formatTokens(hiddenTokens)}</td></tr>`
+      : '';
+  return `<div class="mb-6 last:mb-0">
+    <div class="flex flex-wrap items-center gap-x-2 mb-2">
+      <span class="w-2.5 h-2.5 rounded-full" style="background:${meta.hex}"></span>
+      <span class="text-sm font-semibold text-gray-200">${meta.label}</span>
+      <span class="text-xs text-gray-500">${formatTokens(group.totalTokens)} tokens · ${group.costUsd > 0 ? formatCost(group.costUsd) : 'cost n/a'} · ${group.modelCount} model${group.modelCount === 1 ? '' : 's'}</span>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full min-w-[900px] table-fixed text-left">
+        <thead>
+          <tr class="border-b border-gray-800 text-xs uppercase tracking-wider text-gray-500">
+            <th class="py-2 px-3 font-medium">Model</th>
+            <th class="py-2 px-3 font-medium text-right w-24">Tokens</th>
+            <th class="py-2 px-3 font-medium text-right w-20">Output</th>
+            <th class="py-2 px-3 font-medium text-right w-28 whitespace-nowrap" title="Cache-read tokens as a share of total tokens">Cache Rate</th>
+            <th class="py-2 px-3 font-medium text-right w-28">Cost</th>
+            <th class="py-2 px-3 font-medium text-right w-20" title="Estimated cost per million tokens">$/M</th>
+            <th class="py-2 px-3 font-medium text-right w-16">Users</th>
+            <th class="py-2 px-3 font-medium text-right w-36">Share</th>
+          </tr>
+        </thead>
+        <tbody>${rows}${more}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function modelsByPlatformCard(summary: ModelUsageSummary | undefined, windowTokens: number): string {
+  if (!summary) return '';
+  // Unknown platform strings (legacy rows) have no label or color, so skip them.
+  const blocks = PLATFORM_ORDER.flatMap((key) => {
+    const group = summary.platforms.find((p) => p.platform === key);
+    return group ? [platformModelsBlock(group)] : [];
+  }).join('');
+  // Rows uploaded before per-model tracking carry no breakdown, so say how
+  // much of the window the table actually covers.
+  const coverage = windowTokens > 0 ? Math.min(1, summary.attributedTokens / windowTokens) : 0;
+  return `<div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
+        <div class="flex flex-wrap items-baseline justify-between gap-2 mb-4">
+          <h2 class="text-sm font-semibold text-gray-200">Models by Platform</h2>
+          ${blocks ? `<span class="text-xs text-gray-500">Model detail covers ${formatPercent(coverage)} of tokens in this window</span>` : ''}
+        </div>
+        ${blocks || '<p class="text-sm text-gray-500">No per-model data yet. It fills in as machines upload.</p>'}
+      </div>`;
 }
 
 function topRaceChart(data: AnalyticsData): string {
@@ -192,6 +272,7 @@ export function analyticsPage(data: AnalyticsData, user: User | null = null): st
         <h2 class="text-sm font-semibold text-gray-200 mb-4">Daily Consumption</h2>
         ${dailyConsumptionChart(data.days)}
       </div>
+      ${modelsByPlatformCard(data.models, data.totals.tokens)}
       <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
         <h2 class="text-sm font-semibold text-gray-200 mb-4">Top 4 Race — Daily Tokens</h2>
         ${topRaceChart(data)}

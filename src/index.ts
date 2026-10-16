@@ -31,6 +31,7 @@ import {
   errorPage,
 } from './html';
 import { analyticsPage, type AnalyticsData, type AnalyticsDay, type AnalyticsUserSeries } from './analytics';
+import { queryModelUsage } from './models';
 import { isValidView, isValidPlatform, isValidDateString, getDateRange, sanitizeSource, slugify, isValidSlug, PLATFORMS, type ViewType } from './utils';
 import { generateCardSvg, type CardData } from './card';
 import { generateCardHtml } from './card-png';
@@ -482,6 +483,13 @@ app.get('/analytics', async (c) => {
   since.setDate(since.getDate() - (range - 1));
   const startDate = since.toISOString().slice(0, 10);
 
+  // Best-effort: a failing model query (e.g. 0014 not applied yet) hides the
+  // section instead of taking down the whole page.
+  const modelsPromise = queryModelUsage(c.env.DB, startDate).catch((err) => {
+    console.error('analytics: model usage query failed', err);
+    return undefined;
+  });
+
   const [dailyRes, activesRes, topRes, countRes] = await Promise.all([
     c.env.DB.prepare(
       `SELECT date, COALESCE(platform,'claude') AS platform, SUM(total_tokens) AS t, SUM(cost_usd) AS c
@@ -556,6 +564,7 @@ app.get('/analytics', async (c) => {
       users: Number(((countRes.results || [])[0] as any)?.u) || 0,
     },
     topUsers,
+    models: await modelsPromise,
   };
 
   return c.html(analyticsPage(data, user));
@@ -1261,9 +1270,19 @@ app.post('/api/upload', async (c) => {
   // ~27B tokens of historical peaks whose source logs had since been pruned
   // (totals may only ever go up — see ed592af and e6ed7d5).
   const mergeValue = (column: string) => `MAX(excluded.${column}, daily_usage.${column})`;
+  // Per-model detail is display metadata, but its sums are shown as token
+  // totals, so it follows the same never-lower rule: it fills a NULL, and is
+  // replaced only by a report at least as large as the stored peak. A smaller
+  // report (pruned logs) or one with no breakdown (older CLI) leaves it alone.
+  const mergeBreakdowns = `CASE
+         WHEN excluded.model_breakdowns IS NULL THEN daily_usage.model_breakdowns
+         WHEN daily_usage.model_breakdowns IS NULL THEN excluded.model_breakdowns
+         WHEN excluded.total_tokens >= daily_usage.total_tokens THEN excluded.model_breakdowns
+         ELSE daily_usage.model_breakdowns
+       END`;
   const stmt = c.env.DB.prepare(
-    `INSERT INTO daily_usage (id, upload_id, user_id, date, source, platform, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, models_used)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO daily_usage (id, upload_id, user_id, date, source, platform, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_tokens, cost_usd, models_used, model_breakdowns)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id, date, source, platform) DO UPDATE SET
        upload_id = excluded.upload_id,
        input_tokens = ${mergeValue('input_tokens')},
@@ -1272,7 +1291,8 @@ app.post('/api/upload', async (c) => {
        cache_read_tokens = ${mergeValue('cache_read_tokens')},
        total_tokens = ${mergeValue('total_tokens')},
        cost_usd = ${mergeValue('cost_usd')},
-       models_used = excluded.models_used`
+       models_used = excluded.models_used,
+       model_breakdowns = ${mergeBreakdowns}`
   );
 
   const batch = report.entries.map((entry) =>
@@ -1289,7 +1309,8 @@ app.post('/api/upload', async (c) => {
       entry.cacheReadTokens,
       entry.totalTokens,
       entry.costUsd,
-      JSON.stringify(entry.modelsUsed)
+      JSON.stringify(entry.modelsUsed),
+      entry.modelBreakdowns.length > 0 ? JSON.stringify(entry.modelBreakdowns) : null
     )
   );
 

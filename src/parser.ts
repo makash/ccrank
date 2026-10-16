@@ -13,6 +13,18 @@
 
 export type Platform = 'claude' | 'codex' | 'kimi' | 'grok' | 'glm' | 'pi' | 'opencode' | 'cursor' | 'muse';
 
+// One model's share of a daily row. Only the fields the analytics page shows
+// are kept; client-supplied extras are dropped so stored JSON stays bounded.
+export interface ModelBreakdown {
+  modelName: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  cost: number;
+}
+
 export interface DailyEntry {
   date: string;
   inputTokens: number;
@@ -22,6 +34,7 @@ export interface DailyEntry {
   totalTokens: number;
   costUsd: number;
   modelsUsed: string[];
+  modelBreakdowns: ModelBreakdown[];
   platform: Platform;
 }
 
@@ -77,6 +90,96 @@ function extractModels(obj: Record<string, unknown>): string[] {
 
 function num(val: unknown): number {
   return typeof val === 'number' ? val : 0;
+}
+
+function isRecord(val: unknown): val is Record<string, unknown> {
+  return !!val && typeof val === 'object' && !Array.isArray(val);
+}
+
+// ccusage reports a handful of models per day; the caps only bite on hostile
+// or buggy payloads and keep the stored JSON small.
+const MAX_BREAKDOWNS_PER_ENTRY = 40;
+const MAX_MODEL_NAME_LENGTH = 100;
+
+// Returns null for an unusable name or an idle model (no tokens), and
+// undefined when a number is invalid, which voids the whole breakdown: half a
+// split would misattribute the rest.
+function readBreakdown(name: unknown, raw: Record<string, unknown>): ModelBreakdown | null | undefined {
+  const modelName = String(name ?? '').trim().slice(0, MAX_MODEL_NAME_LENGTH);
+  const inputTokens = num(raw.inputTokens);
+  const outputTokens = num(raw.outputTokens);
+  const cacheCreationTokens = num(raw.cacheCreationTokens);
+  const cacheReadTokens = num(raw.cacheReadTokens || raw.cachedInputTokens);
+  const cost = extractCost(raw);
+  // Real ccusage output has no per-model totalTokens, so derive it.
+  const totalTokens =
+    typeof raw.totalTokens === 'number' && raw.totalTokens !== 0
+      ? raw.totalTokens
+      : inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
+  const numbers = [inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, cost];
+  if (numbers.some((n) => !Number.isFinite(n) || n < 0)) return undefined;
+  if (!modelName || totalTokens === 0) return null;
+  return { modelName, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, cost };
+}
+
+// Folds duplicate models together (session reports repeat a model per
+// session) and orders biggest-first so the cap drops the smallest.
+function mergeBreakdowns(items: ModelBreakdown[]): ModelBreakdown[] {
+  const byName = new Map<string, ModelBreakdown>();
+  for (const item of items) {
+    const existing = byName.get(item.modelName);
+    if (!existing) {
+      byName.set(item.modelName, { ...item });
+      continue;
+    }
+    existing.inputTokens += item.inputTokens;
+    existing.outputTokens += item.outputTokens;
+    existing.cacheCreationTokens += item.cacheCreationTokens;
+    existing.cacheReadTokens += item.cacheReadTokens;
+    existing.totalTokens += item.totalTokens;
+    existing.cost += item.cost;
+  }
+  return [...byName.values()]
+    .sort((a, b) => b.totalTokens - a.totalTokens || a.modelName.localeCompare(b.modelName))
+    .slice(0, MAX_BREAKDOWNS_PER_ENTRY);
+}
+
+// Accepts ccusage's `modelBreakdowns: [{modelName, ...}]`, the same shape keyed
+// by model name, and the @ccusage/codex `models: {name: {...}}` map.
+function extractModelBreakdowns(obj: Record<string, unknown>): ModelBreakdown[] {
+  let pairs: Array<[unknown, unknown]>;
+  if (Array.isArray(obj.modelBreakdowns)) {
+    pairs = obj.modelBreakdowns.map((item): [unknown, unknown] => [
+      isRecord(item) ? (item.modelName ?? item.model ?? item.name) : undefined,
+      item,
+    ]);
+  } else if (isRecord(obj.modelBreakdowns)) {
+    pairs = Object.entries(obj.modelBreakdowns);
+  } else if (isRecord(obj.models)) {
+    pairs = Object.entries(obj.models);
+  } else {
+    return [];
+  }
+  const items: ModelBreakdown[] = [];
+  for (const [name, raw] of pairs) {
+    if (!isRecord(raw)) continue;
+    const item = readBreakdown(name, raw);
+    if (item === undefined) return [];
+    if (item) items.push(item);
+  }
+  return mergeBreakdowns(items);
+}
+
+// A split that claims more tokens than its own row cannot describe that row.
+// It is dropped, not rejected: breakdowns are display metadata, and a 400
+// would lose the whole report (the CLI never commits its cache on failure).
+function reconcileBreakdowns(entry: DailyEntry, breakdowns: ModelBreakdown[]): ModelBreakdown[] {
+  const attributed = breakdowns.reduce((sum, item) => sum + item.totalTokens, 0);
+  const rowTotal = Math.max(
+    entry.totalTokens,
+    entry.inputTokens + entry.outputTokens + entry.cacheCreationTokens + entry.cacheReadTokens
+  );
+  return attributed > rowTotal + Math.max(1, rowTotal * 0.001) ? [] : breakdowns;
 }
 
 // Rejects absurd rows before they can poison max-merged history (usage
@@ -201,9 +304,11 @@ function parseDataEntry(entry: Record<string, unknown>, type: string, index: num
     totalTokens: num(entry.totalTokens),
     costUsd: extractCost(entry),
     modelsUsed: models,
+    modelBreakdowns: [],
     platform: detectPlatform(models),
   };
   validateEntry(parsed, entry, index, maxDate);
+  parsed.modelBreakdowns = reconcileBreakdowns(parsed, extractModelBreakdowns(entry));
   return parsed;
 }
 
@@ -326,6 +431,7 @@ export function parseReport(jsonStr: string): ParsedReport {
         existing.costUsd += parsed.costUsd;
         const modelSet = new Set([...existing.modelsUsed, ...parsed.modelsUsed]);
         existing.modelsUsed = Array.from(modelSet);
+        existing.modelBreakdowns = mergeBreakdowns([...existing.modelBreakdowns, ...parsed.modelBreakdowns]);
         existing.platform = detectPlatform(existing.modelsUsed);
       } else {
         byDate.set(lastActivity, parsed);

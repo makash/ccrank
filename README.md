@@ -50,6 +50,7 @@ The entire app was built on a phone using [Claude Code](https://claude.ai), depl
 | :medal_sports: | **Gamified Titles** | Apprentice, Practitioner, Power User, Token Whale, Token Maximalist |
 | :clock3: | **Time-Travel History** | Browse daily, weekly, and monthly snapshots with date navigation |
 | :computer: | **Multi-Machine Tracking** | Aggregate usage across laptops, desktops, and cloud instances |
+| :bar_chart: | **Models by Platform** | Which models each agent platform's usage comes from: tokens, output, cache rate, cost, and users |
 | :frame_with_picture: | **Shareable Social Cards** | OG-image-ready SVG cards with your stats for Twitter/LinkedIn |
 | :lock: | **Google OAuth** | One-click sign-in, no passwords |
 | :busts_in_silhouette: | **Public Registration** | Anyone with a Google account can join |
@@ -106,8 +107,13 @@ new files, in numeric order:
 npx wrangler d1 execute claude-leaderboard-db --file=migrations/0011_review_flags.sql
 npx wrangler d1 execute claude-leaderboard-db --file=migrations/0012_unknown_date_cleanup.sql
 npx wrangler d1 execute claude-leaderboard-db --file=migrations/0013_review_flag_status.sql
+npx wrangler d1 execute claude-leaderboard-db --file=migrations/0014_model_breakdowns.sql
 # local twin: add --local to each command above
 ```
+
+Apply `0014_model_breakdowns.sql` **before** deploying the Worker that writes
+it: the upload INSERT names the new column, so every upload fails until the
+column exists.
 
 
 Fresh databases need BOTH `npm run db:migrate` AND `npm run db:seed` —
@@ -118,9 +124,10 @@ applies the other's files.
 If two PRs both add the same `NNNN_` number — e.g. `b0307a0`
 (`chore/perf-health`) added `migrations/0011_user_slugs.sql` while PR #18
 added `migrations/0011_review_flags.sql` — the second PR to merge renames
-its file to the next free number (check `ls migrations/`; `0011`–`0013`
+its file to the next free number (check `ls migrations/`; `0011`–`0014`
 are taken on this branch by `0011_review_flags.sql`,
-`0012_unknown_date_cleanup.sql`, and `0013_review_flag_status.sql`),
+`0012_unknown_date_cleanup.sql`, `0013_review_flag_status.sql`, and
+`0014_model_breakdowns.sql`),
 rewires `db:migrate` /
 `db:migrate:local` in numeric order, and re-runs `npm test`
 (`test/migrations.test.mjs` asserts contiguous numbers, numeric order,
@@ -202,6 +209,19 @@ Deploy the Worker before rolling out the CLI. The CLI asks `GET /api/platforms` 
 A model that Pi merely fronts is credited to the vendor that owns it, so a Kimi, Grok, or GLM model run through Pi lands on that platform rather than on Pi. Duplicate records are counted once: Kimi sessions copied during the `.kimi` to `.kimi-code` migration, Grok turns replayed by a rewind, retried Z Code requests, and re-read Muse session files (keyed by record id). Only aggregated usage is uploaded; raw prompts and responses stay local. See `docs/git-metadata.md` for OS-specific downloads and details.
 
 Generate your token in **Settings → Git Metadata**.
+
+### Models by platform
+
+`/analytics` lists, for each platform, the models behind its usage: tokens, output, cache rate, estimated cost, cost per million tokens, and how many users ran each one. Platforms that log no cost (Kimi, Grok, GLM, Muse) show a dash instead of `$0.00`.
+
+The data is the per-model `modelBreakdowns` the CLI already uploads, stored on each daily row (`daily_usage.model_breakdowns`, migration `0014`). It follows the same never-lower rule as the totals: a smaller re-upload (pruned local logs) or an upload with no breakdown never replaces a larger one already stored.
+
+Days uploaded before `0014` have no breakdown, and the CLI only re-sends days whose totals grew, so history fills in as days change. The page reports how much of the window carries a breakdown. To backfill once, clear the CLI's upload cache and upload again; totals cannot go down, so this is safe:
+
+```bash
+rm ~/.ccrank/usage-maxima-*.json
+ccrank-git --url https://your-worker.workers.dev --token YOUR_TOKEN --upload-usage
+```
 
 ### Join the leaderboard
 
